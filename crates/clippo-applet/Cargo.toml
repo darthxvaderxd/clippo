@@ -1,0 +1,17 @@
+[package]
+name = "clippo-applet"
+description = "libcosmic panel applet for clippo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "clippo-applet"
+path = "src/main.rs"
+
+# libcosmic is a git dependency and is added here at M5, deliberately not in
+# [workspace.dependencies] since no other crate shares it.
+[dependencies]

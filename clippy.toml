@@ -1,0 +1,13 @@
+# Keep lints in step with the workspace MSRV.
+msrv = "1.75"
+
+# Clipboard blobs and D-Bus payloads make some functions legitimately wide;
+# these thresholds are a little looser than the defaults on purpose.
+too-many-arguments-threshold = 8
+type-complexity-threshold = 350
+
+# Secrets must never be printed. `dbg!` and friends bypass `tracing` filtering,
+# so they are rejected outright rather than left to review.
+disallowed-macros = [
+    { path = "std::dbg", reason = "use tracing::debug! — dbg! can leak clipboard contents" },
+]
