@@ -1,0 +1,20 @@
+[package]
+name = "clippo-wayland"
+description = "Wayland data-control client: watch selections and serve offers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "clippo_wayland"
+path = "src/lib.rs"
+
+# Debug binary from M1: prints every selection and its flavors.
+[[bin]]
+name = "clippo-watch"
+path = "src/bin/clippo-watch.rs"
+
+[dependencies]

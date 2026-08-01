@@ -1,0 +1,15 @@
+[package]
+name = "clippod"
+description = "The clippo daemon: owns the clipboard history and the D-Bus service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "clippod"
+path = "src/main.rs"
+
+[dependencies]
