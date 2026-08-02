@@ -14,3 +14,4 @@ name = "clippo"
 path = "src/main.rs"
 
 [dependencies]
+clippo-ipc = { workspace = true }
