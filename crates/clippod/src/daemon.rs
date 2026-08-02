@@ -1078,6 +1078,49 @@ mod tests {
         assert_eq!(fixture.daemon.reveal(entry.id).await.unwrap(), "hunter2");
     }
 
+    /// The same bytes twice, and only the second copy knows they are a secret.
+    ///
+    /// `hunter2` out of a text editor and then out of a password manager hash
+    /// alike — the marker is never the canonical flavor — so the second arrival
+    /// is a bump rather than a new row. The bump has to bring its *preview*
+    /// with it and not just its flag: a row marked sensitive whose preview is
+    /// still the password is worse than one that was never flagged, because the
+    /// applet draws its lock badge next to the plaintext.
+    ///
+    /// The same shape covers the two routes with no password manager in them —
+    /// a row captured while `entropy_rule` was off, and a row captured before
+    /// masking existed at all. Both are upgraded by the next copy.
+    #[tokio::test]
+    async fn a_repeat_copy_that_knows_better_masks_the_preview_it_already_stored() {
+        let fixture = Fixture::new();
+
+        fixture.capture(&["hunter2"]).await;
+        let entry = fixture.daemon.list(1, 0).await.unwrap().remove(0);
+        assert!(!entry.sensitive, "nothing about it looks like a secret yet");
+        assert_eq!(entry.preview, "hunter2");
+
+        fixture.capture_password("hunter2").await;
+
+        let listed = fixture.daemon.list(0, 0).await.unwrap();
+        assert_eq!(listed.len(), 1, "the same bytes are still one entry");
+        let entry = &listed[0];
+        assert!(entry.sensitive);
+        assert!(
+            !entry.preview.contains("hunter2"),
+            "the preview stored in the clear survived the bump: {}",
+            entry.preview
+        );
+        assert!(
+            !format!("{listed:?}").contains("hunter2"),
+            "the password crossed the bus in a List response"
+        );
+        assert_eq!(
+            fixture.daemon.reveal(entry.id).await.unwrap(),
+            "hunter2",
+            "and the value is still there to be revealed and pasted"
+        );
+    }
+
     /// The acceptance criterion, as a test: no member but `Reveal` returns a
     /// sensitive value, and this is the check that is supposed to fail the next
     /// time a preview-building helper is refactored.

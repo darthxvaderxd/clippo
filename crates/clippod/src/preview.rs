@@ -23,6 +23,14 @@
 //! It also means detection runs against the *whole* value rather than the
 //! 120-character preview, which the entropy rule's length gate would otherwise
 //! see the wrong end of.
+//!
+//! The cost of storing the answer is that a row keeps whatever this module
+//! concluded on the day it was captured — before masking existed, or while
+//! `entropy_rule` was off. There is no migration pass over the history, so the
+//! correction happens on use: a repeat copy re-runs detection and
+//! [`clippo_store::Store::insert`]'s bump takes the new preview whenever the
+//! new capture is the sensitive one. The flag and the mask only ever move
+//! together, and only ever towards safety.
 
 use std::borrow::Cow;
 

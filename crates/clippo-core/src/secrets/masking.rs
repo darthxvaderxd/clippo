@@ -63,10 +63,13 @@ pub fn mask_with(value: &str, prefix: usize, suffix: usize) -> String {
     let visible = prefix.saturating_add(suffix);
     let bullets: String = std::iter::repeat(MASK_BULLET).take(MASK_BULLETS).collect();
 
-    // Counting `visible + 1` clusters rather than all of them: the question is
-    // only whether there is a middle to hide, and a whole-history `List` should
-    // not walk a multi-megabyte copy to answer it.
-    if value.graphemes(true).take(visible + 1).count() <= visible {
+    // Counting one cluster past `visible` rather than all of them: the question
+    // is only whether there is a middle to hide, and a whole-history `List`
+    // should not walk a multi-megabyte copy to answer it. Saturating because
+    // this is `pub` — the config caps the two counts far below this, but a
+    // caller passing `usize::MAX` should get bullets, not an overflow.
+    let enough_to_decide = visible.saturating_add(1);
+    if value.graphemes(true).take(enough_to_decide).count() <= visible {
         return bullets;
     }
 
@@ -166,6 +169,20 @@ mod tests {
         let masked = mask_with(combined, 1, 1);
         assert_eq!(masked.graphemes(true).next(), Some("e\u{301}"));
         assert!(masked.ends_with("u\u{301}"), "{masked}");
+    }
+
+    /// `mask_with` is `pub`, so it has to answer for counts no config can
+    /// produce. The failure that matters is the arithmetic one: the counts are
+    /// added and then incremented, and both steps have to hold. Asking to show
+    /// more of a value than exists is a request to show all of it, which for a
+    /// masking function means showing none of it.
+    #[test]
+    fn counts_larger_than_the_value_ask_for_bullets_rather_than_overflowing() {
+        for (prefix, suffix) in [(usize::MAX, 0), (0, usize::MAX), (usize::MAX, usize::MAX)] {
+            let masked = mask_with("supersecretvalue", prefix, suffix);
+            assert_eq!(masked.chars().count(), MASK_BULLETS);
+            assert!(masked.chars().all(|c| c == MASK_BULLET), "{masked}");
+        }
     }
 
     #[test]

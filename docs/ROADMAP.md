@@ -83,7 +83,9 @@ Detection, masking, `Reveal`, and the fixture corpus with its tests.
       multi-byte UTF-8, or on a grapheme cluster boundary.
 - [x] Masking is display-only. The preview is masked before it is stored, so `List` and
       `Search` have no unmasked one to return; `Reveal(id)` is the only member that returns a
-      whole value; and `Copy` puts the real bytes on the clipboard.
+      whole value; and `Copy` puts the real bytes on the clipboard. Entries captured before
+      this milestone keep their old preview — there is no migration pass — until the next
+      copy of the same value, which re-detects it and replaces the preview with a mask.
 - [x] A fixture corpus in both directions at `crates/clippo-core/tests/corpus.toml` — tokens,
       high-entropy secrets and a hinted password against git SHAs, UUIDs, base64 blobs,
       minified JS, prose, URLs and paths — with a test asserting every fixture's

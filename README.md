@@ -8,11 +8,12 @@ pasting the real value.
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, components, and the decisions on record.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — build order (M0–M6) and how each stage is verified.
 
-> **Status:** M3 complete. Capture, encrypted storage, the daemon, the `clippo` CLI and the
-> copy-back path are in: `clippod` records every copy, serves `com.nilfactor.Clippo` on the
-> session bus, and `clippo copy <id>` puts an entry back on the clipboard for any application
-> to paste. Still to come — masking of suspected secrets, and the applet. See the roadmap for
-> what lands when.
+> **Status:** M4 complete. Capture, encrypted storage, the daemon, the `clippo` CLI, the
+> copy-back path and secret masking are in: `clippod` records every copy, serves
+> `com.nilfactor.Clippo` on the session bus, `clippo copy <id>` puts an entry back on the
+> clipboard for any application to paste, and a suspected password or token shows as
+> `ab••••••••yz` rather than in full — see [Secrets](#secrets). Still to come — the applet.
+> See the roadmap for what lands when.
 
 ## ⚠️ Build and run from a host terminal, not RustRover's Flatpak
 
@@ -233,6 +234,18 @@ Masking is display-only, and that is a property of where it happens rather than 
   interface that returns one. `List` and `Search` hand out `entries.preview`, which for a
   sensitive entry is *already the mask in the database* — there is no unmasked preview for them
   to return.
+
+Two consequences of masking before storage rather than on the way out, both worth knowing
+before you go looking for them:
+
+- **`clippo search` cannot find a masked entry by its contents.** Search matches previews, and
+  a sensitive entry's preview is the mask, so the only thing that matches is the four visible
+  characters. Find it in `clippo list` instead — masked rows are the ones with `s` in the `FL`
+  column.
+- **Entries copied before this version keep the preview they were stored with.** There is no
+  migration pass over an existing history. Copying the same value again re-runs detection and
+  replaces the preview with a mask, so anything you still use is corrected as you use it; to
+  clear the rest at once, `clippo clear`.
 
 ### Configuring it
 

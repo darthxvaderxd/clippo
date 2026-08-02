@@ -101,7 +101,14 @@ pub struct EntrySummary {
     ///
     /// The masking happened at capture: this field is `entries.preview`, which
     /// is already a mask in the database for a sensitive entry. There is no
-    /// unmasked preview anywhere for a `List` or a `Search` to return.
+    /// unmasked preview for a `List` or a `Search` to return.
+    ///
+    /// With one bounded exception, worth naming because it is the first
+    /// database anyone runs this against: rows captured before masking existed
+    /// keep the preview they were stored with, since there is no migration pass
+    /// over the history. Copying such a value again re-detects it and replaces
+    /// the preview with a mask, so the exception shrinks with use and covers
+    /// nothing the user has touched since.
     pub preview: String,
     /// Whether the entry is exempt from retention and from an ordinary
     /// `Clear`.

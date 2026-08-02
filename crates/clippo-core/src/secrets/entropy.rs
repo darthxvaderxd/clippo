@@ -83,7 +83,19 @@ pub const ENTROPY_THRESHOLD_BITS_PER_CHAR: f64 = 3.5;
 ///
 /// The gates are evaluated cheapest-first, so the overwhelmingly common case —
 /// a copy with a space in it — costs one scan and no allocation.
+///
+/// The byte-length check comes before even that, and is the one gate that does
+/// not read the value at all. Without it the other pathological case — a
+/// whitespace-free copy of many megabytes, which is exactly the shape of a
+/// base64 blob — is scanned twice, once by [`is_single_token`] and once by
+/// [`length_is_in_range`], only to conclude it is over [`MAX_CHARS`]. UTF-8
+/// encodes a character in at most four bytes, so anything past that bound is
+/// over the character ceiling too, whatever it contains.
 pub fn fires(value: &str) -> bool {
+    if value.len() > MAX_CHARS * 4 {
+        return false;
+    }
+
     is_single_token(value)
         && !is_locator(value)
         && length_is_in_range(value)
@@ -250,6 +262,40 @@ mod tests {
         assert!(!fires("2026-08-02T04:51:06.489Z"));
         assert!(!fires("SGVsbG8gV29ybGQh"));
         assert!(!fires("correcthorsebatterystaple"));
+    }
+
+    /// The byte-length bail is an optimisation, so what needs pinning is that
+    /// it decides nothing: it must refuse only values the character gate would
+    /// have refused anyway.
+    ///
+    /// The risk is that bytes and characters are not the same count. A value of
+    /// [`MAX_CHARS`] four-byte characters sits exactly on the bound, so if the
+    /// bail were off by one it would turn a value the rule is supposed to
+    /// consider into a silent false negative — the direction DESIGN.md names as
+    /// the actual risk.
+    #[test]
+    fn the_byte_length_bail_refuses_nothing_the_character_gate_would_have_kept() {
+        // Every multi-byte width, at exactly the ceiling: the bail must let all
+        // of them through to the gates that read the value.
+        for wide in ['é', 'ᚠ', '𐐷'] {
+            let value: String = std::iter::repeat(wide).take(MAX_CHARS).collect();
+            assert!(value.len() > MAX_CHARS, "{wide:?} is multi-byte");
+            assert!(
+                length_is_in_range(&value),
+                "{MAX_CHARS} of {wide:?} is in range by characters"
+            );
+            assert!(
+                value.len() <= MAX_CHARS * 4,
+                "so the byte bail must not refuse it: {} bytes",
+                value.len()
+            );
+        }
+
+        // And the case it exists for: a whitespace-free megabyte is refused
+        // without the two full scans it would otherwise cost.
+        let blob = "SGVsbG8gV29ybGQh".repeat(65_536);
+        assert!(!fires(&blob));
+        assert!(!length_is_in_range(&blob), "and for the same reason");
     }
 
     /// The two shapes the *class* gate handles rather than the threshold, also
