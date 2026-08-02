@@ -45,8 +45,19 @@ Unit-tested against a temp DB.
 `clippod`, the D-Bus interface, the `clippo` CLI, and the copy-back offer path including the
 self-echo guard.
 
+- [x] `clippo-ipc` defines the interface once — the served side and the proxy both generated
+      from the same member list, so a signature cannot drift between the daemon and a frontend.
+- [x] `clippod` owns the store and the Wayland watcher, records every capture, and serves
+      `com.nilfactor.Clippo` on the session bus.
+- [x] `clippo list|search|copy|pin|rm|clear|pause|reveal`, each one proxy call, with a short
+      typeable id, a terminal-safe table, `--json`, and one clear message when the daemon is
+      not running.
+- [ ] The copy-back offer path and the self-echo guard. Until it lands `Copy` refuses, saying
+      so, and leaves the history alone rather than reporting a paste that did not happen.
+
 > **Gate:** `clippo list` and `clippo copy <id>` work end to end, and pasting into another app
-> yields the right content.
+> yields the right content. This is [verification 2](#2-round-trip) below, and it is manual —
+> no CI runner has a compositor.
 
 ### M4 — secrets
 
@@ -92,10 +103,18 @@ both protocols and prints the `$WAYLAND_DISPLAY` it saw.
 
 ### 2. Round trip
 
-With `clippod` running: copy three things, confirm `clippo list` shows three entries, then
-`clippo copy 2` and `Ctrl+V` in `cosmic-edit` — entry 2 should paste verbatim.
+With `clippod` running in one host terminal and `clippo` in another:
 
-Copy the same text twice → still one entry, with a bumped timestamp.
+- [ ] Copy three things — `clippo list` shows three entries, newest first.
+- [ ] `clippo copy 2`, then `Ctrl+V` in `cosmic-edit` — entry 2 pastes verbatim.
+- [ ] Copy the same text twice → still one entry, and its `AGE` column resets rather than a
+      second row appearing.
+- [ ] `clippo reveal 2 | wc -c` counts the whole value, with no newline added.
+- [ ] Stop `clippod` → every subcommand says clippod is not running and exits non-zero.
+
+The second box needs the copy-back offer path, which is the unchecked M3 item above: until
+that lands `clippo copy 2` reports that the daemon cannot do it yet, which is the honest
+answer but not a pass.
 
 ### 3. Encryption
 
@@ -128,5 +147,10 @@ unpinned remain.
 
 - `clippo-core` — detection and masking against the fixture corpus
 - `clippo-store` — dedup, retention, and pin-exemption against a temp DB
+- `clippo-ipc` — the proxy and the interface over a real bus, which needs
+  `dbus-run-session -- cargo test --workspace` (what `just test` and CI run)
+- `clippo-cli` — argument parsing, id resolution, and the table, JSON and escaping against
+  fixture `EntrySummary` values
 
-The Wayland and UI layers stay manual.
+The Wayland and UI layers stay manual, and so does the CLI's live round trip against a running
+daemon — that is verification 2 above.

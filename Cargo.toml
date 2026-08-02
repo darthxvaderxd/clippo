@@ -42,6 +42,7 @@ async-trait = "0.1"
 
 # config / serialization
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 
 # storage
@@ -66,8 +67,10 @@ calloop = "0.14"
 calloop-wayland-source = "0.4"
 rustix = { version = "1", features = ["pipe", "fs"] }
 
-# CLI
-clap = { version = "4", features = ["derive"] }
+# CLI. `wrap_help` because clippo's own `--help` is prose — several paragraphs
+# on id prefixes and on what `reveal` does not sanitise — and without it clap
+# emits one long line per paragraph for the terminal to break mid-word.
+clap = { version = "4", features = ["derive", "wrap_help"] }
 
 # test support
 tempfile = "3"
