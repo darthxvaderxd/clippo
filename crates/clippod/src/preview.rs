@@ -115,8 +115,15 @@ pub struct Description {
 /// An image is never masked even when the marker fires. Its preview is
 /// `image/png, 2.0 KB`, which is a type and a size and reveals nothing; masking
 /// it would hide the one useful thing on the row while protecting nothing. The
-/// `sensitive` flag is still set, so the applet still draws the badge and the
-/// blob is still only reachable through `Copy`.
+/// `sensitive` flag is still set, so the applet still draws the badge, and the
+/// full-size blob is still only reachable through `Copy`.
+///
+/// M5 added one thing this used to say was unreachable: the applet draws the
+/// derived thumbnail on the row, so a hinted image shows a downscale of itself
+/// beside the lock badge. That follows from the paragraph above rather than
+/// contradicting it — the marker fires on the flavors, not on what the picture
+/// shows, and an image whose *preview* is deliberately unmasked has nothing
+/// left for a mask to protect. `Reveal` still refuses an image outright.
 pub fn describe(
     kind: EntryKind,
     flavors: &[Flavor],

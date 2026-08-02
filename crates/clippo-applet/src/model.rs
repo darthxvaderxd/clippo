@@ -31,6 +31,49 @@
 use clippo_ipc::EntrySummary;
 use zeroize::Zeroizing;
 
+/// The `clippo_core::EntryKind` word for an image row, as it arrives over the
+/// bus.
+///
+/// A `String` on [`EntrySummary`] rather than the enum, because the wire
+/// signature is a string. Named once here so that the two places that ask "is
+/// this an image" — whether to fetch a thumbnail, and whether to draw one —
+/// cannot answer differently.
+pub const IMAGE_KIND: &str = "image";
+
+/// Which entry a cached thing belongs to.
+///
+/// `(id, created_at)` rather than the id alone, and that is not belt and
+/// braces: `entries.id` is an `INTEGER PRIMARY KEY` *without* `AUTOINCREMENT`,
+/// so SQLite hands out `max(rowid) + 1` and an id is a row slot rather than a
+/// name. Deleting the newest entry frees its id for the next copy, and
+/// `clippo clear` restarts at 1 — so anything the applet holds across a refresh
+/// and looks up by id alone will sooner or later be handed back for a different
+/// entry. For a thumbnail that means a deleted screenshot drawn beside the
+/// unrelated text the user copied afterwards, which is the user's remedy for
+/// "get that picture out of my history" leaving the picture on screen.
+///
+/// `created_at` is a capture timestamp the daemon already sends on every row,
+/// and the store never rewrites it — a repeat copy bumps `last_used_at` and
+/// leaves `created_at` alone — so the pair is stable for as long as the entry
+/// exists and cannot be reissued to another one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EntryKey {
+    /// The entry's id, as passed to every D-Bus member.
+    pub id: i64,
+    /// When it was captured, in Unix milliseconds.
+    pub created_at: i64,
+}
+
+impl EntryKey {
+    /// The key for one row.
+    pub fn of(entry: &EntrySummary) -> Self {
+        Self {
+            id: entry.id,
+            created_at: entry.created_at,
+        }
+    }
+}
+
 /// Whether the daemon is answering.
 ///
 /// The distinction this exists for is "no daemon" versus "no history": both
@@ -80,6 +123,15 @@ pub struct Model {
     selected: Option<i64>,
     revealed: Option<Revealed>,
     status: Status,
+    /// Whether the next list should land the highlight on its top row.
+    ///
+    /// Set by [`set_query`](Model::set_query) and [`restart`](Model::restart),
+    /// taken by [`set_entries`](Model::set_entries) — they are a round trip
+    /// apart, because the applet asks the daemon and finds out what the ranking
+    /// is some milliseconds later. Without it `set_entries` cannot tell a fresh
+    /// ranking from the same one with a row added or removed, and the two want
+    /// opposite answers.
+    land_at_top: bool,
 }
 
 impl Model {
@@ -119,8 +171,32 @@ impl Model {
 
     /// Replace the query. Does not filter anything — the caller sends it to
     /// `Search` and feeds the answer back through [`set_entries`](Self::set_entries).
+    ///
+    /// Records that the query changed, so the list that comes back is treated
+    /// as a new ranking rather than as the old one edited. Only a real change
+    /// counts: re-setting the same string happens on any redraw path and must
+    /// not move the highlight the user just arrowed onto.
     pub fn set_query(&mut self, query: String) {
+        if query != self.query {
+            self.land_at_top = true;
+        }
         self.query = query;
+    }
+
+    /// Say that the next list is a fresh look at the history rather than the
+    /// current one changing.
+    ///
+    /// What opening the picker does. The rows from last time are still here —
+    /// they are not thrown away on close, so that reopening draws something
+    /// immediately — but the highlight should not still be nine rows down where
+    /// the user left it ten minutes ago. The entry they almost certainly want is
+    /// the one they just copied, which is the top row.
+    ///
+    /// Separate from [`set_query`](Self::set_query) because clearing an already
+    /// empty query is not a change and would otherwise leave the highlight
+    /// exactly where reopening should have moved it.
+    pub fn restart(&mut self) {
+        self.land_at_top = true;
     }
 
     /// Replace the rows with what the daemon just returned.
@@ -129,22 +205,37 @@ impl Model {
     /// what M5 rules out, because the applet and `clippo search` would then
     /// disagree about the same query.
     ///
-    /// The selection survives if its entry is still in the list. When it is
-    /// not — deleted here, or removed by `clippo rm` in a terminal — the
-    /// highlight lands on whatever is now at the same position rather than
-    /// jumping to the top, so deleting several rows in a row does not walk the
-    /// user back to the start of the history each time.
+    /// Where the highlight lands depends on why the list changed, and the two
+    /// reasons want opposite answers:
+    ///
+    /// - **The same query, re-answered** — a copy arrived, or a row was
+    ///   deleted here or by `clippo rm` in a terminal. The selection survives if
+    ///   its entry is still there; when it is not, the highlight lands on
+    ///   whatever is now at the same position rather than jumping to the top,
+    ///   so deleting several rows in a row does not walk the user back to the
+    ///   start of the history each time.
+    /// - **A fresh ranking** — the user typed, or the picker was just opened.
+    ///   The highlight belongs on the best match. Keeping the row number here is
+    ///   how `Enter` ends up copying something the ranking did not put first:
+    ///   arrow down to row 3, type one character, and the highlight stays on
+    ///   row 3 of a list it has never seen.
     pub fn set_entries(&mut self, entries: Vec<EntrySummary>) {
         let previous = self.selected_index();
+        let land_at_top = std::mem::take(&mut self.land_at_top);
         self.entries = entries;
 
-        let still_there = self
-            .selected
-            .is_some_and(|id| self.entries.iter().any(|entry| entry.id == id));
+        let still_there = !land_at_top
+            && self
+                .selected
+                .is_some_and(|id| self.entries.iter().any(|entry| entry.id == id));
         if !still_there {
-            let landing = previous
-                .unwrap_or(0)
-                .min(self.entries.len().saturating_sub(1));
+            let landing = if land_at_top {
+                0
+            } else {
+                previous
+                    .unwrap_or(0)
+                    .min(self.entries.len().saturating_sub(1))
+            };
             self.selected = self.entries.get(landing).map(|entry| entry.id);
         }
 
@@ -205,10 +296,14 @@ impl Model {
 
     /// Hold a value `Reveal` just returned, for as long as its row stays
     /// selected.
-    pub fn set_revealed(&mut self, id: i64, value: String) {
+    ///
+    /// Takes anything that becomes a [`Zeroizing<String>`] so the caller can
+    /// hand over one it was already holding, rather than this wrapping a plain
+    /// `String` and leaving the caller's unwiped copy behind.
+    pub fn set_revealed(&mut self, id: i64, value: impl Into<Zeroizing<String>>) {
         self.revealed = Some(Revealed {
             id,
-            value: Zeroizing::new(value),
+            value: value.into(),
         });
     }
 
@@ -405,5 +500,113 @@ mod tests {
         let mut model = model_with(&[1, 2]);
         model.select(99);
         assert_eq!(model.selected_id(), Some(1));
+    }
+
+    /// Typing is a new ranking, so `Enter` must copy the best match rather than
+    /// whatever inherited the row number the highlight happened to be on.
+    #[test]
+    fn a_new_query_puts_the_highlight_on_the_best_match() {
+        let mut model = model_with(&[1, 2, 3, 4]);
+        model.select_next();
+        model.select_next();
+        assert_eq!(model.selected_index(), Some(2));
+
+        model.set_query("ab".to_owned());
+        model.set_entries(vec![entry(9), entry(3), entry(1)]);
+
+        assert_eq!(
+            model.selected_id(),
+            Some(9),
+            "the top-ranked match, not row 2 of a list it has never seen"
+        );
+    }
+
+    /// The other half of the same rule: an entry still in the results after a
+    /// query change does not keep the highlight either — the ranking decides.
+    #[test]
+    fn a_new_query_does_not_keep_the_highlight_on_a_surviving_entry() {
+        let mut model = model_with(&[1, 2, 3]);
+        model.select_next();
+        assert_eq!(model.selected_id(), Some(2));
+
+        model.set_query("b".to_owned());
+        model.set_entries(vec![entry(3), entry(2)]);
+
+        assert_eq!(model.selected_id(), Some(3));
+    }
+
+    /// And the landing rule for a deletion still applies once the query has
+    /// settled — one keystroke must not disable it for the rest of the session.
+    #[test]
+    fn a_deletion_after_a_query_change_still_lands_where_it_was() {
+        let mut model = Model::new();
+        model.set_query("a".to_owned());
+        model.set_entries(vec![entry(1), entry(2), entry(3), entry(4)]);
+        model.select_next();
+        model.select_next();
+        assert_eq!(model.selected_index(), Some(2));
+
+        // Same query, one row gone: the deletion rule, not the requery rule.
+        model.set_entries(vec![entry(1), entry(2), entry(4)]);
+
+        assert_eq!(model.selected_id(), Some(4));
+        assert_eq!(model.selected_index(), Some(2));
+    }
+
+    /// Re-setting the identical query happens on ordinary redraw paths and is
+    /// not a fresh ranking.
+    #[test]
+    fn setting_the_same_query_again_does_not_move_the_highlight() {
+        let mut model = model_with(&[1, 2, 3]);
+        model.select_next();
+
+        model.set_query(String::new());
+        model.set_entries(vec![entry(1), entry(2), entry(3)]);
+
+        assert_eq!(model.selected_id(), Some(2));
+    }
+
+    /// Which is why opening the picker says so itself. Clearing an already
+    /// empty query is not a change, so without this the highlight would still
+    /// be where the user left it last time — and `Enter` would copy that
+    /// instead of the entry they just copied elsewhere.
+    #[test]
+    fn reopening_the_picker_puts_the_highlight_back_on_the_newest_entry() {
+        let mut model = model_with(&[1, 2, 3]);
+        model.select_next();
+        model.select_next();
+        assert_eq!(model.selected_id(), Some(3));
+
+        // What `present` does: same (empty) query, fresh look.
+        model.set_query(String::new());
+        model.restart();
+        model.set_entries(vec![entry(9), entry(1), entry(2), entry(3)]);
+
+        assert_eq!(model.selected_id(), Some(9));
+    }
+
+    #[test]
+    fn an_entry_key_is_the_id_and_the_capture_time() {
+        let key = EntryKey::of(&entry(7));
+        assert_eq!(
+            key,
+            EntryKey {
+                id: 7,
+                created_at: 7
+            }
+        );
+    }
+
+    /// The reason the key is a pair. SQLite reissues a deleted id to the next
+    /// insert, so the same id can name two different entries over a session —
+    /// and anything cached against it must not follow.
+    #[test]
+    fn a_reissued_id_is_a_different_key() {
+        let mut screenshot = entry(42);
+        screenshot.created_at = 1_000;
+        let mut later_text = entry(42);
+        later_text.created_at = 2_000;
+
+        assert_ne!(EntryKey::of(&screenshot), EntryKey::of(&later_text));
     }
 }

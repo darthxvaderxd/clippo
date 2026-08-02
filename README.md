@@ -233,8 +233,9 @@ looks like that.
 `Ctrl+R` calls `Reveal(id)` for that one row and shows the answer in place. It is **never
 cached**: the applet answers with it only while that same row is still highlighted, so moving
 the selection stops it being drawn, and it is dropped when the popup closes — whether you
-closed it or clicked away. The value is held zeroized, so dropping it wipes the memory rather
-than leaving the secret in a freed buffer for a core dump to pick up.
+closed it or clicked away. The value is held zeroized from the moment it arrives, so dropping
+it wipes the memory rather than leaving the secret in a freed buffer for a core dump to pick
+up — with one honest gap: the buffer zbus deserialises the reply into is not clippo's to wipe.
 
 Copying a masked row still copies the **real** value. Masking is display-only everywhere in
 clippo; see [Secrets](#secrets).
@@ -244,6 +245,11 @@ clippo; see [Secrets](#secrets).
 The applet subscribes to the daemon's `HistoryChanged` and never polls. Copy something in
 another window with the picker open and it appears at the top; `clippo rm <id>` in a terminal
 removes that row from under you.
+
+With the picker *closed* the applet listens and does nothing else. The signal fires on every
+copy you make all day, and re-reading a list nobody is looking at would cost the daemon a
+ranked search — and a thumbnail fetch for every screenshot — for no visible benefit. Opening
+the picker refreshes it, so what you see is always current.
 
 If `clippod` is not running the picker says so, with the command to start it. It deliberately
 does *not* show an empty list, which would read as "your clipboard history is gone". It

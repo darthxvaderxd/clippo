@@ -20,19 +20,28 @@
 //! # Images
 //!
 //! An image row draws the stored `image/png;clippo-thumb` bytes, which capture
-//! derived once. Nothing here ever asks for the full-size blob: the thumbnails
-//! map is filled by `Thumbnail` calls and a row with no entry in it draws the
-//! generic image icon rather than falling back to the real image.
-
-use std::collections::HashMap;
+//! derived once. Nothing here ever asks for the full-size blob: the cache is
+//! filled by `Thumbnail` calls and a row [`Thumbnails::get`] has nothing for
+//! draws the generic image icon rather than falling back to the real image.
+//!
+//! A *sensitive* image row draws its thumbnail like any other, next to the lock
+//! badge. That is a decision rather than an oversight, and it is M4's: an
+//! image's preview is deliberately left unmasked because it is a type and a
+//! size (`image/png, 2.0 KB`) and hiding it would protect nothing while
+//! removing the only useful thing on the row. A thumbnail is the same
+//! judgement one step further — the marker fires on the flavors, not on what
+//! the picture shows, and a screenshot the user copied is a screenshot they
+//! chose. `Reveal` remains the only route to the full-size bytes.
 
 use clippo_ipc::EntrySummary;
 use cosmic::iced::{Alignment, Length};
-use cosmic::widget::{self, image};
+use cosmic::widget;
+use cosmic::widget::image::Handle;
 use cosmic::{theme, Element};
 
 use crate::app::{Action, Message};
 use crate::model::{Model, Status};
+use crate::thumbs::Thumbnails;
 
 /// The id of the search field, so that opening the picker can focus it.
 pub fn search_id() -> widget::Id {
@@ -50,10 +59,7 @@ const PREVIEW_CHARS: usize = 96;
 const THUMB: f32 = 40.0;
 
 /// The whole picker.
-pub fn picker<'a>(
-    model: &'a Model,
-    thumbnails: &'a HashMap<i64, image::Handle>,
-) -> Element<'a, Message> {
+pub fn picker<'a>(model: &'a Model, thumbnails: &'a Thumbnails) -> Element<'a, Message> {
     let search = widget::search_input("Search the clipboard", model.query())
         .id(search_id())
         .on_input(Message::QueryChanged)
@@ -81,7 +87,7 @@ pub fn picker<'a>(
 }
 
 /// The rows.
-fn list<'a>(model: &'a Model, thumbnails: &'a HashMap<i64, image::Handle>) -> Element<'a, Message> {
+fn list<'a>(model: &'a Model, thumbnails: &'a Thumbnails) -> Element<'a, Message> {
     let selected = model.selected_id();
     let revealed = model.revealed();
 
@@ -97,7 +103,9 @@ fn list<'a>(model: &'a Model, thumbnails: &'a HashMap<i64, image::Handle>) -> El
                 // has already established that this is the focused row, so the
                 // check here is about not leaking it sideways into the others.
                 is_selected.then_some(revealed).flatten(),
-                thumbnails.get(&entry.id),
+                // Answers `None` for anything that is not an image row, so a
+                // cache mistake cannot put a picture on a row of text.
+                thumbnails.get(entry),
             ))
         });
 
@@ -112,7 +120,7 @@ fn row<'a>(
     entry: &'a EntrySummary,
     selected: bool,
     revealed: Option<&'a str>,
-    thumbnail: Option<&'a image::Handle>,
+    thumbnail: Option<&'a Handle>,
 ) -> Element<'a, Message> {
     let leading: Element<'a, Message> = match thumbnail {
         Some(handle) => widget::image(handle.clone())
@@ -124,10 +132,19 @@ fn row<'a>(
             .into(),
     };
 
-    let text = revealed.unwrap_or(&entry.preview);
+    // A revealed value is drawn whole and wrapped. It is the one thing on the
+    // row the user asked to *read*, and a secret cut off at the width of the
+    // list is one they have to go elsewhere to finish — which is the entire
+    // reason they pressed Ctrl+R. A preview is still shortened: those are
+    // browsed rather than read, and one long one would otherwise set the width
+    // of every row.
+    let body = match revealed {
+        Some(value) => widget::text::body(value).width(Length::Fill),
+        None => widget::text::body(shorten(&entry.preview, PREVIEW_CHARS)).width(Length::Fill),
+    };
     let mut line = widget::Row::new()
         .push(leading)
-        .push(widget::text::body(shorten(text, PREVIEW_CHARS)).width(Length::Fill))
+        .push(body)
         .spacing(8)
         .align_y(Alignment::Center);
 

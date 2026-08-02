@@ -112,16 +112,28 @@ libcosmic UI: search, pins, images, live updates via `HistoryChanged`, and `Togg
       place through `Reveal(id)`. The revealed value is **never cached**: it is answered only
       while its own row is still selected, so moving the highlight stops it being drawn without
       anything having to remember to clear it, and it is dropped when the popup closes —
-      whether the applet closed it or the compositor did. It is held in a `Zeroizing<String>`,
-      so dropping it wipes the memory rather than freeing it with the secret still in place.
+      whether the applet closed it or the compositor did. It is held in a `Zeroizing<String>`
+      from the moment it arrives on the bus, so dropping it wipes the memory rather than
+      freeing it with the secret still in place; zbus's own deserialisation buffer is the one
+      hop clippo does not own and does not wipe. The event carrying it has a hand-written
+      `Debug` that prints a length, so a `debug!` added later cannot put it in the journal.
 - [x] Image rows draw the stored `image/png;clippo-thumb` flavor, fetched with the new
-      `Thumbnail(id)` member. The applet never asks for a full-size blob; a row whose thumbnail
-      is missing draws the generic image icon rather than falling back to the real image, and
-      each entry is asked at most once so a history of oversized screenshots is not re-fetched
-      per keystroke.
+      `Thumbnail(id)` member. The applet never asks for a full-size blob — and neither does the
+      daemon serving it, which reaches the thumbnail with a targeted read rather than through
+      `Store::get`, so the full-size PNG beside it is never read or decrypted. A row whose
+      thumbnail is missing draws the generic image icon rather than falling back to the real
+      image, and each entry is asked at most once *that the request was actually queued*, so a
+      history of oversized screenshots is not re-fetched per keystroke and a list with more
+      image rows than the request channel holds still finishes fetching. The cache is keyed on
+      `(id, created_at)`: SQLite reissues a deleted id to the next insert, so an id alone would
+      eventually draw a deleted screenshot beside the entry that inherited its id.
 - [x] Live updates by subscription, with nothing polled. `HistoryChanged` refreshes the list
       while the popup is open, and `NameOwnerChanged` filtered to the daemon's name is how the
-      applet notices `clippod` stopping and starting.
+      applet notices `clippod` stopping and starting. *While the popup is open* is literal: the
+      signal fires on every copy anyone makes and the picker is closed for almost all of them,
+      so a refresh with nothing on screen would spend a ranked `Search`, a list of previews and
+      a `Thumbnail` round trip per copied screenshot for no one. Nothing is lost by waiting —
+      opening the picker refreshes as it opens.
 - [x] The applet reconnects with no reconnection code — a zbus signal stream is a match rule
       held by the bus and a proxy is a name and a path, so both outlive the daemon they refer
       to — and shows an explicit "clippod is not running" panel rather than an empty list that

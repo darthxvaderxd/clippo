@@ -28,13 +28,10 @@
 //! will do both. DESIGN.md specifies `Delete` for removal, so it keeps that
 //! binding, and this is the cost.
 
-use std::collections::{HashMap, HashSet};
-
 use cosmic::app::{Core, Task};
 use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
 use cosmic::iced::window::Id;
 use cosmic::iced::{Event, Subscription};
-use cosmic::widget::image;
 use cosmic::Element;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -42,6 +39,7 @@ use tracing::{debug, warn};
 use crate::bus::{self, Request};
 use crate::model::{Model, Status};
 use crate::surface::Picker;
+use crate::thumbs::Thumbnails;
 use crate::view;
 
 /// The panel icon.
@@ -100,34 +98,39 @@ pub struct Clippo {
     /// How to reach the daemon. `None` until the bus worker has started, which
     /// is the only window in which the UI can do nothing.
     requests: Option<mpsc::Sender<Request>>,
-    /// Decoded thumbnails, by entry id.
+    /// Decoded thumbnails and what has been asked for.
     ///
     /// Not secret — a thumbnail is a downscale of a picture the user copied —
     /// so unlike a revealed value this is allowed to persist across popup
     /// opens, which is what stops reopening the picker re-fetching every image.
-    thumbnails: HashMap<i64, image::Handle>,
-    /// Entries a thumbnail has already been asked for, successfully or not.
-    ///
-    /// Without this an image stored without a thumbnail would be re-requested
-    /// on every refresh, which for a history full of oversized screenshots is a
-    /// call per row per keystroke.
-    asked: HashSet<i64>,
+    /// [`Thumbnails`] owns the rules for that; this file only decides *when* to
+    /// ask.
+    thumbnails: Thumbnails,
 }
 
 impl Clippo {
-    /// Hand a request to the bus worker.
+    /// Hand a request to the bus worker, saying whether it was taken.
     ///
     /// `try_send` because this runs in `update`, which is synchronous. A full
     /// queue means the daemon is not keeping up with the UI; dropping the
     /// request is right, since the next keystroke supersedes a refresh anyway
     /// and the alternative is blocking the frame.
-    fn ask(&self, request: Request) {
+    ///
+    /// The return value matters for anything that also records *that* it asked.
+    /// The executor is single-threaded, so the worker cannot drain a slot while
+    /// this is running: a caller that marks first and sends second turns one
+    /// full queue into a permanent gap.
+    fn ask(&self, request: Request) -> bool {
         let Some(requests) = self.requests.as_ref() else {
             debug!(?request, "clippo-applet is not on the bus yet; dropping");
-            return;
+            return false;
         };
-        if let Err(error) = requests.try_send(request) {
-            warn!(%error, "clippo-applet could not queue a request");
+        match requests.try_send(request) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "clippo-applet could not queue a request");
+                false
+            }
         }
     }
 
@@ -136,11 +139,32 @@ impl Clippo {
         self.ask(Request::Refresh(self.model.query().to_owned()));
     }
 
+    /// Re-read the list, but only when there is something on screen to update.
+    ///
+    /// The popup is closed almost all of the time, and `HistoryChanged` fires
+    /// on every copy anyone makes. Refreshing regardless would spend a ranked
+    /// `Search`, up to [`bus::ROW_LIMIT`] marshalled preview strings and a
+    /// `Thumbnail` round trip per copied screenshot on a picker nobody is
+    /// looking at. Nothing is lost by waiting: [`Clippo::present`] refreshes as
+    /// it opens, so the first thing on screen is always current.
+    fn refresh_if_visible(&self) {
+        if self.picker.is_open() {
+            self.refresh();
+        }
+    }
+
     /// Copy the selected entry and put the picker away.
     ///
     /// Closing is not optional: the user asked for this value in order to paste
     /// it somewhere, and a picker still on screen is over the window they are
     /// about to paste into.
+    ///
+    /// It closes before the `Copy` can have failed, which is the cost of that:
+    /// a refusal reaches the journal and not the user, who finds out by pasting
+    /// the wrong thing. Holding the picker open until the answer came back
+    /// would put a frame's delay on every copy to catch a case that only arises
+    /// when the daemon has just died, and the model has nowhere to show the
+    /// message anyway — see [`bus::Event::Failed`].
     fn activate(&mut self) -> Task<Message> {
         let Some(id) = self.model.selected_id() else {
             return Task::none();
@@ -171,8 +195,17 @@ impl Clippo {
     /// gone. So it waits for [`Message::Opened`].
     fn present(&mut self) -> Task<Message> {
         self.model.set_query(String::new());
-        self.refresh();
-        self.picker.show(&self.core)
+        // And the highlight goes back to the top, for the same reason the query
+        // does not survive: a picker reopened ten minutes later should be
+        // pointing at the entry the user just copied, not at row nine of the
+        // list they were looking at then.
+        self.model.restart();
+        let opening = self.picker.show(&self.core);
+        // After `show` rather than before it, so that a picker which could not
+        // open — no panel surface yet — does not spend a `Search` and a burst
+        // of `Thumbnail` calls on a list nobody is going to see.
+        self.refresh_if_visible();
+        opening
     }
 
     /// Open or close.
@@ -185,18 +218,19 @@ impl Clippo {
     }
 
     /// Ask for any thumbnail an image row needs and does not have.
+    ///
+    /// The entry is marked as asked only once [`Clippo::ask`] says the worker
+    /// took the request, which is [`Thumbnails`]'s rule and the reason it is a
+    /// separate call. And the loop stops at the first refusal rather than
+    /// carrying on: the executor is single-threaded, so nothing can drain a
+    /// slot in the middle of it and every later `try_send` would fail the same
+    /// way. The backlog is picked up in [`Clippo::on_bus`] as replies come in.
     fn fetch_thumbnails(&mut self) {
-        let wanted: Vec<i64> = self
-            .model
-            .entries()
-            .iter()
-            .filter(|entry| entry.kind == "image" && !self.asked.contains(&entry.id))
-            .map(|entry| entry.id)
-            .collect();
-
-        for id in wanted {
-            self.asked.insert(id);
-            self.ask(Request::Thumbnail(id));
+        for key in self.thumbnails.wanted(self.model.entries()) {
+            if !self.ask(Request::Thumbnail(key)) {
+                break;
+            }
+            self.thumbnails.asked(key);
         }
     }
 
@@ -205,10 +239,15 @@ impl Clippo {
         match event {
             bus::Event::Ready(sender) => {
                 self.requests = Some(sender);
-                self.refresh();
+                // Only if something is on screen. At startup nothing is — the
+                // panel draws an icon, not a picker — but the icon can be
+                // clicked before the worker is up, and that click's own refresh
+                // was dropped for want of a sender.
+                self.refresh_if_visible();
             }
             bus::Event::Entries(entries) => {
                 self.model.set_entries(entries);
+                self.thumbnails.prune(self.model.entries());
                 self.fetch_thumbnails();
             }
             bus::Event::Revealed(id, value) => {
@@ -216,16 +255,23 @@ impl Clippo {
                 // row stays selected. Nothing else holds a copy.
                 self.model.set_revealed(id, value);
             }
-            bus::Event::Thumbnail(id, bytes) => {
-                self.thumbnails.insert(id, image::Handle::from_bytes(bytes));
+            bus::Event::Thumbnail(key, bytes) => {
+                self.thumbnails.store(key, bytes);
+                // A reply means a slot in the request queue has come free, so
+                // anything `fetch_thumbnails` had to leave behind can go now.
+                // This is what makes a list with more image rows than the queue
+                // holds finish rather than stopping at the first batch.
+                self.fetch_thumbnails();
             }
             bus::Event::Toggle => return self.toggle(),
             bus::Event::DaemonUp => {
-                // Unconditional refresh: this arrives both from
-                // `HistoryChanged` and from the daemon reappearing, and in
-                // either case the list on screen is the stale one.
+                // This arrives from `HistoryChanged`, from the daemon
+                // reappearing, and from every successful call — so on a busy
+                // desktop it is frequent, and the picker is closed for almost
+                // all of it. The list is stale either way; it only needs
+                // re-reading when somebody can see it.
                 self.model.set_status(Status::Connected);
-                self.refresh();
+                self.refresh_if_visible();
             }
             bus::Event::DaemonDown => {
                 self.model.set_status(Status::DaemonUnavailable);
@@ -233,7 +279,6 @@ impl Clippo {
                 // swept on startup, so nothing cached about the old one is
                 // worth keeping.
                 self.thumbnails.clear();
-                self.asked.clear();
             }
             bus::Event::Failed(message) => {
                 warn!(message, "clippo-applet: a call failed");
@@ -287,8 +332,11 @@ impl Clippo {
 /// the one piece of key handling that can be unit tested.
 fn action_for(key: &Key, modifiers: Modifiers) -> Option<Action> {
     // `macos_command` is not a thing here, but `control` alone must not match
-    // when other modifiers are held: `Ctrl+Shift+P` is not `Ctrl+P`.
-    let only_control = modifiers.control() && !modifiers.alt() && !modifiers.shift();
+    // when other modifiers are held: `Ctrl+Shift+P` is not `Ctrl+P`, and nor is
+    // `Super+Ctrl+P` — Logo is the modifier a desktop's own shortcuts are on,
+    // so a chord that includes it belongs to whatever bound it.
+    let only_control =
+        modifiers.control() && !modifiers.alt() && !modifiers.shift() && !modifiers.logo();
 
     match key {
         Key::Named(Named::ArrowUp) if !modifiers.control() => Some(Action::Previous),
@@ -323,8 +371,7 @@ impl cosmic::Application for Clippo {
             model: Model::new(),
             picker: Picker::new(),
             requests: None,
-            thumbnails: HashMap::new(),
-            asked: HashSet::new(),
+            thumbnails: Thumbnails::new(),
         };
         (applet, Task::none())
     }
@@ -508,6 +555,16 @@ mod tests {
         let both = Modifiers::CTRL | Modifiers::SHIFT;
         assert_eq!(action_for(&character("p"), both), None);
         assert_eq!(action_for(&character("r"), both), None);
+    }
+
+    /// Logo especially: `Super` is where a desktop puts its own shortcuts, and
+    /// `Super+V` is the one clippo asks the user to bind. `Super+Ctrl+P` is
+    /// somebody else's chord.
+    #[test]
+    fn a_super_chord_is_not_a_control_binding() {
+        let with_logo = Modifiers::CTRL | Modifiers::LOGO;
+        assert_eq!(action_for(&character("p"), with_logo), None);
+        assert_eq!(action_for(&character("r"), with_logo), None);
     }
 
     #[test]

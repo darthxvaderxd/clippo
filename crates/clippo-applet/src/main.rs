@@ -36,6 +36,7 @@ mod app;
 mod bus;
 mod model;
 mod surface;
+mod thumbs;
 mod view;
 
 use tracing_subscriber::EnvFilter;

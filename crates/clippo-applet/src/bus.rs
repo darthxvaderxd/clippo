@@ -42,10 +42,10 @@ use clippo_ipc::{
 use cosmic::iced::futures::{SinkExt, Stream, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
-// `name()` on an `fdo::Error` comes from this trait, which has to be in scope
-// even though nothing here names it. Same import `clippo-cli` needs.
 use zbus::fdo;
-use zbus::DBusError as _;
+use zeroize::Zeroizing;
+
+use crate::model::EntryKey;
 
 /// How many rows the popup asks for.
 ///
@@ -69,11 +69,15 @@ pub enum Request {
     /// `Reveal(id)` — the full value of one entry, on the user's instruction.
     Reveal(i64),
     /// `Thumbnail(id)` — the stored PNG for an image row.
-    Thumbnail(i64),
+    ///
+    /// Carries the whole [`EntryKey`] rather than the id the member takes, so
+    /// that the answer can be filed under a key that cannot have been reissued
+    /// to a different entry in the meantime.
+    Thumbnail(EntryKey),
 }
 
 /// Something that happened, for the UI to fold in.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Event {
     /// The worker is up; this is how the UI sends it [`Request`]s. Emitted
     /// once, before anything else.
@@ -82,17 +86,61 @@ pub enum Event {
     Entries(Vec<EntrySummary>),
     /// The answer to a [`Request::Reveal`]. Held only as long as its row stays
     /// focused — see [`crate::model`].
-    Revealed(i64, String),
-    /// The answer to a [`Request::Thumbnail`].
-    Thumbnail(i64, Vec<u8>),
+    ///
+    /// [`Zeroizing`] from the moment it arrives rather than only once the model
+    /// has it: this value is cloned by the runtime on its way through, and a
+    /// plain `String` would leave every intermediate copy in freed memory for a
+    /// core dump or a swap file to pick up. It cannot cover zbus's own
+    /// deserialisation buffer, which is the one hop this crate does not own.
+    Revealed(i64, Zeroizing<String>),
+    /// The answer to a [`Request::Thumbnail`], or `None` when the entry has no
+    /// thumbnail to give.
+    ///
+    /// Reported either way. The `None` is not just for the UI's benefit — it is
+    /// what tells the applet a slot in the request queue has come free, so a
+    /// list with more image rows than the queue holds finishes fetching instead
+    /// of stopping at the first refusal.
+    Thumbnail(EntryKey, Option<Vec<u8>>),
     /// `clippo show` called `Toggle` on the applet's interface.
     Toggle,
     /// The daemon is answering. Carries no data; the UI asks for a refresh.
     DaemonUp,
     /// The daemon is not answering.
     DaemonDown,
-    /// A call failed for a reason worth putting on screen.
+    /// A call failed for a reason the journal should have.
+    ///
+    /// Not on screen: the [`Model`][crate::model::Model] has nowhere to put a
+    /// per-call failure, and the two failures a user can act on — no daemon and
+    /// no results — have states of their own. Anything else is a refusal on one
+    /// member, which is logged with the member's name.
     Failed(String),
+}
+
+/// Hand-written so that a stray `debug!(?event)` cannot put a revealed password
+/// in the journal.
+///
+/// The precedent is M4's `Debug` on `clippo_core::Entry`, which prints a hash
+/// prefix rather than the hash. Same reasoning, stronger case: this variant
+/// carries the plaintext itself, and it is reachable from `Message`'s derived
+/// `Debug` through `Message::Bus`.
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Event::Ready(_) => f.write_str("Ready"),
+            Event::Entries(entries) => write!(f, "Entries({} rows)", entries.len()),
+            Event::Revealed(id, value) => {
+                write!(f, "Revealed({id}, {} chars)", value.chars().count())
+            }
+            Event::Thumbnail(key, Some(bytes)) => {
+                write!(f, "Thumbnail({key:?}, {} bytes)", bytes.len())
+            }
+            Event::Thumbnail(key, None) => write!(f, "Thumbnail({key:?}, none)"),
+            Event::Toggle => f.write_str("Toggle"),
+            Event::DaemonUp => f.write_str("DaemonUp"),
+            Event::DaemonDown => f.write_str("DaemonDown"),
+            Event::Failed(message) => write!(f, "Failed({message:?})"),
+        }
+    }
 }
 
 /// The served half of `com.nilfactor.ClippoApplet`.
@@ -170,6 +218,13 @@ pub fn worker() -> impl Stream<Item = Event> {
                 let _ = output
                     .send(Event::Failed(format!("no live updates: {error}")))
                     .await;
+                // Like the two exits above it. This one takes the request
+                // receiver down with it, so every later action is dropped —
+                // and without this the applet would keep its optimistic
+                // `Connected` state and draw "Nothing copied yet", which is
+                // precisely the "your history is gone" reading the explicit
+                // no-daemon state exists to prevent.
+                let _ = output.send(Event::DaemonDown).await;
                 return;
             }
         };
@@ -318,17 +373,19 @@ async fn serve_request(
             Err(error) => down("Pin", &error),
         },
         Request::Reveal(id) => match clippo.reveal(id).await {
-            Ok(value) => Event::Revealed(id, value),
+            Ok(value) => Event::Revealed(id, Zeroizing::new(value)),
             Err(error) => down("Reveal", &error),
         },
-        Request::Thumbnail(id) => match clippo.thumbnail(id).await {
-            Ok(bytes) => Event::Thumbnail(id, bytes),
+        Request::Thumbnail(key) => match clippo.thumbnail(key.id).await {
+            Ok(bytes) => Event::Thumbnail(key, Some(bytes)),
             // Not `down`: an image stored without a thumbnail is a normal
             // answer, not a sick daemon, and treating it as one would drop the
             // whole list into the error state over one undecodable screenshot.
+            // Still reported, because the UI is counting replies to know when
+            // it can queue the next request.
             Err(error) => {
-                debug!(id, %error, "no thumbnail for this entry");
-                return Ok(());
+                debug!(id = key.id, %error, "no thumbnail for this entry");
+                Event::Thumbnail(key, None)
             }
         },
     };
@@ -337,44 +394,22 @@ async fn serve_request(
 }
 
 /// A failed call, as an event.
+///
+/// Which failures mean "no daemon" is [`clippo_ipc::is_service_absent`]'s to
+/// say. The CLI has to tell the same two apart to print `clippod is not
+/// running`, and a second copy of the name list here is one that can drift.
 fn down(member: &str, error: &zbus::Error) -> Event {
     warn!(member, %error, "clippo-applet call failed");
-    if is_absent(error) {
+    if clippo_ipc::is_service_absent(error) {
         Event::DaemonDown
     } else {
         Event::Failed(format!("{member} failed: {error}"))
     }
 }
 
-/// Whether a failure means "no daemon" rather than "the daemon said no".
-///
-/// The same two names `clippo-cli` treats as an absent daemon, for the same
-/// reason — one is what a call to an unowned name gets, the other is what the
-/// bus says when asked about the name directly.
-fn is_absent(error: &zbus::Error) -> bool {
-    let name = match error {
-        zbus::Error::MethodError(name, _, _) => name.as_str().to_owned(),
-        zbus::Error::FDO(error) => error.name().as_str().to_owned(),
-        _ => return false,
-    };
-    matches!(
-        name.as_str(),
-        "org.freedesktop.DBus.Error.ServiceUnknown" | "org.freedesktop.DBus.Error.NameHasNoOwner"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_absent_daemon_is_told_apart_from_a_refusal() {
-        let absent = zbus::Error::FDO(Box::new(fdo::Error::ServiceUnknown(String::new())));
-        assert!(is_absent(&absent));
-
-        let refused = zbus::Error::FDO(Box::new(fdo::Error::InvalidArgs("no entry 9".to_owned())));
-        assert!(!is_absent(&refused));
-    }
 
     /// A refusal must not put the applet into the "daemon not running" state:
     /// deleting an id that another window already deleted is an ordinary race,
@@ -386,5 +421,45 @@ mod tests {
 
         let absent = zbus::Error::FDO(Box::new(fdo::Error::ServiceUnknown(String::new())));
         assert!(matches!(down("Delete", &absent), Event::DaemonDown));
+    }
+
+    /// The `Debug` that has to be hand-written. `Message` derives `Debug` and
+    /// contains this, so one `debug!(?message)` added later is the whole
+    /// distance between a revealed password and the journal.
+    #[test]
+    fn debugging_an_event_never_prints_a_revealed_value() {
+        let event = Event::Revealed(3, Zeroizing::new("hunter2".to_owned()));
+        let rendered = format!("{event:?}");
+
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert_eq!(rendered, "Revealed(3, 7 chars)");
+    }
+
+    /// The same through the type that actually reaches a log line.
+    #[test]
+    fn debugging_the_message_that_wraps_it_is_no_different() {
+        let message = crate::app::Message::Bus(Event::Revealed(3, "hunter2".to_owned().into()));
+        assert!(!format!("{message:?}").contains("hunter2"));
+    }
+
+    /// The rest of the events are still legible — a `Debug` that said nothing
+    /// would be safe and useless.
+    #[test]
+    fn the_other_events_still_say_what_they_are() {
+        assert_eq!(format!("{:?}", Event::DaemonDown), "DaemonDown");
+        assert_eq!(format!("{:?}", Event::Entries(vec![])), "Entries(0 rows)");
+
+        let key = EntryKey {
+            id: 42,
+            created_at: 1_000,
+        };
+        assert_eq!(
+            format!("{:?}", Event::Thumbnail(key, Some(vec![0; 12]))),
+            "Thumbnail(EntryKey { id: 42, created_at: 1000 }, 12 bytes)"
+        );
+        assert_eq!(
+            format!("{:?}", Event::Thumbnail(key, None)),
+            "Thumbnail(EntryKey { id: 42, created_at: 1000 }, none)"
+        );
     }
 }

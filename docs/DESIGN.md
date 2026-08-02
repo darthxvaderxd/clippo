@@ -264,4 +264,7 @@ Choices made during planning that a future reader might otherwise re-litigate:
   thumbnail expressly "so the applet never decodes full-size images", and with no member to
   fetch one the applet could only have reached it through the full-size blob — the thing the
   thumbnail exists to avoid. It returns derived bytes rather than stored content, so it does
-  not widen what `Reveal` is the sole route for.
+  not widen what `Reveal` is the sole route for. The member reads the thumbnail flavor on its
+  own rather than through `Store::get`, which returns *every* flavor: going through `get` would
+  avoid the full-size decode and still read and decrypt the full-size PNG in order to hand back
+  the small one beside it, which is the cost the derived thumbnail exists to remove.

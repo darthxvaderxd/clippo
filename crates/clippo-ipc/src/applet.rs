@@ -114,4 +114,54 @@ mod tests {
         assert_ne!(APPLET_BUS_NAME, crate::BUS_NAME);
         assert_ne!(APPLET_OBJECT_PATH, crate::OBJECT_PATH);
     }
+
+    /// What the trait is for, exercised rather than asserted: the served side
+    /// runs against a frontend that is not the applet and not on a bus.
+    struct Counter {
+        toggles: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AppletFrontend for Counter {
+        async fn toggle(&self) -> fdo::Result<()> {
+            self.toggles
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_served_interface_forwards_a_toggle_to_its_frontend() {
+        let counter = Arc::new(Counter {
+            toggles: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let interface = AppletInterface::new(counter.clone());
+
+        interface.toggle().await.unwrap();
+        interface.toggle().await.unwrap();
+
+        assert_eq!(
+            counter.toggles.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    /// And a frontend that refuses is reported as a refusal rather than
+    /// swallowed — `clippo show` prints what came back.
+    #[tokio::test]
+    async fn a_frontend_that_refuses_is_passed_through() {
+        struct Shutting;
+
+        #[async_trait]
+        impl AppletFrontend for Shutting {
+            async fn toggle(&self) -> fdo::Result<()> {
+                Err(fdo::Error::Failed("the applet is shutting down".to_owned()))
+            }
+        }
+
+        let interface = AppletInterface::new(Arc::new(Shutting));
+
+        let error = interface.toggle().await.unwrap_err();
+        assert!(error.to_string().contains("shutting down"), "{error}");
+    }
 }
