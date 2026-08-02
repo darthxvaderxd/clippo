@@ -19,10 +19,20 @@
 //! 2. **The Secret Service, through [`oo7`].** A 32-byte key stored as
 //!    lowercase hex under [`KEYRING_ATTRIBUTES`]. Created on first run.
 //! 3. **A new `~/.local/share/clippo/key`, mode `0600`**, when the Secret
-//!    Service cannot be reached — with a `WARN` naming the file and saying the
-//!    key is on disk unencrypted. Silent fallback is the failure worth avoiding
-//!    here: a user whose key quietly moved to a plain file should be able to
-//!    find that out from the daemon's log.
+//!    Service cannot be reached *and there is no `history.db` yet* — with a
+//!    `WARN` naming the file and saying the key is on disk unencrypted. Silent
+//!    fallback is the failure worth avoiding here: a user whose key quietly
+//!    moved to a plain file should be able to find that out from the daemon's
+//!    log.
+//! 4. **Otherwise, refuse to start.** If the Secret Service is unreachable and a
+//!    history database already exists, minting a key file would be the last
+//!    thing that ever happens to that database: rule 1 would hand the new file
+//!    key to SQLCipher on every subsequent run, so the keyring key that does
+//!    open it would never be consulted again, and a single transient keyring
+//!    outage — `clippod.service` has no ordering against gnome-keyring — would
+//!    cost the user their whole history permanently. Failing instead keeps the
+//!    working key reachable, and the next start with a live Secret Service
+//!    recovers on its own.
 //!
 //! An existing key file whose mode lets anyone but its owner read it is
 //! **refused**, not used. Wider-than-`0600` on a file that is the only thing
@@ -32,11 +42,14 @@
 //!
 //! # Getting back to the keyring
 //!
-//! Because rule 1 is absolute, there is no automatic migration from the file
-//! back to the Secret Service. Deleting both `key` and `history.db` starts over
-//! with a keyring-held key; deleting only `key` leaves a database nothing can
-//! decrypt. That is deliberate — clippo will not quietly discard history it can
-//! still read.
+//! Rule 1 is absolute *once a key file exists*, so there is no automatic
+//! migration from the file back to the Secret Service; rule 4 is what stops one
+//! ever being created underneath a database it cannot open. A machine that
+//! genuinely has no keyring gets its file key on first run, when there is no
+//! database to protect, and keeps it. Deleting both `key` and `history.db`
+//! starts over with a keyring-held key; deleting only `key` leaves a database
+//! nothing can decrypt. That is deliberate — clippo will not quietly discard
+//! history it can still read.
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -125,9 +138,22 @@ impl Key {
     /// the value is already 32 uniformly random bytes, so a KDF would only add
     /// cost. The whole statement is built here so no caller ever holds the hex
     /// itself, and the returned string zeroes when it drops.
+    ///
+    /// Built by `push_str` into an exactly-sized buffer rather than by
+    /// `format!`: a string that grows leaves its old, unzeroed allocation — hex
+    /// key and all — behind for the allocator to hand out or the kernel to swap.
     pub(crate) fn pragma(&self) -> Zeroizing<String> {
+        const PREFIX: &str = "PRAGMA key = \"x'";
+        const SUFFIX: &str = "'\";";
+
         let hex = self.to_hex();
-        Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex.as_str()))
+        let mut statement = Zeroizing::new(String::with_capacity(
+            PREFIX.len() + hex.len() + SUFFIX.len(),
+        ));
+        statement.push_str(PREFIX);
+        statement.push_str(&hex);
+        statement.push_str(SUFFIX);
+        statement
     }
 
     /// The key as 64 lowercase hex digits.
@@ -228,6 +254,25 @@ pub enum KeyError {
         source: std::io::Error,
     },
 
+    /// The Secret Service is unreachable and there is already a database that a
+    /// key from it may be the only thing able to open.
+    #[error(
+        "no Secret Service could be reached ({reason}), and a history database already exists \
+         at {database}. clippo will not create a key file at {key_file} in that situation: the \
+         file would win over the Secret Service on every later start, so the key that does open \
+         {database} would never be looked for again. Start the Secret Service \
+         (org.freedesktop.secrets, usually gnome-keyring) and start clippo again; if the keyring \
+         really is gone for good, delete {database} to start a fresh history"
+    )]
+    NoSecretServiceForExistingDatabase {
+        /// The database that would have been shadowed.
+        database: PathBuf,
+        /// The key file clippo declined to create.
+        key_file: PathBuf,
+        /// Why the Secret Service could not be reached.
+        reason: String,
+    },
+
     /// The Secret Service holds an item under clippo's attributes, but it is
     /// not a clippo key.
     #[error(
@@ -252,8 +297,9 @@ pub async fn acquire() -> Result<(Key, KeySource), KeyError> {
 
 /// Get the database key, keeping any fallback file in `data_dir`.
 ///
-/// The three-step rule is in the module docs. In short: an existing key file
-/// wins, then the Secret Service, then a new key file with a warning.
+/// The four-step rule is in the module docs. In short: an existing key file
+/// wins, then the Secret Service, then a new key file with a warning — but only
+/// while there is no `history.db` for that new key to shadow.
 pub async fn acquire_in(data_dir: &Path) -> Result<(Key, KeySource), KeyError> {
     let path = data_dir.join(KEY_FILE_NAME);
 
@@ -272,18 +318,43 @@ pub async fn acquire_in(data_dir: &Path) -> Result<(Key, KeySource), KeyError> {
             Ok((key, KeySource::SecretService))
         }
         Err(problem) => {
-            tracing::warn!(
-                error = %problem,
-                key_file = %path.display(),
-                "no Secret Service could be reached, so clippo is storing its database key \
-                 unencrypted in a file with mode 0600; anyone who can read that file can read \
-                 the whole clipboard history. If a history database already exists and was \
-                 encrypted with a key from the Secret Service, it will not open with this one"
-            );
-            let key = create_key_file(&path)?;
+            let database = data_dir.join(paths::DB_FILE_NAME);
+            let key = fall_back_to_file(&path, &database, &problem.to_string())?;
             Ok((key, KeySource::File(path)))
         }
     }
+}
+
+/// Mint the fallback key file — unless there is a database it would shadow.
+///
+/// Split out from [`acquire_in`] because this is the decision worth testing on
+/// its own: reaching it through `acquire_in` means going through
+/// [`from_secret_service`], and a test that only fails on machines without a
+/// running keyring is not a test of anything.
+///
+/// The refusal is the recoverable direction. Failing to start is annoying and
+/// fixes itself the moment the Secret Service comes back; writing the file is
+/// silent, looks like success, and permanently hides the key that opens the
+/// history behind rule 1. That asymmetry is also why an unanswerable `exists`
+/// counts as "there is one".
+fn fall_back_to_file(path: &Path, database: &Path, reason: &str) -> Result<Key, KeyError> {
+    if database.try_exists().unwrap_or(true) {
+        return Err(KeyError::NoSecretServiceForExistingDatabase {
+            database: database.to_path_buf(),
+            key_file: path.to_path_buf(),
+            reason: reason.to_owned(),
+        });
+    }
+
+    tracing::warn!(
+        error = %reason,
+        key_file = %path.display(),
+        "no Secret Service could be reached, so clippo is storing its database key unencrypted \
+         in a file with mode 0600; anyone who can read that file can read the whole clipboard \
+         history. This key will be preferred over the Secret Service from now on, so move it \
+         (with history.db) out of the way if you want to go back to the keyring"
+    );
+    create_key_file(path)
 }
 
 /// Fetch clippo's key from the Secret Service, creating one if there is none.
@@ -376,8 +447,7 @@ fn create_key_file(path: &Path) -> Result<Key, KeyError> {
     }
 
     let key = Key::random()?;
-    let mut contents = key.to_hex();
-    contents.push('\n');
+    let hex = key.to_hex();
 
     // `create_new` rather than `create`: the caller has already established
     // that there is no key file, so finding one now means something else is
@@ -395,7 +465,12 @@ fn create_key_file(path: &Path) -> Result<Key, KeyError> {
 
     // umask can only clear bits, so the file is at most 0600 and possibly
     // narrower; both pass the check `read_key_file` will make next startup.
-    file.write_all(contents.as_bytes())
+    //
+    // The newline is a second `write_all` rather than a `push` onto the hex:
+    // pushing reallocates past the exact capacity `to_hex` asked for, and the
+    // freed buffer holding the whole key is not what `Zeroizing` wipes.
+    file.write_all(hex.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
         .and_then(|()| file.sync_all())
         .map_err(|source| KeyError::WriteFile {
             path: path.to_path_buf(),
@@ -572,6 +647,40 @@ mod tests {
         assert_eq!(key.0, expected.0);
         assert_eq!(source, KeySource::File(dir.path().join(KEY_FILE_NAME)));
         assert!(source.to_string().contains("unencrypted"));
+    }
+
+    #[test]
+    fn no_key_file_is_minted_underneath_a_database_it_could_not_open() {
+        // The trap rule 4 exists for: the keyring is transiently down for one
+        // start, and without this the file key written here would win over the
+        // (working) keyring key on every start after it, forever.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEY_FILE_NAME);
+        let database = dir.path().join(paths::DB_FILE_NAME);
+        std::fs::write(&database, b"pretend ciphertext").unwrap();
+
+        let error = fall_back_to_file(&path, &database, "no D-Bus session bus").unwrap_err();
+        assert!(
+            matches!(error, KeyError::NoSecretServiceForExistingDatabase { .. }),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("no D-Bus session bus"), "{message}");
+        assert!(message.contains("org.freedesktop.secrets"), "{message}");
+        assert!(!path.exists(), "the key file must not have been created");
+    }
+
+    #[test]
+    fn a_first_run_with_no_keyring_still_gets_its_file_key() {
+        // The other half of rule 4: a machine that genuinely has no Secret
+        // Service is not blocked, because there is no history to lose yet.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEY_FILE_NAME);
+
+        let key =
+            fall_back_to_file(&path, &dir.path().join(paths::DB_FILE_NAME), "no keyring").unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(read_key_file(&path).unwrap().unwrap().0, key.0);
     }
 
     #[tokio::test]

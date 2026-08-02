@@ -149,6 +149,16 @@ impl Store {
     /// same copy could both find nothing and both insert. The bump sets
     /// `last_used_at` to the repeat copy's `created_at`, which is what moves it
     /// back to the front of [`Store::list`].
+    ///
+    /// A bump also ORs `sensitive` in rather than dropping it. The same bytes
+    /// can arrive twice by different routes — `hunter2` out of a text editor,
+    /// then the same `hunter2` out of a password manager — and only the second
+    /// carries the marker M4 reads. The marker is never the canonical flavor, so
+    /// the two hash alike and the second arrival is a bump; discarding its
+    /// `sensitive` would leave a password the applet renders in full. OR is the
+    /// safe direction for a heuristic: an entry that was ever sensitive stays
+    /// sensitive, and clearing the flag stays something a user gesture asks for
+    /// rather than something a later copy does by accident.
     pub fn insert(&mut self, new: &NewEntry) -> Result<Insertion, StoreError> {
         let flavors = distinct_flavors(&new.flavors);
         let captured_at = new.created_at.as_unix_millis();
@@ -186,8 +196,10 @@ impl Store {
                     |row| row.get(0),
                 )?;
                 tx.execute(
-                    "UPDATE entries SET last_used_at = ?1 WHERE id = ?2",
-                    params![captured_at, id],
+                    "UPDATE entries
+                     SET last_used_at = ?1, sensitive = sensitive | ?2
+                     WHERE id = ?3",
+                    params![captured_at, new.sensitive, id],
                 )?;
                 Insertion::Bumped(EntryId::new(id))
             }
@@ -454,6 +466,40 @@ mod tests {
             "the repeat is when it was last used"
         );
         assert_eq!(stored.flavors.len(), 1, "no second set of flavors");
+    }
+
+    #[test]
+    fn a_repeat_copy_can_only_ever_make_an_entry_more_sensitive() {
+        // The same bytes out of a text editor and then out of a password
+        // manager: identical hash, so the second is a bump, but only the second
+        // carries the marker. A bump that dropped it would leave a password the
+        // applet renders in full.
+        let temp = Temp::new();
+        let mut store = temp.open();
+
+        let id = store.insert(&text(1_000, "hunter2")).unwrap().id();
+        assert!(!store.get(id).unwrap().unwrap().entry.sensitive);
+
+        let mut from_password_manager = text(2_000, "hunter2");
+        from_password_manager.sensitive = true;
+        assert_eq!(
+            store.insert(&from_password_manager).unwrap(),
+            Insertion::Bumped(id)
+        );
+        assert!(store.get(id).unwrap().unwrap().entry.sensitive);
+
+        // And not back again: an entry that was ever sensitive stays sensitive
+        // until something with a user behind it says otherwise.
+        assert_eq!(
+            store.insert(&text(3_000, "hunter2")).unwrap(),
+            Insertion::Bumped(id)
+        );
+        let stored = store.get(id).unwrap().unwrap();
+        assert!(stored.entry.sensitive);
+        assert_eq!(
+            stored.entry.last_used_at,
+            Timestamp::from_unix_millis(3_000)
+        );
     }
 
     #[test]
