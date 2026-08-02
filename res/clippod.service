@@ -9,6 +9,20 @@ Documentation=https://github.com/darthxvaderxd/clippo
 After=cosmic-session.target
 PartOf=cosmic-session.target
 
+# The restart budget, widened from systemd's default of 5 starts in 10s. That
+# default gives up after a handful of seconds, and the failure most likely to
+# happen at login is the one that needs longer than that: the Secret Service is
+# not up yet, or the keyring is still locked, and clippo-store treats a locked
+# keyring with an existing history.db as a hard error rather than silently
+# minting a new key beside it. A few seconds of trying turns a keyring the user
+# unlocks a moment later into a unit that stays `failed` for the whole session.
+# Twenty starts, five seconds apart (RestartSec below), is about a hundred
+# seconds of retrying — enough for that — and it still gives up afterwards,
+# with a journal line naming the reason, rather than looping forever on an
+# install that is genuinely broken.
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
 [Service]
 # Type=exec rather than simple: systemd then reports a missing or unexecutable
 # binary as a failed start instead of a start that succeeded and immediately
@@ -25,7 +39,7 @@ ExecStart=%h/.local/bin/clippod
 # rather than the rest of the session. The history itself is on disk and is
 # unaffected either way.
 Restart=on-failure
-RestartSec=2
+RestartSec=5
 
 # Set CLIPPO_LOG (falling back to RUST_LOG, default info) to change verbosity:
 #   systemctl --user edit clippod

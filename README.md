@@ -75,7 +75,14 @@ puts everything in the XDG user locations:
 | icons | `~/.local/share/icons/hicolor/{scalable,symbolic}/apps` |
 
 `~/.local/bin` has to be on your `PATH` for `clippo` to be typeable — most shells on Pop!\_OS
-add it already, and `command -v clippo` after installing tells you.
+add it already, and `command -v clippo` after installing tells you. The applet does not depend
+on that: `install` writes the absolute path into the `.desktop`'s `Exec`, because the `PATH`
+that would matter there is `cosmic-panel`'s rather than your shell's.
+
+If either `XDG_DATA_HOME` or `XDG_CONFIG_HOME` is set, it is honoured — but only when it holds
+an *absolute* path, which is what the XDG spec says and what `clippod` itself does. A relative
+or empty value falls back to `~/.local/share` and `~/.config`, so the daemon and the installer
+can never disagree about where anything is.
 
 `systemctl --user enable --now clippod` starts the daemon and starts it again on every login:
 the unit is `WantedBy=cosmic-session.target`, so it comes up with the COSMIC session and goes
@@ -98,9 +105,10 @@ just prefix=/usr destdir=pkg install  # staged, for building a distro package
 ```
 
 A prefix moves everything to the FHS layout under it — `$prefix/bin`, `$prefix/share/…`,
-`$prefix/lib/systemd/user` — and `install` rewrites the unit's `ExecStart` to match. The unit
-stays a *user* unit whichever prefix you use: `clippod` needs the session's Wayland socket,
-its session bus and its keyring, and a system service has none of those.
+`$prefix/lib/systemd/user` — and `install` rewrites the unit's `ExecStart` and the `.desktop`'s
+`Exec` to match. The unit stays a *user* unit whichever prefix you use: `clippod` needs the
+session's Wayland socket, its session bus and its keyring, and a system service has none of
+those. `uninstall` stops and disables it at every prefix for the same reason.
 
 `destdir` prepends a staging root and touches nothing outside it — no cache refresh, no
 `systemctl`, since on a packaged install those belong to the installing machine.

@@ -78,15 +78,29 @@ destdir := env_var_or_default("DESTDIR", "")
 
 _home := env_var_or_default("HOME", "")
 
-# Set-but-empty is treated as unset, which `env_var_or_default` on its own does
-# not do: it hands back the empty string, and `"" / "applications"` is
-# `/applications` — a path at the root of the filesystem. Exporting an XDG
-# variable empty is a normal enough thing for a shell profile to do that this is
-# worth the two extra lines.
+# An XDG variable is honoured only when it holds an *absolute* path; anything
+# else — unset, empty, or relative — falls back to $HOME. That is what the XDG
+# spec requires, and it is the rule `clippo-core::paths` already implements
+# (`resolve_from`, and the `an_unset_or_relative_xdg_value_falls_back_to_home`
+# test beside it). It has to be the same rule in both places: the daemon reads
+# its history from wherever `paths` says, so a justfile that resolved a relative
+# `XDG_DATA_HOME=share` against the working directory would install the unit and
+# the .desktop into the checkout, and — worse — point `purge-data`'s `rm -rf` at
+# a directory that is not the user's history while reporting that it was.
+#
+# Empty is the case a shell profile actually produces, and `"" / "applications"`
+# is `/applications`, a path at the root of the filesystem. Relative is the case
+# a `just`-from-the-wrong-place produces. `=~ '^/'` covers both.
 _data_env := env_var_or_default("XDG_DATA_HOME", "")
 _config_env := env_var_or_default("XDG_CONFIG_HOME", "")
-_xdg_data := if _data_env == "" { _home / ".local/share" } else { _data_env }
-_xdg_config := if _config_env == "" { _home / ".config" } else { _config_env }
+_xdg_data := if _data_env =~ '^/' { _data_env } else { _home / ".local/share" }
+_xdg_config := if _config_env =~ '^/' { _config_env } else { _home / ".config" }
+
+# Where the daemon keeps the encrypted history — `clippo-core::paths::data_dir`,
+# resolved by the rule above. Never under `prefix` or `destdir`: it is the
+# user's data, not part of the installation, and `uninstall` says so while
+# `purge-data` is the only thing that touches it.
+_data_dir := _xdg_data / "clippo"
 
 # The user-local layout is XDG's, so XDG_DATA_HOME and XDG_CONFIG_HOME are
 # honoured. A prefixed install is FHS's and is not user-specific, so it is not.
@@ -121,8 +135,17 @@ install: build-release
     install -Dm755 target/release/clippo        "$bin/clippo"
     install -Dm755 target/release/clippo-applet "$bin/clippo-applet"
 
-    install -Dm644 res/com.nilfactor.Clippo.desktop \
-        "$apps/com.nilfactor.Clippo.desktop"
+    # The .desktop ships `Exec=clippo-applet`, a bare name, and gets the
+    # installed path written in. `.desktop` has no `%h`, and the PATH that
+    # matters is not the one you ran `just` from — it is cosmic-panel's, which
+    # for a session started by the display manager may well not have
+    # ~/.local/bin on it. An absolute Exec is the difference between the applet
+    # starting and the panel silently having a gap where it should be.
+    mkdir -p "$apps"
+    sed "s|^Exec=.*|Exec={{ bindir }}/clippo-applet|" res/com.nilfactor.Clippo.desktop \
+        > "$apps/com.nilfactor.Clippo.desktop"
+    chmod 644 "$apps/com.nilfactor.Clippo.desktop"
+
     install -Dm644 res/com.nilfactor.Clippo.metainfo.xml \
         "$metainfo/com.nilfactor.Clippo.metainfo.xml"
     install -Dm644 res/icons/hicolor/scalable/apps/com.nilfactor.Clippo.svg \
@@ -159,7 +182,12 @@ install: build-release
     # `daemon-reload` so systemd sees the unit; enabling it is left to the
     # person installing, because starting a daemon that then owns the clipboard
     # is not a thing to do to somebody as a side effect of copying files.
-    if [ -z "{{ prefix }}" ] && command -v systemctl >/dev/null 2>&1; then
+    #
+    # Not guarded on `prefix`: `$prefix/lib/systemd/user` is in the user
+    # manager's search path too, so a prefixed install needs the reload for the
+    # same reason a user-local one does. (`destdir` has already exited above —
+    # a staging tree is nothing to this machine's systemd.)
+    if command -v systemctl >/dev/null 2>&1; then
         systemctl --user daemon-reload 2>/dev/null || true
     fi
 
@@ -194,7 +222,13 @@ uninstall:
     # Stop it before removing the binary underneath it. `--now` stops and
     # disables in one go; both are ignorable, since "not installed" and "not
     # running" are exactly what `uninstall` is trying to arrive at.
-    if [ -z "{{ destdir }}" ] && [ -z "{{ prefix }}" ] && command -v systemctl >/dev/null 2>&1; then
+    #
+    # Guarded on `destdir` only, not on `prefix`. A staging tree has no running
+    # daemon to stop, but a prefixed install very much does — the unit is a
+    # *user* unit at every prefix — and removing the binary out from under it
+    # empties the clipboard, which is the one consequence this recipe is meant
+    # to avoid causing by surprise.
+    if [ -z "{{ destdir }}" ] && command -v systemctl >/dev/null 2>&1; then
         systemctl --user disable --now clippod 2>/dev/null || true
     fi
 
@@ -231,19 +265,26 @@ uninstall:
     command -v gtk-update-icon-cache >/dev/null 2>&1 \
         && gtk-update-icon-cache -qtf "$icons" 2>/dev/null || true
 
-    if [ -z "{{ prefix }}" ] && command -v systemctl >/dev/null 2>&1; then
+    if command -v systemctl >/dev/null 2>&1; then
         systemctl --user daemon-reload 2>/dev/null || true
     fi
 
-    data="${XDG_DATA_HOME:-$HOME/.local/share}/clippo"
+    # `{{ _data_dir }}`, not a second `${XDG_DATA_HOME:-…}` expansion: `:-`
+    # honours a relative value where the daemon ignores it, so resolving it here
+    # a second way is how the two drift apart.
+    data="{{ _data_dir }}"
     echo
     echo "clippo removed."
     echo
-    echo "Your clipboard history was NOT deleted. It is still at"
-    echo "  $data/history.db"
-    echo "and its key is still in the keyring. Uninstalling a program is not a"
-    echo "reason to throw away what it was keeping for you — if you do want it"
-    echo "gone, that is \`just purge-data\`, or delete the directory by hand."
+    if [ -e "$data/history.db" ]; then
+        echo "Your clipboard history was NOT deleted. It is still at"
+        echo "  $data/history.db"
+        echo "and its key is still in the keyring. Uninstalling a program is not a"
+        echo "reason to throw away what it was keeping for you — if you do want it"
+        echo "gone, that is \`just purge-data\`, or delete the directory by hand."
+    else
+        echo "There was no clipboard history at $data to keep."
+    fi
 
 # Deliberately not part of `uninstall`: this is the only recipe here that
 # destroys anything, so it has to be asked for by name, and it asks again
@@ -254,7 +295,11 @@ purge-data:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    data="${XDG_DATA_HOME:-$HOME/.local/share}/clippo"
+    # The same one resolution as everywhere else. This is the recipe that runs
+    # `rm -rf`, so it is the one where getting the directory wrong costs most:
+    # a path resolved by a different rule than the daemon's deletes something
+    # that is not the history and reports that the history is gone.
+    data="{{ _data_dir }}"
 
     if [ ! -e "$data" ]; then
         echo "nothing to purge: $data does not exist"
