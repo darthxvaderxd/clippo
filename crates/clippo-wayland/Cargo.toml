@@ -18,3 +18,12 @@ name = "clippo-watch"
 path = "src/bin/clippo-watch.rs"
 
 [dependencies]
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true }
+wayland-protocols-wlr = { workspace = true }
+calloop = { workspace = true }
+calloop-wayland-source = { workspace = true }
+rustix = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
