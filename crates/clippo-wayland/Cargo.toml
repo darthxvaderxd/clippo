@@ -27,6 +27,7 @@ default = ["watch-bin"]
 watch-bin = ["dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
+clippo-core = { workspace = true }
 wayland-client = { workspace = true }
 wayland-protocols = { workspace = true }
 wayland-protocols-wlr = { workspace = true }

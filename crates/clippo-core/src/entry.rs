@@ -134,8 +134,13 @@ pub enum EntryKind {
 }
 
 impl EntryKind {
-    /// Every kind, in the order they are ranked when a selection carries
-    /// several flavors.
+    /// Every kind, richest first.
+    ///
+    /// The ranking itself lives in the derived `Ord` — the variants are
+    /// declared least- to most-specific, so `Image > Uris > Html > Text`. This
+    /// list is the same order written down for iteration, and a test asserts
+    /// the two agree, so inserting a variant in the wrong place fails loudly
+    /// rather than silently changing which flavor wins.
     pub const ALL: &'static [EntryKind] = &[
         EntryKind::Image,
         EntryKind::Uris,
@@ -159,12 +164,11 @@ impl EntryKind {
     /// Flavors that carry no content of their own — the
     /// `x-kde-passwordManagerHint` marker, say — return `None`.
     pub fn from_mime(mime: &str) -> Option<Self> {
-        let mime = mime
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
+        let essence = match mime.split_once(';') {
+            Some((essence, _parameters)) => essence,
+            None => mime,
+        };
+        let mime = essence.trim().to_ascii_lowercase();
         match mime.as_str() {
             "text/html" => Some(Self::Html),
             "text/uri-list" => Some(Self::Uris),
@@ -178,14 +182,14 @@ impl EntryKind {
     ///
     /// Real copies advertise several flavors at once — a browser offers
     /// `text/html` *and* `text/plain`, a file manager offers `text/uri-list`
-    /// *and* `text/plain` — so the richest flavor present wins, in the order of
-    /// [`EntryKind::ALL`]. Returns `None` when nothing carries content.
+    /// *and* `text/plain` — so the richest flavor present wins. "Richest" is
+    /// the derived `Ord`, the same ranking [`EntryKind::ALL`] lists. Returns
+    /// `None` when nothing carries content.
     pub fn for_flavors(flavors: &[Flavor]) -> Option<Self> {
-        let found: Vec<Self> = flavors
+        flavors
             .iter()
             .filter_map(|flavor| Self::from_mime(&flavor.mime))
-            .collect();
-        Self::ALL.iter().copied().find(|kind| found.contains(kind))
+            .max()
     }
 }
 
@@ -221,10 +225,14 @@ impl FromStr for EntryKind {
 
 /// One MIME flavor of one copy: a `flavors` row without its `entry_id`.
 ///
+/// This is also the type the Wayland watcher hands out — `clippo_wayland::Flavor`
+/// is a re-export of this one, not a second definition of it. A captured flavor
+/// and a stored flavor are the same two fields, so the daemon moves one into a
+/// [`NewEntry`] without rebuilding it.
+///
 /// `Debug` prints the byte count rather than the bytes. Clipboard contents
 /// routinely include passwords, and a stray `{flavor:?}` in a log line would
-/// put one in the journal — the same reasoning as `clippo_wayland::Flavor`,
-/// which this type mirrors on the storage side.
+/// put one in the journal.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Flavor {
     /// The MIME type, as the source advertised it.
@@ -263,7 +271,12 @@ impl fmt::Debug for Flavor {
 /// its way *into* the store, which has both and no id yet, is a [`NewEntry`].
 ///
 /// `Debug` prints the preview's length rather than its text, for the reason
-/// given on [`Flavor`].
+/// given on [`Flavor`], and truncates the hash for the same reason: BLAKE3 of
+/// the canonical flavor is unsalted, so a full hash in a log line lets anyone
+/// holding that line confirm a guessed clipboard value offline. In the database
+/// it is encrypted at rest; in the journal it would not be. Eight hex digits is
+/// enough to tell two entries apart while debugging, which is all this impl is
+/// for.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Entry {
     /// Primary key.
@@ -296,11 +309,18 @@ impl fmt::Debug for Entry {
             .field("last_used_at", &self.last_used_at)
             .field("kind", &self.kind)
             .field("preview_chars", &self.preview.chars().count())
-            .field("hash", &self.hash)
+            .field("hash_prefix", &hash_prefix(&self.hash))
             .field("pinned", &self.pinned)
             .field("sensitive", &self.sensitive)
             .finish()
     }
+}
+
+/// The leading hex digits of a hash, enough to tell two entries apart in a log
+/// without being the whole value. Character-wise rather than byte-wise so a
+/// non-hex `hash` cannot panic on a slice boundary.
+fn hash_prefix(hash: &str) -> String {
+    hash.chars().take(8).collect()
 }
 
 /// A copy on its way into the store: everything an [`Entry`] has except the id
@@ -399,6 +419,16 @@ mod tests {
     }
 
     #[test]
+    fn the_listed_ranking_and_the_derived_one_are_the_same_ranking() {
+        // `for_flavors` ranks by `Ord`; `ALL` writes the ranking down. If a new
+        // variant is declared in the wrong position the two disagree, and this
+        // is where that shows up rather than in whichever kind a browser copy
+        // silently becomes.
+        assert!(EntryKind::ALL.windows(2).all(|pair| pair[0] > pair[1]));
+        assert_eq!(EntryKind::ALL.len(), 4);
+    }
+
+    #[test]
     fn timestamps_map_straight_onto_an_integer_column() {
         let stored = Timestamp::from_unix_millis(1_700_000_000_000);
         assert_eq!(stored.as_unix_millis(), 1_700_000_000_000);
@@ -445,13 +475,19 @@ mod tests {
             last_used_at: Timestamp::from_unix_millis(0),
             kind: EntryKind::Text,
             preview: "hunter2".to_owned(),
-            hash: "abc123".to_owned(),
+            hash: "0123456789abcdef0123456789abcdef".to_owned(),
             pinned: false,
             sensitive: true,
         };
         let rendered = format!("{entry:?}");
         assert!(!rendered.contains("hunter2"), "{rendered}");
         assert!(rendered.contains("preview_chars: 7"), "{rendered}");
+
+        // The hash is unsalted, so a whole one in a log line is an offline
+        // check against a guessed clipboard value. A prefix is not.
+        assert!(!rendered.contains("0123456789abcdef0"), "{rendered}");
+        assert!(rendered.contains("01234567"), "{rendered}");
+        assert_eq!(hash_prefix("abc"), "abc");
     }
 
     #[test]

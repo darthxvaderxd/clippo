@@ -54,25 +54,16 @@ pub enum SelectionKind {
 
 /// One MIME flavor of a captured selection.
 ///
+/// This *is* [`clippo_core::Flavor`], re-exported rather than redefined: a
+/// captured flavor and a stored flavor are the same two fields, and having two
+/// identical types would make the daemon rebuild every flavor field by field on
+/// its way from the watcher to the store. `clippo-core` owns the vocabulary;
+/// this crate speaks it.
+///
 /// `Debug` deliberately prints the length rather than the bytes: clipboard
 /// contents routinely include passwords, and a stray `{flavor:?}` in a log line
 /// would leak them.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Flavor {
-    /// The MIME type the source advertised.
-    pub mime: String,
-    /// The bytes the source wrote for this flavor.
-    pub data: Vec<u8>,
-}
-
-impl fmt::Debug for Flavor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Flavor")
-            .field("mime", &self.mime)
-            .field("bytes", &self.data.len())
-            .finish()
-    }
-}
+pub use clippo_core::Flavor;
 
 /// Why a flavor the source advertised did not make it into the selection.
 #[derive(Debug, Clone, PartialEq, Eq)]

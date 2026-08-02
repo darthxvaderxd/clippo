@@ -10,9 +10,14 @@
 //! value is ignored rather than honoured, which is what the spec requires and
 //! what stops a stray `XDG_DATA_HOME=` from scattering databases in the working
 //! directory.
+//!
+//! This module answers *where*, not *what is there*: nothing here creates a
+//! directory or touches a file. Creating the data directory — and the `0700`
+//! decision that goes with it, which exists for the fallback key file — belongs
+//! with `clippo-store` at M2b, next to the key handling it protects.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The directory clippo owns inside each XDG base directory.
 pub const APP_DIR: &str = "clippo";
@@ -22,10 +27,6 @@ pub const CONFIG_FILE_NAME: &str = "config.toml";
 
 /// The history database's name inside [`data_dir`].
 pub const DB_FILE_NAME: &str = "history.db";
-
-/// The fallback key file's name inside [`data_dir`], used only when no Secret
-/// Service is reachable (DESIGN.md, `clippo-store` → "Key management").
-pub const KEY_FILE_NAME: &str = "key";
 
 /// Nothing in the environment says where the user's home is.
 #[derive(Debug, thiserror::Error)]
@@ -40,16 +41,6 @@ pub enum PathError {
         xdg_var: &'static str,
         /// What clippo was trying to place, for the message.
         what: &'static str,
-    },
-
-    /// The data directory could not be created.
-    #[error("could not create the clippo data directory at {path}")]
-    CreateDataDir {
-        /// The directory clippo tried to create.
-        path: PathBuf,
-        /// Why it failed.
-        #[source]
-        source: std::io::Error,
     },
 }
 
@@ -71,39 +62,6 @@ pub fn data_dir() -> Result<PathBuf, PathError> {
 /// The encrypted history database: `<data_dir>/history.db`.
 pub fn db_path() -> Result<PathBuf, PathError> {
     Ok(data_dir()?.join(DB_FILE_NAME))
-}
-
-/// The fallback database key: `<data_dir>/key`.
-pub fn key_path() -> Result<PathBuf, PathError> {
-    Ok(data_dir()?.join(KEY_FILE_NAME))
-}
-
-/// Create [`data_dir`] if it is not there yet, and return it.
-///
-/// Created `0700` on Unix: the fallback key file lives here, and so does a
-/// database whose whole point is that its contents are not readable.
-pub fn ensure_data_dir() -> Result<PathBuf, PathError> {
-    let dir = data_dir()?;
-    create_private_dir(&dir).map_err(|source| PathError::CreateDataDir {
-        path: dir.clone(),
-        source,
-    })?;
-    Ok(dir)
-}
-
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(dir)
-    }
 }
 
 fn resolve(
@@ -197,10 +155,6 @@ mod tests {
         assert_eq!(
             data.join(DB_FILE_NAME),
             PathBuf::from("/xdg/data/clippo/history.db")
-        );
-        assert_eq!(
-            data.join(KEY_FILE_NAME),
-            PathBuf::from("/xdg/data/clippo/key")
         );
 
         let config = resolve_from(os("/xdg/config"), None, ".config").unwrap();

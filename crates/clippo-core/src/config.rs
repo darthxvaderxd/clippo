@@ -2,7 +2,9 @@
 //! file they can be overridden from.
 //!
 //! ```toml
-//! # ~/.config/clippo/config.toml — every key is optional
+//! # ~/.config/clippo/config.toml — every key is optional.
+//! # Read once when clippod starts: run `systemctl --user restart clippod`
+//! # after editing this file.
 //! max_entries = 500
 //! max_age_days = 30
 //! max_image_bytes = 8388608
@@ -14,8 +16,8 @@
 //! mask_suffix = 2
 //! ```
 //!
-//! Three rules the loader keeps, in order of how much trouble getting them
-//! wrong would cause:
+//! Four rules the loader keeps, in order of how much trouble getting them wrong
+//! would cause:
 //!
 //! 1. **A missing file is not a problem.** No file, no warning, defaults.
 //! 2. **A file that is there but wrong is a hard error**, naming the path and
@@ -26,6 +28,13 @@
 //!    zero stay distinguishable all the way from the file to [`Config`]: every
 //!    key parses as an `Option`, and each one either documents what its zero
 //!    means or rejects it by name. See the table on each field below.
+//! 4. **The file is read once, at startup.** There is no hot-reload and no file
+//!    watching in v1, so editing `config.toml` while `clippod` is running has
+//!    no effect until the daemon is restarted:
+//!    `systemctl --user restart clippod`. That is a deliberate v1 scope
+//!    boundary rather than an oversight — re-reading config mid-run would mean
+//!    re-deriving retention, the watcher's primary-selection binding and the
+//!    masking rules against a history that was captured under the old ones.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -130,6 +139,10 @@ impl Config {
     ///
     /// No file means defaults, silently. Any other problem — unreadable,
     /// unparseable, out of range — is an error naming the path.
+    ///
+    /// Call this once, at startup. The file is not watched and nothing
+    /// re-reads it, so a running daemon must be restarted to pick up an edit;
+    /// see the module docs.
     pub fn load() -> Result<Self, ConfigError> {
         Self::load_from(paths::config_file()?)
     }
@@ -264,12 +277,18 @@ struct RawConfig {
     max_age_days: Option<i64>,
     max_image_bytes: Option<i64>,
     capture_primary: Option<bool>,
-    secrets: Option<RawSecrets>,
+    secrets: Option<Secrets>,
 }
 
+/// The `[secrets]` table as written.
+///
+/// Named for the table rather than `RawSecrets`, because serde puts the Rust
+/// type name into its type-mismatch messages and `#[serde(rename)]` does not
+/// change it: `secrets = 5` should read "expected struct Secrets", which is a
+/// thing the user's file has, rather than naming an internal type it does not.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawSecrets {
+struct Secrets {
     entropy_rule: Option<bool>,
     mask_prefix: Option<i64>,
     mask_suffix: Option<i64>,
@@ -528,6 +547,18 @@ mask_suffix = 2
         };
         assert!(error.contains("max_entires"), "{error}");
         assert!(error.contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_table_does_not_name_an_internal_type() {
+        // The user wrote `secrets`, so that is what the error may talk about.
+        let error = match parse("secrets = 5\n") {
+            Err(error @ ConfigError::Parse { .. }) => error.to_string(),
+            other => panic!("expected a parse error, got {other:?}"),
+        };
+        assert!(!error.to_lowercase().contains("raw"), "{error}");
+        assert!(error.contains("Secrets"), "{error}");
+        assert!(error.contains("config.toml"), "{error}");
     }
 
     #[test]

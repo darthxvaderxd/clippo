@@ -5,8 +5,8 @@
 //!   `clippo-store` maps them rather than translating them.
 //! - [`config`] — every knob DESIGN.md names, its documented default, and the
 //!   TOML file it can be overridden from.
-//! - [`paths`] — the one place that knows where clippo's config, database and
-//!   fallback key live.
+//! - [`paths`] — the one place that knows where clippo's config file and
+//!   database live, so no other crate hardcodes either.
 //!
 //! Secret detection and masking, the other half of this crate's job, arrive at
 //! M4; the config knobs they need ([`SecretsConfig`]) are already here.
