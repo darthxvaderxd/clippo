@@ -9,3 +9,15 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+clippo-core = { workspace = true }
+blake3 = { workspace = true }
+getrandom = { workspace = true }
+oo7 = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
