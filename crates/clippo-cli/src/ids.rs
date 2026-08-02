@@ -18,6 +18,10 @@
 //!
 //! Matching is on the decimal spelling of the id, so it is a string prefix
 //! (`14` matches `142`), not a numeric one.
+//!
+//! Because a prefix and a whole id are both legitimate spellings, two arguments
+//! to one `clippo rm` can name the same entry. [`resolve_all`] resolves a list
+//! as a list and hands back each entry once.
 
 use std::fmt;
 
@@ -52,13 +56,22 @@ pub struct Candidate {
 /// it is there to tell two entries apart, not to be read.
 const CANDIDATE_PREVIEW_CHARS: usize = 40;
 
+/// How much of an unusable argument is quoted back. Long enough to recognise a
+/// typo in, short enough that a pasted paragraph does not become the error.
+const TYPED_ECHO_CHARS: usize = 40;
+
 impl fmt::Display for ResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // The only message that echoes something which is not a decimal
+            // number, so the only one that has to make it safe first. The bytes
+            // came from the user's own shell rather than from the clipboard,
+            // but `clippo copy $'\e[2J'` should still not clear their screen.
             ResolveError::NotAnId { typed } => write!(
                 f,
-                "`{typed}` is not an entry id. Ids are the numbers in the ID column of \
-                 `clippo list`, and may be shortened to any unambiguous start"
+                "`{}` is not an entry id. Ids are the numbers in the ID column of \
+                 `clippo list`, and may be shortened to any unambiguous start",
+                render::one_line(typed, TYPED_ECHO_CHARS)
             ),
             ResolveError::NoSuchEntry {
                 typed,
@@ -143,6 +156,32 @@ pub fn resolve(typed: &str, entries: &[EntrySummary]) -> Result<i64, ResolveErro
                 .collect(),
         }),
     }
+}
+
+/// The entries several typed references name, each one once.
+///
+/// All of them against the same history, and all of them resolved before the
+/// caller acts on any: `clippo rm 1 2 zz` fails without having deleted entries
+/// 1 and 2.
+///
+/// Two references can name the same entry — `12` and `1` are both legitimate
+/// spellings of entry 12, and a user assembling a list from `clippo list`
+/// output can easily produce both — so the result is deduplicated. Deleting an
+/// entry twice is not deleting two entries: the second call would fail with
+/// "there is no entry 12", and reporting that as a failure of a `clippo rm`
+/// that did exactly what was asked is worse than saying nothing.
+///
+/// Order is the order they were typed in, so the confirmation reads back the
+/// way the command was written.
+pub fn resolve_all(typed: &[String], entries: &[EntrySummary]) -> Result<Vec<i64>, ResolveError> {
+    let mut ids: Vec<i64> = Vec::with_capacity(typed.len());
+    for typed in typed {
+        let id = resolve(typed, entries)?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
 }
 
 #[cfg(test)]
@@ -261,6 +300,51 @@ mod tests {
                 "{typed:?} was accepted"
             );
         }
+    }
+
+    fn typed(references: &[&str]) -> Vec<String> {
+        references.iter().map(|typed| (*typed).to_owned()).collect()
+    }
+
+    #[test]
+    fn several_references_resolve_in_the_order_they_were_typed() {
+        assert_eq!(
+            resolve_all(&typed(&["127", "3", "120"]), &history()).unwrap(),
+            [127, 3, 120]
+        );
+    }
+
+    /// `1` and `12` are both entry 12 when 120 and 127 are gone, and a user
+    /// pulling ids out of a list can easily type both. Deleting an entry twice
+    /// is not deleting two entries — the second `Delete` would fail with "there
+    /// is no entry 12", after the entry had in fact been deleted, so
+    /// `clippo rm 1 12` would report a failure for a command that worked.
+    #[test]
+    fn two_references_to_one_entry_resolve_to_one_id() {
+        let entries = vec![entry(3, "three"), entry(12, "twelve")];
+        assert_eq!(resolve_all(&typed(&["1", "12"]), &entries).unwrap(), [12]);
+        assert_eq!(resolve_all(&typed(&["3", "3"]), &entries).unwrap(), [3]);
+        assert_eq!(
+            resolve_all(&typed(&["3", "12", "1", "3"]), &entries).unwrap(),
+            [3, 12]
+        );
+    }
+
+    /// The other half of the guarantee: one bad reference stops the whole
+    /// command, so the caller never deletes the good ones first.
+    #[test]
+    fn one_unresolvable_reference_fails_the_whole_list() {
+        let error = resolve_all(&typed(&["3", "12", "zz"]), &history()).unwrap_err();
+        assert!(matches!(error, ResolveError::NotAnId { .. }), "{error:?}");
+    }
+
+    /// This is the one message that quotes back something which is not a
+    /// number, so it is the one that has to be made safe first.
+    #[test]
+    fn an_unusable_argument_is_quoted_back_safely() {
+        let printed = resolve("\u{1b}[2J", &history()).unwrap_err().to_string();
+        assert!(!printed.contains('\u{1b}'), "{printed:?}");
+        assert!(printed.contains("\\u{1b}"), "{printed:?}");
     }
 
     /// Prefixes are on the decimal spelling, so a leading zero is not the same

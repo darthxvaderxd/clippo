@@ -114,12 +114,10 @@ impl Client {
     /// One `List` for the lot, and every reference resolved before anything is
     /// deleted: `clippo rm 1 2 zz` fails without having deleted entries 1 and
     /// 2, and no reference is ever resolved against a history that an earlier
-    /// argument in the same command has already changed.
+    /// argument in the same command has already changed. Two references naming
+    /// the same entry come back as one id — see [`ids::resolve_all`].
     pub fn resolve_all(&self, typed: &[String]) -> Result<Vec<i64>, CliError> {
         let entries = self.list(0, 0)?;
-        typed
-            .iter()
-            .map(|typed| Ok(ids::resolve(typed, &entries)?))
-            .collect()
+        Ok(ids::resolve_all(typed, &entries)?)
     }
 }

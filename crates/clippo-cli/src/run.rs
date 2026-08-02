@@ -66,24 +66,25 @@ pub fn run(command: Command) -> Result<(), CliError> {
 
         Command::Rm { ids } => {
             // Resolve every reference before deleting any of them, so a typo
-            // in the last argument does not leave the first ones deleted.
+            // in the last argument does not leave the first ones deleted. Two
+            // references naming the same entry are one id by here, so nothing
+            // is ever deleted twice.
             let ids = client.resolve_all(&ids)?;
+            let mut deleted: Vec<i64> = Vec::with_capacity(ids.len());
             for id in &ids {
-                client.delete(*id)?;
-            }
-            note(format!(
-                "deleted {}",
-                match ids.as_slice() {
-                    [id] => format!("entry {id}"),
-                    ids => format!(
-                        "entries {}",
-                        ids.iter()
-                            .map(i64::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
+                // The interface has no batch `Delete`, so a failure part-way
+                // through a list genuinely leaves the earlier ones gone. Say
+                // which before reporting it: the alternative is a user who has
+                // to run `clippo list` to find out what their command did.
+                if let Err(error) = client.delete(*id) {
+                    if !deleted.is_empty() {
+                        note(deleted_message(&deleted));
+                    }
+                    return Err(error);
                 }
-            ));
+                deleted.push(*id);
+            }
+            note(deleted_message(&deleted));
             Ok(())
         }
 
@@ -114,6 +115,20 @@ pub fn run(command: Command) -> Result<(), CliError> {
             // this subcommand's --help.
             emit(&client.reveal(id)?)
         }
+    }
+}
+
+/// What `rm` says it did, for however many entries it got through.
+fn deleted_message(ids: &[i64]) -> String {
+    match ids {
+        [id] => format!("deleted entry {id}"),
+        ids => format!(
+            "deleted entries {}",
+            ids.iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -234,6 +249,12 @@ fn note(message: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_rm_says_it_did_names_every_entry_it_deleted() {
+        assert_eq!(deleted_message(&[7]), "deleted entry 7");
+        assert_eq!(deleted_message(&[7, 12, 3]), "deleted entries 7, 12, 3");
+    }
 
     #[test]
     fn the_prompt_says_what_happens_to_the_pinned_entries() {

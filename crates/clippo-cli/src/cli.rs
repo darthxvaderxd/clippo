@@ -68,8 +68,10 @@ one-line preview.
 
 Previews are clipboard content, which is arbitrary bytes: newlines are \
 collapsed and control characters are escaped before printing, so a copied \
-terminal escape sequence cannot repaint your terminal. `reveal` is the one \
-command that does not do this.")]
+terminal escape sequence cannot repaint your terminal. `--json` keeps whole, \
+unflattened previews, and relies on JSON's own \\uXXXX escaping instead — \
+which is equally safe to look at and decodes back to exactly what was stored. \
+`reveal` is the one command that prints clipboard content as it is.")]
     List {
         /// How many entries to show; 0 means all of them.
         #[arg(short = 'n', long, default_value_t = DEFAULT_LIMIT, value_name = "N")]
@@ -80,7 +82,16 @@ command that does not do this.")]
         offset: u32,
 
         /// Emit JSON instead of a table, for scripts.
-        #[arg(long)]
+        #[arg(
+            long,
+            long_help = "Emit JSON instead of a table, for scripts.
+
+Every field the daemon sent, under its own name: whole previews rather than \
+the column's share of one, and timestamps as Unix milliseconds rather than \
+`3m`. Control, invisible and reordering characters are written as \\uXXXX — \
+JSON's own spelling for them, so the output is safe to look at in a terminal \
+and still decodes back to exactly what was stored."
+        )]
         json: bool,
     },
 
@@ -103,7 +114,16 @@ end of a long copy.")]
         limit: u32,
 
         /// Emit JSON instead of a table, for scripts.
-        #[arg(long)]
+        #[arg(
+            long,
+            long_help = "Emit JSON instead of a table, for scripts.
+
+Every field the daemon sent, under its own name: whole previews rather than \
+the column's share of one, and timestamps as Unix milliseconds rather than \
+`3m`. Control, invisible and reordering characters are written as \\uXXXX — \
+JSON's own spelling for them, so the output is safe to look at in a terminal \
+and still decodes back to exactly what was stored."
+        )]
         json: bool,
     },
 
@@ -380,5 +400,27 @@ mod tests {
             .to_string();
         assert!(help.contains("escape sequences"), "{help}");
         assert!(help.contains("safe for a terminal"), "{help}");
+    }
+
+    /// `reveal` is the *only* exception to the sanitising rule, and `--json`
+    /// reads like a second one — it prints a preview that was never flattened.
+    /// It is not one, and its help is where that is said.
+    #[test]
+    fn jsons_help_says_how_it_is_made_safe_rather_than_leaving_it_to_be_assumed() {
+        for name in ["list", "search"] {
+            let help = Cli::command()
+                .get_subcommands()
+                .find(|subcommand| subcommand.get_name() == name)
+                .and_then(|subcommand| {
+                    subcommand
+                        .get_arguments()
+                        .find(|argument| argument.get_id() == "json")
+                        .and_then(clap::Arg::get_long_help)
+                })
+                .expect("--json documents itself")
+                .to_string();
+            assert!(help.contains("\\uXXXX"), "clippo {name}: {help}");
+            assert!(help.contains("decodes back"), "clippo {name}: {help}");
+        }
     }
 }

@@ -11,8 +11,15 @@
 //! through [`one_line`], which is written to be safe on arbitrary input so that
 //! it stays safe if the daemon's preview rules change.
 //!
-//! [`crate::cli::Command::Reveal`] is the deliberate exception, and says so in
-//! its `--help`. It exists to be redirected, and a value that came back
+//! [`json`] is the same rule by a different route. A script wants the daemon's
+//! value, not a column's rendering of it, so previews stay whole and
+//! unflattened — but the dangerous characters are `\u`-escaped by JSON's own
+//! syntax, which decodes back to exactly what was stored. `serde_json` does that
+//! for the control characters and not for the reordering ones, so
+//! [`escape_invisible`] finishes the job.
+//!
+//! [`crate::cli::Command::Reveal`] is the one deliberate exception, and says so
+//! in its `--help`. It exists to be redirected, and a value that came back
 //! altered would be the wrong value.
 
 use clippo_core::Timestamp;
@@ -122,14 +129,55 @@ fn flags(entry: &EntrySummary) -> String {
 /// Unix milliseconds rather than becoming "3m", and the preview is the whole
 /// one rather than the column's share of it.
 ///
-/// JSON escaping is what makes this safe to emit unsanitised — a control
-/// character comes out as ``, which no terminal acts on. A script that
-/// decodes it and prints the result is back to handling hostile bytes, exactly
-/// as it would be with any other clipboard tool.
+/// The preview is not flattened, but it is still made safe to print: JSON
+/// escaping does the job here that [`one_line`] does for the table.
+/// `serde_json` writes a control character as its `\u001b` form, and
+/// [`escape_invisible`] does the same for the reordering and zero-width
+/// characters it passes through — so this is safe in the terminal of somebody
+/// running `clippo list --json` to see the shape of the output, while decoding
+/// back to exactly the string the daemon sent. A script that decodes it and
+/// prints the result is back to handling hostile bytes, exactly as it would be
+/// with any other clipboard tool.
 pub fn json(entries: &[EntrySummary]) -> Result<String, CliError> {
-    let mut json = serde_json::to_string_pretty(entries).map_err(CliError::Json)?;
+    let serialised = serde_json::to_string_pretty(entries).map_err(CliError::Json)?;
+    let mut json = escape_invisible(&serialised);
     json.push('\n');
     Ok(json)
+}
+
+/// `\u`-escape the characters `serde_json` emits as themselves that a
+/// terminal still acts on.
+///
+/// `serde_json` escapes the control characters, `"` and `\`, and passes every
+/// other code point through as UTF-8 — which sends the Cf reordering and
+/// zero-width characters that [`is_invisible_or_reordering`] exists for straight
+/// at the terminal. `\uXXXX` is how JSON spells those anyway, so escaping
+/// them changes the document's bytes without changing the string it decodes to:
+/// a script reads what was stored, and only the display of it changes.
+///
+/// Rewriting the serialised text rather than the values is sound because JSON's
+/// own syntax is ASCII. Every character this touches is therefore inside a
+/// string literal, which is the one place `\uXXXX` means anything.
+fn escape_invisible(json: &str) -> String {
+    if !json.chars().any(is_invisible_or_reordering) {
+        return json.to_owned();
+    }
+
+    let mut out = String::with_capacity(json.len());
+    for character in json.chars() {
+        if is_invisible_or_reordering(character) {
+            // UTF-16 rather than the code point: a `\u` escape is four hex
+            // digits, so anything above the BMP — the tag block — is written as
+            // the surrogate pair JSON would have used for it.
+            let mut units = [0_u16; 2];
+            for unit in character.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        } else {
+            out.push(character);
+        }
+    }
+    out
 }
 
 /// How long ago, in the widest unit that gives a whole number.
@@ -168,6 +216,13 @@ pub fn age(now: Timestamp, last_used_at: i64) -> String {
 /// Counting is on characters written, not characters read, so an entry made
 /// entirely of escape sequences cannot push the row past the column width.
 pub fn one_line(text: &str, max_chars: usize) -> String {
+    // No column at all is no output. Worth stating rather than falling out of
+    // the loop below, where the trimming that follows a cut would spin: `pop`
+    // on an empty string reports nothing to do without making progress.
+    if max_chars == 0 {
+        return String::new();
+    }
+
     let mut out = String::with_capacity(text.len().min(max_chars));
     let mut written = 0_usize;
     let mut pending_space = false;
@@ -221,7 +276,13 @@ pub fn one_line(text: &str, max_chars: usize) -> String {
 /// is category Cc only, while the bidi overrides and isolates are Cf and
 /// visually reorder everything after them — which in a table means the id
 /// column and the row's own preview can be made to swap places. The zero-width
-/// characters are here because "invisible in a preview" defeats the preview.
+/// characters are here because "invisible in a preview" defeats the preview,
+/// and the tag block for the same reason at its most deliberate: a copy can
+/// carry a whole ASCII message in characters nothing renders.
+///
+/// Hand-listed rather than "every Cf", which would want a Unicode table
+/// dependency. This is the subset a terminal — or a reader of `--json` — is
+/// actually misled by.
 fn is_invisible_or_reordering(character: char) -> bool {
     matches!(character,
         '\u{00ad}'                // soft hyphen
@@ -232,6 +293,7 @@ fn is_invisible_or_reordering(character: char) -> bool {
         | '\u{2060}'..='\u{206f}' // word joiner, isolates, deprecated formatting
         | '\u{feff}'              // zero-width no-break space / BOM
         | '\u{fff9}'..='\u{fffb}' // interlinear annotation
+        | '\u{e0000}'..='\u{e007f}' // language tags: invisible, and ASCII-shaped
     )
 }
 
@@ -346,6 +408,16 @@ mod tests {
         assert_eq!(one_line("a\u{202e}b", 40), "a\\u{202e}b");
         assert_eq!(one_line("a\u{200b}b", 40), "a\\u{200b}b");
         assert_eq!(one_line("a\u{feff}b", 40), "a\\u{feff}b");
+        // The tag block: a message in characters that render as nothing at all.
+        assert_eq!(one_line("a\u{e0041}b", 40), "a\\u{e0041}b");
+    }
+
+    /// Not reachable today — every caller passes a constant — but the trimming
+    /// after a cut is a `pop` loop, and a zero-width column is the one input
+    /// that makes it go round without shortening anything.
+    #[test]
+    fn a_column_no_characters_wide_is_no_output_rather_than_a_hang() {
+        assert_eq!(one_line("anything at all", 0), "");
     }
 
     #[test]
@@ -398,12 +470,51 @@ mod tests {
         assert!(rendered.ends_with('\n'), "{rendered:?}");
     }
 
-    /// JSON's own escaping is what makes emitting an unsanitised preview safe.
+    /// JSON's own escaping is what makes emitting an unflattened preview safe.
     #[test]
     fn json_escapes_control_characters_rather_than_emitting_them() {
         let rendered = json(&[entry(1, "\u{1b}[2J")]).unwrap();
         assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
         assert!(rendered.contains("\\u001b"), "{rendered:?}");
+    }
+
+    /// The half `serde_json` does not do. These are Cf, not Cc, so they go
+    /// through its escaping untouched — and somebody running `clippo list
+    /// --json` to see the shape of the output is looking at a terminal.
+    #[test]
+    fn json_escapes_the_reordering_and_invisible_characters_too() {
+        for (raw, escaped) in [
+            ("a\u{202e}b", "a\\u202eb"),
+            ("a\u{200b}b", "a\\u200bb"),
+            ("a\u{feff}b", "a\\ufeffb"),
+            // Above the BMP, so it is a surrogate pair rather than one escape.
+            ("a\u{e0041}b", "a\\udb40\\udc41b"),
+        ] {
+            let rendered = json(&[entry(1, raw)]).unwrap();
+            assert!(rendered.contains(escaped), "{rendered:?}");
+            for character in raw.chars().filter(|c| is_invisible_or_reordering(*c)) {
+                assert!(!rendered.contains(character), "{rendered:?}");
+            }
+        }
+    }
+
+    /// The whole justification for escaping in the serialised text: a script
+    /// decodes the document and gets the daemon's string back, byte for byte.
+    /// If this ever fails, `--json` has stopped being machine output.
+    #[test]
+    fn an_escaped_preview_still_decodes_to_exactly_what_was_stored() {
+        let preview = "a\u{202e}b\u{200b}c\u{e0041}d\u{1b}e\nf";
+        let rendered = json(&[entry(1, preview)]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed[0]["preview"], preview);
+    }
+
+    /// An escape is only ever inside a string literal, so nothing that has no
+    /// dangerous character in it is touched at all.
+    #[test]
+    fn ordinary_json_comes_back_unchanged() {
+        let ordinary = "{\n  \"preview\": \"naïve café\"\n}";
+        assert_eq!(escape_invisible(ordinary), ordinary);
     }
 
     #[test]

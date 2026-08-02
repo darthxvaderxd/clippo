@@ -115,6 +115,10 @@ clippo: `1` could mean any of these 3 entries — type more of the id:
   127  image/png, 2.0 KB
 ```
 
+`clippo rm` takes several ids at once. They are all resolved before anything is deleted, so one
+bad reference fails the command rather than half of it, and two references to the same entry —
+`clippo rm 1 12` where `1` can only mean 12 — delete it once.
+
 ### Reading a list
 
 ```
@@ -135,8 +139,13 @@ under the same name, which is what to script against.
 
 A preview is whatever somebody copied, which includes escape sequences and right-to-left
 overrides — printed raw, those repaint a terminal or reorder a row so that it shows one entry's
-text next to another's id. So everything the CLI prints is flattened to one line and escaped
-first: `\u{1b}[31m` is shown, not obeyed.
+text next to another's id. So the table is flattened to one line and escaped first:
+`\u{1b}[31m` is shown, not obeyed.
+
+`--json` keeps the daemon's whole preview, newlines and all, because a script wants the value
+rather than a column's rendering of it — but it is still safe to look at. The characters that
+matter come out as `\uXXXX`, which is JSON's own spelling for them, so what a script decodes is
+exactly what was stored and only the display changes.
 
 `clippo reveal` is the deliberate exception. It exists to be redirected or piped, and a value
 that came back altered would be the wrong value — so it prints exactly what was stored, with no
