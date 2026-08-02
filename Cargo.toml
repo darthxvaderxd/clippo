@@ -40,7 +40,14 @@ toml = "0.8"
 # storage
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 blake3 = "1"
-oo7 = "0.3"
+# `tokio` rather than the default `async-std`, so the one runtime the daemon
+# already has is the one the keyring talks to. `native_crypto` keeps oo7 off a
+# second OpenSSL — the vendored one belongs to SQLCipher.
+oo7 = { version = "0.3", default-features = false, features = ["tokio", "native_crypto", "tracing"] }
+# `std` so its error type is a `std::error::Error` and can be a `#[source]`;
+# 0.4 rather than 0.3 so the tree carries one copy, shared with tempfile's.
+getrandom = { version = "0.4", features = ["std"] }
+zeroize = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 nucleo-matcher = "0.3"
 
@@ -54,6 +61,9 @@ rustix = { version = "1", features = ["pipe", "fs"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# test support
+tempfile = "3"
 
 # internal crates
 clippo-core = { path = "crates/clippo-core", version = "0.1.0" }
