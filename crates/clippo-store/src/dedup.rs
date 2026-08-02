@@ -21,7 +21,7 @@
 //!
 //! Two flavors are deliberately never canonical:
 //!
-//! - **The thumbnail**, [`THUMBNAIL_MIME`]. It is derived from the image beside
+//! - **The thumbnail**, [`THUMBNAIL_MIME`][crate::images::THUMBNAIL_MIME]. It is derived from the image beside
 //!   it, so hashing it would key an entry on the output of clippo's own
 //!   downscaler — change the thumbnail size and every entry in the history
 //!   changes identity.
@@ -53,11 +53,7 @@
 
 use clippo_core::{EntryKind, Flavor};
 
-/// The derived-thumbnail flavor, which is never canonical.
-///
-/// DESIGN.md, `clippo-store` → "Images": a PNG thumbnail is stored beside a
-/// full-size image so the applet never decodes the original.
-pub const THUMBNAIL_MIME: &str = "image/png;clippo-thumb";
+use crate::images::is_thumbnail;
 
 /// The domain-separation prefix mixed into every entry hash.
 const HASH_DOMAIN: &[u8] = b"clippo/entry/v1\0";
@@ -67,7 +63,14 @@ const HASH_DOMAIN: &[u8] = b"clippo/entry/v1\0";
 /// `None` means the flavors do not contain anything of the kind claimed —
 /// a selection of nothing but a thumbnail or a password-manager marker, say.
 /// The caller cannot store such a selection, because it has no identity.
-pub fn canonical_flavor(kind: EntryKind, flavors: &[Flavor]) -> Option<&Flavor> {
+///
+/// Takes anything that iterates flavors rather than a slice, so the store can
+/// ask the same question of the borrowed, already-filtered list it is about to
+/// write without cloning a multi-megabyte blob to do it.
+pub fn canonical_flavor<'a, I>(kind: EntryKind, flavors: I) -> Option<&'a Flavor>
+where
+    I: IntoIterator<Item = &'a Flavor>,
+{
     let mut best: Option<(u8, &Flavor)> = None;
     for flavor in flavors {
         let Some(rank) = rank(kind, &flavor.mime) else {
@@ -114,14 +117,6 @@ fn essence(mime: &str) -> String {
         None => mime,
     };
     essence.trim().to_ascii_lowercase()
-}
-
-/// Whether a MIME type is the derived thumbnail rather than a captured flavor.
-fn is_thumbnail(mime: &str) -> bool {
-    // Compared with whitespace removed, for the reason `clippo-wayland`'s
-    // `mime` module gives: toolkits spell parameters inconsistently.
-    let squeezed: String = mime.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    squeezed.eq_ignore_ascii_case(THUMBNAIL_MIME)
 }
 
 /// How good a candidate this MIME type is for an entry of this kind — higher is
@@ -220,7 +215,10 @@ mod tests {
     fn the_derived_thumbnail_is_never_canonical() {
         // Even when it is the only image flavor small enough to have survived,
         // hashing it would key the entry on clippo's own downscaler.
-        let captured = flavors(&[(THUMBNAIL_MIME, "thumb"), ("image/jpeg", "jpg")]);
+        let captured = flavors(&[
+            (crate::images::THUMBNAIL_MIME, "thumb"),
+            ("image/jpeg", "jpg"),
+        ]);
         assert_eq!(
             canonical_mime(EntryKind::Image, &captured),
             Some("image/jpeg")
