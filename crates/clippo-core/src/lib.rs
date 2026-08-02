@@ -1,17 +1,26 @@
-//! Shared clippo types: clipboard entries and their flavors, configuration, and
-//! the secret detection + masking rules.
+//! The vocabulary every other clippo crate speaks.
 //!
-//! Placeholder — filled in at M4 (secrets); see `docs/ROADMAP.md`.
+//! - [`entry`] — [`Entry`], [`Flavor`] and [`EntryKind`], mirroring the
+//!   `entries` and `flavors` tables in DESIGN.md field for field so that
+//!   `clippo-store` maps them rather than translating them.
+//! - [`config`] — every knob DESIGN.md names, its documented default, and the
+//!   TOML file it can be overridden from.
+//! - [`paths`] — the one place that knows where clippo's config, database and
+//!   fallback key live.
+//!
+//! Secret detection and masking, the other half of this crate's job, arrive at
+//! M4; the config knobs they need ([`SecretsConfig`]) are already here.
+//!
+//! ```no_run
+//! let config = clippo_core::Config::load()?;
+//! println!("keeping {} entries in {}", config.max_entries, clippo_core::paths::db_path()?.display());
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
-/// Crate name, exposed so the placeholder has a testable surface.
-pub const NAME: &str = "clippo-core";
+pub mod config;
+pub mod entry;
+pub mod paths;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn name_is_set() {
-        assert_eq!(NAME, "clippo-core");
-    }
-}
+pub use config::{Config, ConfigError, SecretsConfig};
+pub use entry::{Entry, EntryId, EntryKind, Flavor, NewEntry, ParseEntryKindError, Timestamp};
+pub use paths::PathError;
