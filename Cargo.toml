@@ -30,8 +30,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-journald = "0.3"
 
 # async runtime + D-Bus
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
-zbus = "5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+# `tokio` rather than the default `async-io`: `clippod` already runs a tokio
+# runtime, and zbus on async-io inside one spawns a second executor on its own
+# thread to drive the connection. `blocking-api` is kept for the frontends,
+# which have no runtime of their own to reach for.
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
+# The served interface is a trait object (`Arc<dyn ClippoBackend>`), so its
+# async methods need boxing that native `async fn` in traits does not give.
+async-trait = "0.1"
 
 # config / serialization
 serde = { version = "1", features = ["derive"] }
@@ -64,6 +71,9 @@ clap = { version = "4", features = ["derive"] }
 
 # test support
 tempfile = "3"
+# Only for `.next()` on a zbus signal stream in the D-Bus round-trip test; zbus
+# re-exports `futures_core`, which has the trait but not the extension methods.
+futures-util = "0.3"
 
 # internal crates
 clippo-core = { path = "crates/clippo-core", version = "0.1.0" }

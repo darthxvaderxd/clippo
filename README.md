@@ -8,9 +8,10 @@ pasting the real value.
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, components, and the decisions on record.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — build order (M0–M6) and how each stage is verified.
 
-> **Status:** M1. The data-control client captures selections and `clippo-watch` prints them;
-> storage, the daemon, the CLI and the applet are still placeholders. See the roadmap for what
-> lands when.
+> **Status:** M3. Capture, encrypted storage and the daemon are in: `clippod` records every copy
+> and serves `com.nilfactor.Clippo` on the session bus. Still to come — putting an entry back on
+> the clipboard (`Copy` moves it to the front of the history but does not paste yet), masking of
+> suspected secrets, the CLI and the applet. See the roadmap for what lands when.
 
 ## ⚠️ Build and run from a host terminal, not RustRover's Flatpak
 
@@ -46,6 +47,36 @@ just check     # fmt + clippy + test, exactly what CI runs
 
 `just` itself is optional — every recipe is a one-line `cargo` invocation you can run
 directly. `just install` / `just uninstall` are stubs until M6 (packaging).
+
+## Running the daemon
+
+```sh
+just run-daemon        # cargo run -p clippod, with debug logging
+```
+
+From a host terminal, for the reason above. It reads the config, opens the encrypted history,
+takes the name `com.nilfactor.Clippo` on the **session** bus and starts recording. A second
+`clippod` exits non-zero saying the name is taken rather than running as a silent duplicate.
+
+There is no CLI yet, so poke it with `busctl` in the meantime:
+
+```sh
+busctl --user introspect com.nilfactor.Clippo /com/nilfactor/Clippo com.nilfactor.Clippo
+busctl --user call com.nilfactor.Clippo /com/nilfactor/Clippo com.nilfactor.Clippo List uu 10 0
+busctl --user call com.nilfactor.Clippo /com/nilfactor/Clippo com.nilfactor.Clippo Search su "todo" 5
+busctl --user call com.nilfactor.Clippo /com/nilfactor/Clippo com.nilfactor.Clippo SetPaused b true
+```
+
+`List` and `Search` return previews; `Reveal x <id>` is the only member that returns a whole
+stored value. **Until M4 lands, a preview is not masked** — a copied password shows as itself.
+
+Logging is `tracing`. Under systemd it goes to the journal with real priorities
+(`journalctl --user -u clippod -f`); run by hand it goes to stderr. `CLIPPO_LOG` sets the
+verbosity, falling back to `RUST_LOG`, defaulting to `info`:
+
+```sh
+CLIPPO_LOG=clippod=debug,clippo_wayland=debug just run-daemon
+```
 
 ## Debugging capture
 

@@ -32,8 +32,11 @@ run-applet:
 watch *ARGS:
     cargo run -p clippo-wayland --bin clippo-watch -- {{ARGS}}
 
+# `dbus-run-session` gives the suite a private session bus, so clippo-ipc's
+# round-trip test runs for real instead of skipping. Everything else is
+# unaffected by it.
 test:
-    cargo test --workspace
+    dbus-run-session -- cargo test --workspace
 
 fmt:
     cargo fmt --all
@@ -42,7 +45,7 @@ fmt:
 check:
     cargo fmt --check
     cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace
+    dbus-run-session -- cargo test --workspace
 
 clean:
     cargo clean

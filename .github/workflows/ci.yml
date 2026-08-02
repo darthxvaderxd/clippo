@@ -15,7 +15,9 @@ jobs:
       - uses: actions/checkout@v4
 
       # Pre-installed for the milestones that need them: wayland-client and
-      # xkbcommon (M1, M5), and SQLCipher's vendored OpenSSL build (M2).
+      # xkbcommon (M1, M5), SQLCipher's vendored OpenSSL build (M2), and
+      # dbus-run-session (M3) so the D-Bus round-trip test has a bus to use
+      # instead of skipping itself.
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -23,7 +25,8 @@ jobs:
             libwayland-dev \
             libxkbcommon-dev \
             pkg-config \
-            libssl-dev
+            libssl-dev \
+            dbus
 
       - name: Install Rust toolchain
         run: |
@@ -39,5 +42,7 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Under a private session bus: without one, clippo-ipc's round-trip test
+      # skips, and a skipped test that reports a pass is worse than no test.
       - name: cargo test
-        run: cargo test --workspace
+        run: dbus-run-session -- cargo test --workspace

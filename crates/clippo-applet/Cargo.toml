@@ -15,3 +15,4 @@ path = "src/main.rs"
 # libcosmic is a git dependency and is added here at M5, deliberately not in
 # [workspace.dependencies] since no other crate shares it.
 [dependencies]
+clippo-ipc = { workspace = true }

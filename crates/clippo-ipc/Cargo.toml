@@ -9,3 +9,11 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+clippo-core = { workspace = true }
+serde = { workspace = true }
+zbus = { workspace = true }
+
+[dev-dependencies]
+futures-util = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
