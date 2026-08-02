@@ -1,0 +1,25 @@
+[Desktop Entry]
+Type=Application
+Name=Clippo
+GenericName=Clipboard History
+Comment=Clipboard history for COSMIC that never shows a password in full
+Icon=com.nilfactor.Clippo
+Exec=clippo-applet
+Terminal=false
+Categories=Utility;
+Keywords=clipboard;history;paste;copy;clip;
+
+# COSMIC reads this to decide what may be added in Settings -> Desktop ->
+# Panel -> Configure panel applets. Without it clippo is not offered there at
+# all, whatever else is installed.
+X-CosmicApplet=true
+
+# The applet has no toplevel window of its own — it draws into the panel and
+# opens a popup — so the panel must not wait for one or reserve space for it.
+X-HasNoWindow=true
+
+# An applet is not an application to launch from the app library: starting it
+# by hand puts a second copy of the panel icon nowhere useful. cosmic-panel
+# starts it, and it stays out of the launcher.
+NoDisplay=true
+StartupNotify=false

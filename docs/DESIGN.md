@@ -94,7 +94,9 @@ clippo/
     ├── com.nilfactor.Clippo.desktop        # applet entry, X-CosmicApplet=true
     ├── com.nilfactor.Clippo.metainfo.xml
     ├── clippod.service                     # WantedBy=cosmic-session.target
-    └── icons/hicolor/scalable/apps/…
+    └── icons/hicolor/
+        ├── scalable/apps/com.nilfactor.Clippo.svg
+        └── symbolic/apps/com.nilfactor.Clippo-symbolic.svg   # what the panel draws
 ```
 
 ## Components

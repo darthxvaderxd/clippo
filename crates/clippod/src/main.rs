@@ -48,9 +48,9 @@
 //! Wayland has no such thing. It makes *this process* the owner of the
 //! selection, and every paste is answered by writing the bytes down a pipe from
 //! here. **So the clipboard empties when `clippod` exits.** That is the
-//! protocol working as designed, not a clippo bug; `Restart=on-failure` in the
-//! M6 unit narrows the window and the README says so plainly, because a user
-//! who did not know would report it.
+//! protocol working as designed, not a clippo bug; `Restart=on-failure` in
+//! `res/clippod.service` narrows the window and the README says so plainly,
+//! because a user who did not know would report it.
 //!
 //! It also means clippo hears its own copy-back come back round as a capture —
 //! see [`echo`], the guard that keeps it out of the history.

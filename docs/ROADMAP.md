@@ -157,6 +157,47 @@ libcosmic UI: search, pins, images, live updates via `HistoryChanged`, and `Togg
 systemd user unit, `.desktop`, metainfo, icons, `just install`, and a README — including the
 "run from a host terminal, not from a Flatpak" warning.
 
+- [x] `res/clippod.service` is a systemd **user** unit with `WantedBy=cosmic-session.target`
+      and `Restart=on-failure`. `PartOf` the same target, so logging out stops it rather than
+      leaving a daemon holding the history open against a compositor that is gone, and
+      `Type=exec` so a missing binary is reported as a failed start rather than as a start
+      that succeeded and immediately died.
+- [x] `res/com.nilfactor.Clippo.desktop` carries `X-CosmicApplet=true`, without which clippo
+      is not offered in COSMIC's panel configuration at all, and `NoDisplay=true`, because an
+      applet started from the app library puts a second panel icon nowhere useful. It passes
+      `desktop-file-validate` with no output.
+- [x] `res/com.nilfactor.Clippo.metainfo.xml` passes `appstreamcli validate`, with the
+      GPL-3.0-only project licence, a summary, a description and the project URL. The one
+      remaining `--pedantic` note is `cid-contains-uppercase-letter`, which is inherent: the
+      component id has to match the `.desktop` name, and that is COSMIC's convention.
+- [x] A scalable icon at `res/icons/hicolor/scalable/apps/com.nilfactor.Clippo.svg` and a
+      symbolic one at `res/icons/hicolor/symbolic/apps/com.nilfactor.Clippo-symbolic.svg` —
+      the second being what the panel actually draws. `clippo-applet` asks for its own icon
+      by name now, with `edit-paste-symbolic` as a fallback so a working copy run without
+      installing still gets a glyph rather than a hole.
+- [x] `just install` builds release and installs the three binaries and every resource to the
+      XDG user locations, refreshes the desktop and icon caches, and needs no root.
+      `clippo-watch` is deliberately not installed: it prints clipboard contents unredacted.
+- [x] `just uninstall` stops and disables the unit first, then removes exactly what `install`
+      placed. It does **not** delete `history.db` or the keyring entry — `just purge-data` is
+      the separate, named, confirmed recipe for that, and it is the only one here that
+      destroys anything.
+- [x] Both are idempotent: `install` twice overwrites, `uninstall` with nothing installed
+      exits 0 quietly.
+- [x] `prefix` and `destdir` overrides, by variable or environment, for a system-wide or
+      staged packaged install, with the unit's `ExecStart` rewritten to match and the default
+      user-local behaviour unchanged.
+- [x] The README covers what clippo is, secret masking, install and uninstall, where the
+      history lives so it can be removed by hand, the `Super+V` RON snippet,
+      `journalctl --user -u clippod -f`, the clipboard emptying when `clippod` dies, and — at
+      the top, with the `echo $WAYLAND_DISPLAY` check — the host-terminal-not-Flatpak warning.
+
+> **Gate:** `systemctl --user enable --now clippod` on the target host starts the daemon on
+> login, and clippo appears in the panel applet list. This is
+> [verification 6](#6-restart-resilience) below, and it is manual — this environment has no
+> COSMIC session and no running systemd user manager, so the unit is verified only as far as
+> `systemd-analyze verify --user` accepting it.
+
 ## Verification
 
 **Build and run on the host, not inside RustRover's Flatpak.** This is the single most
@@ -245,6 +286,8 @@ unpinned remain.
 
 ### 6. Restart resilience
 
+- [ ] `just install`, then `systemctl --user enable --now clippod` → the daemon starts, and
+      starts again on the next login. This is M6's gate.
 - [ ] `systemctl --user restart clippod` → `clippo list` still returns the history.
 - [ ] With the popup open, `systemctl --user stop clippod` → the picker says "clippod is not
       running" rather than going blank. Start it again → the list comes back on its own, with
@@ -265,7 +308,11 @@ unpinned remain.
       the panel setting — not a raw bus error, and not the daemon's message.
 
 Manual, and unchecked in the repository for the usual reason: this section needs a running
-COSMIC session, which neither this development environment nor CI has.
+COSMIC session, which neither this development environment nor CI has. The first box needs a
+running systemd user manager as well, which a container does not have either — what is
+checked of the unit here is that `systemd-analyze verify --user` accepts it with its
+`ExecStart` pointing at a real binary, and that `just install` / `just uninstall` place and
+remove it correctly against a scratch `$HOME`.
 
 ### 7. Automated
 

@@ -1,0 +1,58 @@
+[Unit]
+Description=clippo clipboard history daemon
+Documentation=https://github.com/darthxvaderxd/clippo
+
+# The daemon needs a Wayland session to bind data-control on, so it belongs to
+# the COSMIC session rather than to the login: started with it, stopped with it.
+# PartOf means logging out stops clippod instead of leaving a daemon holding an
+# encrypted history open against a compositor that is gone.
+After=cosmic-session.target
+PartOf=cosmic-session.target
+
+# The restart budget, widened from systemd's default of 5 starts in 10s. That
+# default gives up after a handful of seconds, and the failure most likely to
+# happen at login is the one that needs longer than that: the Secret Service is
+# not up yet, or the keyring is still locked, and clippo-store treats a locked
+# keyring with an existing history.db as a hard error rather than silently
+# minting a new key beside it. A few seconds of trying turns a keyring the user
+# unlocks a moment later into a unit that stays `failed` for the whole session.
+# Twenty starts, five seconds apart (RestartSec below), is about a hundred
+# seconds of retrying — enough for that — and it still gives up afterwards,
+# with a journal line naming the reason, rather than looping forever on an
+# install that is genuinely broken.
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+# Type=exec rather than simple: systemd then reports a missing or unexecutable
+# binary as a failed start instead of a start that succeeded and immediately
+# died, which is the difference between `systemctl --user status clippod`
+# naming the problem and it saying "activating".
+Type=exec
+
+# `just install` rewrites this line to the bindir it actually installed to.
+# %h/.local/bin is the default user-local install, which needs no root.
+ExecStart=%h/.local/bin/clippod
+
+# DESIGN.md's risk table: the daemon owns the Wayland selection, so if it dies
+# the clipboard empties. Restarting costs one clipboard's worth of content
+# rather than the rest of the session. The history itself is on disk and is
+# unaffected either way.
+Restart=on-failure
+RestartSec=5
+
+# Set CLIPPO_LOG (falling back to RUST_LOG, default info) to change verbosity:
+#   systemctl --user edit clippod
+#   [Service]
+#   Environment=CLIPPO_LOG=clippod=debug,clippo_wayland=debug
+# Output goes to the journal: journalctl --user -u clippod -f
+
+# clippo is unprivileged and never wants more than it starts with. The heavier
+# sandboxing options are deliberately left off: the daemon needs the Wayland
+# socket, the session bus, the Secret Service and its own data directory, and a
+# namespace that broke any one of those would fail in a way that looks like a
+# clippo bug rather than like a unit-file mistake.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=cosmic-session.target
