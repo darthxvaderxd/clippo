@@ -1,20 +1,45 @@
 //! Hand-rolled `ext_data_control_v1` / `zwlr_data_control_v1` client.
 //!
-//! M1a implements the *bind* and *watch* halves of the design: connect, bind a
-//! data-control manager preferring the `ext` protocol, get a device for the
-//! seat, and capture every interesting flavor of each selection atomically.
-//! Serving offers back to the compositor arrives with the copy-back path at M3.
+//! All three halves of the design are here: **bind** a data-control manager,
+//! preferring the `ext` protocol; **watch** the seat's selection and capture
+//! every interesting flavor of each copy atomically; and **offer** a stored
+//! entry back, owning a source and answering each paste.
 //!
 //! ```no_run
+//! use clippo_wayland::{Clipboard, WatchEvent};
+//!
 //! # fn main() -> Result<(), clippo_wayland::Error> {
-//! let (watcher, mut selections) = clippo_wayland::watch(Default::default())?;
-//! while let Some(selection) = selections.blocking_recv() {
-//!     println!("{} flavors", selection.flavors.len());
+//! let (watcher, mut events) = clippo_wayland::watch(Default::default())?;
+//! let clipboard = watcher.clipboard();
+//! while let Some(event) = events.blocking_recv() {
+//!     match event {
+//!         WatchEvent::Captured(selection) => {
+//!             println!("{} flavors", selection.flavors.len());
+//!             // Put it straight back — see the self-echo warning below.
+//!             clipboard.offer(selection.flavors).ok();
+//!         }
+//!         WatchEvent::SelectionLost => println!("something else took the clipboard"),
+//!     }
 //! }
 //! watcher.stop();
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Two things a caller has to know
+//!
+//! **Whoever owns the selection has to stay alive.** Wayland keeps no clipboard
+//! of its own: the bytes live in this process and are written to a pipe on each
+//! paste. When the [`Watcher`] stops — or the process exits — the clipboard
+//! empties. That is the protocol, not a clippo bug, and it is why `clippod`'s
+//! systemd unit restarts on failure.
+//!
+//! **What you set comes back.** Taking the selection makes the compositor
+//! deliver it to every data-control client, this one included, so an
+//! [`Clipboard::offer`] is followed by a [`WatchEvent::Captured`] carrying what
+//! was just offered. A caller that stores every capture needs a guard against
+//! its own echo; `clippod` keys one on the entry hash the offered flavors
+//! produce.
 //!
 //! **Run this from a host terminal.** A Flatpak-proxied Wayland socket filters
 //! out privileged protocols, so data-control is invisible from inside one; see
@@ -22,6 +47,7 @@
 
 mod flavor;
 mod mime;
+mod offer;
 mod protocol;
 mod watch;
 
@@ -29,16 +55,26 @@ use std::fmt;
 use std::time::Duration;
 
 pub use mime::{
-    is_interesting, is_password_manager_hint, INTERESTING_MIMES, PASSWORD_MANAGER_HINT_MIME,
+    is_interesting, is_password_manager_hint, same, INTERESTING_MIMES, PASSWORD_MANAGER_HINT_MIME,
 };
 pub use protocol::{EXT_PROTOCOL, WLR_PROTOCOL};
-pub use watch::{watch, Watcher};
+pub use watch::{watch, Watcher, WaylandClipboard};
 
 /// Default per-flavor size cap, matching the store's image cap in DESIGN.md.
 pub const DEFAULT_MAX_FLAVOR_BYTES: usize = 8 * 1024 * 1024;
 
 /// Default time a single flavor may take before it is abandoned.
 pub const DEFAULT_FLAVOR_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default time an application has to finish reading one paste.
+///
+/// Generous, and deliberately longer than the read timeout: an application
+/// pasting a large image may well take a moment, and the cost of waiting is one
+/// idle file descriptor rather than any of the loop's time.
+pub const DEFAULT_PASTE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default number of half-finished pastes that may be outstanding at once.
+pub const DEFAULT_MAX_PENDING_PASTES: usize = 32;
 
 /// Default number of captured selections that may queue up for the daemon.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 64;
@@ -179,6 +215,59 @@ impl fmt::Debug for Selection {
     }
 }
 
+/// One thing that happened to the clipboard.
+///
+/// Two variants rather than a bare [`Selection`] because a caller that owns the
+/// selection has state to unwind when it stops owning it: `clippod` clears its
+/// self-echo guard on [`SelectionLost`](Self::SelectionLost), so that a guard
+/// armed for an echo that never arrived cannot outlive the copy-back it belongs
+/// to and swallow a real copy later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchEvent {
+    /// A copy was captured, with every interesting flavor of it together.
+    Captured(Selection),
+    /// Another application took the clipboard; clippo no longer owns it.
+    ///
+    /// Only ever follows an [`Clipboard::offer`] — a watcher that never offers
+    /// anything has nothing to lose and never sees this.
+    SelectionLost,
+}
+
+/// Putting a stored entry back on the clipboard.
+///
+/// A trait rather than a concrete type so the daemon's copy-back path can be
+/// exercised in-process, against a fake that echoes what it was given, without
+/// a compositor to run it against. [`WaylandClipboard`] is the real one.
+pub trait Clipboard: fmt::Debug + Send + Sync {
+    /// Take the clipboard, advertising every one of these flavors.
+    ///
+    /// Ownership lasts until another application takes it or the process that
+    /// called this exits — see the crate docs.
+    fn offer(&self, flavors: Vec<Flavor>) -> Result<(), OfferError>;
+}
+
+/// Why an entry could not be put back on the clipboard.
+#[derive(Debug, thiserror::Error)]
+pub enum OfferError {
+    /// There was nothing to advertise.
+    #[error("there is no flavor to put on the clipboard")]
+    NothingToOffer,
+
+    /// The watcher thread is gone, so nothing owns a Wayland connection.
+    #[error(
+        "the wayland watcher is no longer running, so clippo cannot take the clipboard; \
+         the daemon is on its way down or lost its connection to the compositor"
+    )]
+    WatcherStopped,
+
+    /// The watcher has not drained its command queue.
+    #[error(
+        "the wayland watcher is not keeping up with clipboard requests; \
+         its event loop is blocked on something"
+    )]
+    Busy,
+}
+
 /// How the watcher behaves.
 #[derive(Debug, Clone)]
 pub struct WatchConfig {
@@ -200,6 +289,14 @@ pub struct WatchConfig {
     /// abandoned. Guards against a source that takes the pipe and never closes
     /// it.
     pub flavor_read_timeout: Duration,
+    /// How long an application has to finish reading one paste of an entry
+    /// clippo put on the clipboard. A receiver that stops reading is dropped
+    /// after this rather than holding its pipe open for the life of the daemon.
+    pub paste_write_timeout: Duration,
+    /// How many half-finished pastes may be outstanding at once. When a new one
+    /// would exceed this, the oldest is dropped — it is the one that has had
+    /// longest to read and has not.
+    pub max_pending_pastes: usize,
     /// How many captured selections may queue up for the daemon.
     pub channel_capacity: usize,
 }
@@ -210,6 +307,8 @@ impl Default for WatchConfig {
             primary: false,
             max_flavor_bytes: DEFAULT_MAX_FLAVOR_BYTES,
             flavor_read_timeout: DEFAULT_FLAVOR_READ_TIMEOUT,
+            paste_write_timeout: DEFAULT_PASTE_WRITE_TIMEOUT,
+            max_pending_pastes: DEFAULT_MAX_PENDING_PASTES,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
         }
     }

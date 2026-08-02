@@ -506,6 +506,7 @@ dependencies = [
  "clippo-ipc",
  "clippo-store",
  "clippo-wayland",
+ "image",
  "nucleo-matcher",
  "tempfile",
  "tokio",

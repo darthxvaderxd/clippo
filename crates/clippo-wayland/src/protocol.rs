@@ -6,7 +6,7 @@
 //! sees [`Manager`], [`Device`] and [`Offer`], and receives events through the
 //! [`DataControlSink`] trait.
 
-use std::os::fd::BorrowedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
 
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::{BindError, GlobalList};
@@ -19,11 +19,13 @@ use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
     ext_data_control_manager_v1::ExtDataControlManagerV1,
     ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
+    ext_data_control_source_v1::{self, ExtDataControlSourceV1},
 };
 use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
     zwlr_data_control_manager_v1::ZwlrDataControlManagerV1,
     zwlr_data_control_offer_v1::{self, ZwlrDataControlOfferV1},
+    zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
 };
 
 use crate::watch::WatchState;
@@ -60,6 +62,10 @@ pub(crate) trait DataControlSink {
     fn selection_changed(&mut self, kind: SelectionKind, offer: Option<Offer>);
     /// The device is inert and must be torn down.
     fn device_finished(&mut self);
+    /// Somebody is pasting: write this flavor of our own selection into `fd`.
+    fn source_send(&mut self, source: &ObjectId, mime: String, fd: OwnedFd);
+    /// Our selection was replaced by another application's.
+    fn source_cancelled(&mut self, source: &ObjectId);
 }
 
 /// A bound data-control manager, whichever protocol provided it.
@@ -123,6 +129,18 @@ impl Manager {
         }
     }
 
+    /// Create a source to advertise a stored entry from.
+    ///
+    /// One source serves exactly one `set_selection`: both protocols make
+    /// reusing a source a `used_source` protocol error, which kills the whole
+    /// connection, so every copy-back builds a new one.
+    pub(crate) fn create_source(&self, qh: &QueueHandle<WatchState>) -> Source {
+        match self {
+            Self::Ext(manager) => Source::Ext(manager.create_data_source(qh, ())),
+            Self::Wlr(manager) => Source::Wlr(manager.create_data_source(qh, ())),
+        }
+    }
+
     /// The interface name, for logging.
     pub(crate) fn protocol(&self) -> &'static str {
         match self {
@@ -166,6 +184,59 @@ impl Device {
         match self {
             Self::Ext(device) => device.destroy(),
             Self::Wlr(device) => device.destroy(),
+        }
+    }
+
+    /// Hand the clipboard to `source`, or give it up entirely with `None`.
+    ///
+    /// The mismatched arms cannot happen: one [`Manager`] makes both halves, so
+    /// a `Device::Ext` is only ever asked to take a `Source::Ext`. They are an
+    /// error rather than a panic because a daemon that logs and keeps watching
+    /// is a better outcome than one that aborts the user's history process over
+    /// a paste.
+    pub(crate) fn set_selection(&self, source: Option<&Source>) {
+        match (self, source) {
+            (Self::Ext(device), None) => device.set_selection(None),
+            (Self::Ext(device), Some(Source::Ext(source))) => device.set_selection(Some(source)),
+            (Self::Wlr(device), None) => device.set_selection(None),
+            (Self::Wlr(device), Some(Source::Wlr(source))) => device.set_selection(Some(source)),
+            _ => tracing::error!(
+                "refusing to set the selection from a source built by the other data-control \
+                 protocol; clippo did not take the clipboard"
+            ),
+        }
+    }
+}
+
+/// A source clippo owns, holding one stored entry's flavors.
+#[derive(Debug)]
+pub(crate) enum Source {
+    Ext(ExtDataControlSourceV1),
+    Wlr(ZwlrDataControlSourceV1),
+}
+
+impl Source {
+    /// Stable identity, used to tell our current source from one we replaced.
+    pub(crate) fn id(&self) -> ObjectId {
+        match self {
+            Self::Ext(source) => source.id(),
+            Self::Wlr(source) => source.id(),
+        }
+    }
+
+    /// Advertise one more MIME type. **Only legal before `set_selection`** —
+    /// both protocols make a later `offer` an `invalid_offer` protocol error.
+    pub(crate) fn offer(&self, mime: &str) {
+        match self {
+            Self::Ext(source) => source.offer(mime.to_owned()),
+            Self::Wlr(source) => source.offer(mime.to_owned()),
+        }
+    }
+
+    pub(crate) fn destroy(&self) {
+        match self {
+            Self::Ext(source) => source.destroy(),
+            Self::Wlr(source) => source.destroy(),
         }
     }
 }
@@ -312,6 +383,48 @@ impl Dispatch<ZwlrDataControlOfferV1, ()> for WatchState {
     ) {
         if let zwlr_data_control_offer_v1::Event::Offer { mime_type } = event {
             state.offer_mime(&offer.id(), mime_type);
+        }
+    }
+}
+
+impl Dispatch<ExtDataControlSourceV1, ()> for WatchState {
+    fn event(
+        state: &mut Self,
+        source: &ExtDataControlSourceV1,
+        event: ext_data_control_source_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_data_control_source_v1::Event::Send { mime_type, fd } => {
+                state.source_send(&source.id(), mime_type, fd);
+            }
+            ext_data_control_source_v1::Event::Cancelled => {
+                state.source_cancelled(&source.id());
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwlrDataControlSourceV1, ()> for WatchState {
+    fn event(
+        state: &mut Self,
+        source: &ZwlrDataControlSourceV1,
+        event: zwlr_data_control_source_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_data_control_source_v1::Event::Send { mime_type, fd } => {
+                state.source_send(&source.id(), mime_type, fd);
+            }
+            zwlr_data_control_source_v1::Event::Cancelled => {
+                state.source_cancelled(&source.id());
+            }
+            _ => {}
         }
     }
 }

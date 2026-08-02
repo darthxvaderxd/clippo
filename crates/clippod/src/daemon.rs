@@ -21,19 +21,20 @@
 //! new mutation from being added later with only one of the three.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use clippo_core::{EntryId, EntryKind, NewEntry, Timestamp};
+use clippo_core::{EntryId, EntryKind, Flavor, NewEntry, Timestamp};
 use clippo_ipc::{ClippoBackend, ClippoInterface, EntrySummary};
-use clippo_store::{dedup, Store, StoreError};
-use clippo_wayland::Selection;
+use clippo_store::{dedup, is_offerable, Store, StoreError};
+use clippo_wayland::{Clipboard, Selection};
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, error, info, warn};
 use zbus::fdo;
 use zbus::object_server::SignalEmitter;
 
 use crate::cache::PreviewCache;
+use crate::echo::EchoGuard;
 use crate::preview;
 
 /// The mutable half, behind one lock.
@@ -51,6 +52,12 @@ use crate::preview;
 struct State {
     store: Store,
     cache: PreviewCache,
+    /// In here, not beside the store, because arming it and the write that
+    /// earns it are one operation: `Copy` must not be able to put an entry on
+    /// the clipboard between another task arming the guard and that task
+    /// offering. Holding one lock across both makes that impossible rather
+    /// than unlikely. See [`crate::echo`].
+    echo: EchoGuard,
 }
 
 /// The clipboard daemon.
@@ -63,6 +70,9 @@ pub struct Daemon {
     /// takes effect even while a large image capture holds the store.
     paused: AtomicBool,
     signals: Signals,
+    /// Where `Copy` puts an entry. Filled in once, after the Wayland watcher
+    /// has started — see [`Daemon::connect_clipboard`].
+    clipboard: OnceLock<Arc<dyn Clipboard>>,
 }
 
 impl Daemon {
@@ -75,6 +85,7 @@ impl Daemon {
         let mut state = State {
             store,
             cache: PreviewCache::new(),
+            echo: EchoGuard::default(),
         };
         reload(&mut state)?;
         info!(
@@ -85,7 +96,41 @@ impl Daemon {
             state: Mutex::new(state),
             paused: AtomicBool::new(false),
             signals,
+            clipboard: OnceLock::new(),
         }))
+    }
+
+    /// Give the daemon the clipboard it will serve `Copy` from.
+    ///
+    /// Separate from [`Daemon::new`] because of the order `main` runs in: the
+    /// D-Bus object is exported before the well-known name is taken, and the
+    /// Wayland watcher only starts after it, so that a second `clippod` dies at
+    /// the name request without ever having touched the compositor. The daemon
+    /// therefore exists for a moment before the clipboard does, and `Copy`
+    /// during that moment says so rather than pretending.
+    ///
+    /// Calling this twice is a bug, and it is ignored rather than obeyed: the
+    /// second clipboard would leave the first watcher owning a selection
+    /// nothing could replace.
+    pub fn connect_clipboard(&self, clipboard: Arc<dyn Clipboard>) {
+        if self.clipboard.set(clipboard).is_err() {
+            error!("clippo was given a second clipboard to serve Copy from; ignoring it");
+        }
+    }
+
+    /// Another application took the clipboard from us.
+    ///
+    /// The self-echo guard goes with it: whatever copy-back it was armed for is
+    /// not coming back now that somebody else owns the selection, and a guard
+    /// left armed would swallow the next real copy of that content.
+    pub async fn selection_lost(&self) {
+        let mut state = self.state.lock().await;
+        if state.echo.clear() {
+            debug!(
+                "another application took the clipboard before clippo's own copy-back came \
+                 round; the self-echo guard was cleared"
+            );
+        }
     }
 
     /// Record a selection the Wayland watcher captured.
@@ -118,13 +163,6 @@ impl Daemon {
             );
         }
 
-        if self.paused.load(Ordering::Relaxed) {
-            debug!(
-                flavors = selection.flavors.len(),
-                "clippo is paused, so this copy was not recorded"
-            );
-            return;
-        }
         if selection.is_empty() {
             debug!(
                 advertised = selection.advertised.len(),
@@ -142,6 +180,25 @@ impl Daemon {
 
         let insertion = {
             let mut state = self.state.lock().await;
+
+            // Before the paused check, so that a copy-back made while paused
+            // still spends the guard it armed. Left armed, it would swallow the
+            // next real copy of that same content instead. See [`crate::echo`].
+            if state.echo.is_echo(&new.hash) {
+                debug!(
+                    kind = %kind,
+                    "ignoring clippo's own copy-back rather than recording it as a copy"
+                );
+                return;
+            }
+            if self.paused.load(Ordering::Relaxed) {
+                debug!(
+                    flavors = new.flavors.len(),
+                    "clippo is paused, so this copy was not recorded"
+                );
+                return;
+            }
+
             match state.store.insert(&new) {
                 Ok(insertion) => {
                     // Retention runs inside `insert`, so the reload here is
@@ -172,6 +229,83 @@ impl Daemon {
             "clippo recorded a copy"
         );
         self.signals.history_changed().await;
+    }
+
+    /// [`ClippoBackend::copy`] against a clock the caller supplies, for the
+    /// same reason [`Daemon::capture_at`] takes one.
+    async fn copy_at(&self, id: EntryId, now: Timestamp) -> fdo::Result<()> {
+        let clipboard = self.clipboard.get().ok_or_else(|| {
+            // Only reachable in the moment between the object being exported
+            // and the watcher starting; see `Daemon::connect_clipboard`.
+            warn!(
+                id = id.get(),
+                "Copy arrived before clippo had a clipboard to put it on"
+            );
+            fdo::Error::Failed(
+                "clippo is still starting up and has no clipboard to put an entry on yet; \
+                 try again"
+                    .to_owned(),
+            )
+        })?;
+
+        let mut state = self.state.lock().await;
+        let stored = state
+            .store
+            .get(id)
+            .map_err(|error| failed("copy", error))?
+            .ok_or_else(|| no_such_entry(id))?;
+
+        // Every stored flavor except the ones clippo derived for itself. The
+        // thumbnail is the one that matters: advertising `image/png;clippo-thumb`
+        // would let an application negotiate it and paste a 256-pixel version of
+        // the user's screenshot — a paste that succeeds with the wrong picture,
+        // which is worse than one that fails. `clippo-store` owns the list, next
+        // to the MIME it mirrors.
+        let offerable: Vec<Flavor> = stored
+            .flavors
+            .into_iter()
+            .filter(|flavor| is_offerable(&flavor.mime))
+            .collect();
+        if offerable.is_empty() {
+            return Err(fdo::Error::Failed(format!(
+                "entry {id} has nothing clippo can put on the clipboard"
+            )));
+        }
+        let flavors = offerable.len();
+
+        // Armed before the flavors go anywhere near the compositor: the echo
+        // can be on the capture channel before `offer` returns.
+        state.echo.arm(&stored.entry.hash);
+        if let Err(error) = clipboard.offer(offerable) {
+            state.echo.clear();
+            error!(id = id.get(), error = %error, "clippo could not take the clipboard");
+            return Err(fdo::Error::Failed(format!(
+                "clippo could not put entry {id} on the clipboard: {error}. \
+                 The history is unchanged"
+            )));
+        }
+
+        // The paste has happened as far as anyone outside can tell, so a
+        // failure here is a bookkeeping failure, not a failed `Copy`. Reporting
+        // it as one would have a user retry something that worked.
+        let touched = match state.store.touch(id, now) {
+            Ok(touched) => touched,
+            Err(error) => {
+                error!(
+                    id = id.get(),
+                    error = %error,
+                    "clippo put an entry on the clipboard but could not move it to the front"
+                );
+                false
+            }
+        };
+        self.commit(state, touched).await;
+
+        info!(
+            id = id.get(),
+            flavors, "clippo put an entry on the clipboard"
+        );
+        Ok(())
     }
 
     /// Whether new copies are being recorded.
@@ -285,30 +419,22 @@ impl ClippoBackend for Daemon {
         Ok(state.cache.search(query, limit as usize))
     }
 
-    /// Put an entry back on the clipboard — **not implemented yet**, and it
-    /// says so.
+    /// Put an entry back on the clipboard, and move it to the front.
     ///
-    /// Offering a stored entry back to the compositor needs `clippo-wayland`'s
-    /// source half and the self-echo guard that goes with it, which is the next
-    /// milestone; M1a implemented watching only. Until that lands, the honest
-    /// answer is an error: a caller that got `Ok(())` would paste whatever was
-    /// on the clipboard before and have nothing to tell them why — and
-    /// `clippo copy 2` followed by Ctrl-V is precisely the ROADMAP check a user
-    /// would run.
+    /// Everything below happens under one lock, which is what makes the
+    /// self-echo guard sound: the compositor announces the new selection to
+    /// every data-control client, clippo included, so the capture task can be
+    /// holding this entry's own flavors before this method returns. It cannot
+    /// act on them until the guard is armed, because it needs this same lock to
+    /// look at them.
     ///
-    /// The store half is not done either. Moving the entry to the front records
-    /// a use that did not happen, so a `busctl` poke would silently reorder the
-    /// real history; the `touch` belongs with the paste, in the same call that
-    /// earns it.
+    /// `last_used_at` moves for the same reason a repeat copy moves it: pasting
+    /// something out of the history is a use of it, and a user who pasted an
+    /// entry expects to find it at the top next time. The guard is what stops
+    /// that from happening twice — once here, once when the copy-back comes
+    /// round as a capture.
     async fn copy(&self, id: i64) -> fdo::Result<()> {
-        warn!(
-            id,
-            "Copy did nothing: putting an entry back on the clipboard is not implemented yet"
-        );
-        Err(fdo::Error::NotSupported(format!(
-            "clippo cannot put entry {id} back on the clipboard yet: the copy-back offer path is \
-             not implemented. The history is unchanged"
-        )))
+        self.copy_at(EntryId::new(id), Timestamp::now()).await
     }
 
     async fn delete(&self, id: i64) -> fdo::Result<()> {
@@ -471,25 +597,75 @@ fn no_such_entry(id: EntryId) -> fdo::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::sync::atomic::AtomicI64;
+    use std::sync::Mutex as StdMutex;
 
     use clippo_core::Flavor;
-    use clippo_store::{Key, Retention};
-    use clippo_wayland::{SelectionKind, PASSWORD_MANAGER_HINT_MIME};
+    use clippo_store::{Key, Retention, THUMBNAIL_MIME};
+    use clippo_wayland::{OfferError, SelectionKind, PASSWORD_MANAGER_HINT_MIME};
     use tempfile::TempDir;
 
     use super::*;
 
+    /// The compositor, in process.
+    ///
+    /// This is the seam DESIGN.md's risk table asks the self-echo loop to be
+    /// tested against: it keeps what it was handed, and [`Fixture::echo`] feeds
+    /// it back exactly as cosmic-comp would — a `selection` event carrying the
+    /// flavors clippo just set, delivered to clippo's own watcher.
+    #[derive(Debug, Default)]
+    struct FakeClipboard {
+        offers: StdMutex<Vec<Vec<Flavor>>>,
+    }
+
+    impl FakeClipboard {
+        /// The flavors of the most recent copy-back.
+        fn last_offer(&self) -> Vec<Flavor> {
+            self.offers
+                .lock()
+                .expect("the fake clipboard's lock")
+                .last()
+                .cloned()
+                .expect("something should have been put on the clipboard")
+        }
+
+        fn offer_count(&self) -> usize {
+            self.offers.lock().expect("the fake clipboard's lock").len()
+        }
+    }
+
+    impl Clipboard for FakeClipboard {
+        fn offer(&self, flavors: Vec<Flavor>) -> Result<(), OfferError> {
+            if flavors.is_empty() {
+                return Err(OfferError::NothingToOffer);
+            }
+            self.offers
+                .lock()
+                .expect("the fake clipboard's lock")
+                .push(flavors);
+            Ok(())
+        }
+    }
+
+    /// A clipboard that will not take anything, for the failure path.
+    #[derive(Debug)]
+    struct BrokenClipboard;
+
+    impl Clipboard for BrokenClipboard {
+        fn offer(&self, _flavors: Vec<Flavor>) -> Result<(), OfferError> {
+            Err(OfferError::WatcherStopped)
+        }
+    }
+
     /// A daemon over a temp database, with signals counted rather than sent.
     struct Fixture {
         daemon: Arc<Daemon>,
+        clipboard: Arc<FakeClipboard>,
         /// Hands out a fresh millisecond per capture. `last_used_at` has
         /// millisecond resolution and decides the order of the history, so
         /// captures made against the real clock inside one millisecond would
         /// order by a tie-break rather than by the rule under test.
-        ///
-        /// The values start just after the epoch, which also makes `Copy`'s
-        /// real-clock `touch` unambiguously newer than anything captured here.
         clock: AtomicI64,
         /// Removed on drop, so it has to outlive the daemon.
         _dir: TempDir,
@@ -501,23 +677,65 @@ mod tests {
             let key = Key::random().expect("a key for the test database");
             let store =
                 Store::open(dir.path().join("history.db"), &key).expect("the store should open");
+            let daemon = Daemon::new(store, Signals::discard()).expect("the daemon should start");
+            let clipboard = Arc::new(FakeClipboard::default());
+            daemon.connect_clipboard(Arc::clone(&clipboard) as Arc<dyn Clipboard>);
             Self {
-                daemon: Daemon::new(store, Signals::discard()).expect("the daemon should start"),
+                daemon,
+                clipboard,
                 clock: AtomicI64::new(1_000),
                 _dir: dir,
             }
         }
 
+        /// The next millisecond, so every write has a distinct `last_used_at`.
+        fn tick(&self) -> Timestamp {
+            Timestamp::from_unix_millis(self.clock.fetch_add(1, Ordering::Relaxed))
+        }
+
         /// Capture each text one millisecond after the last.
         async fn capture(&self, texts: &[&str]) {
             for text in texts {
-                let now = Timestamp::from_unix_millis(self.clock.fetch_add(1, Ordering::Relaxed));
-                self.daemon.capture_at(text_selection(text), now).await;
+                self.daemon
+                    .capture_at(text_selection(text), self.tick())
+                    .await;
             }
+        }
+
+        /// `Copy(id)`, on the same fresh-millisecond clock.
+        async fn copy(&self, id: EntryId) -> fdo::Result<()> {
+            self.daemon.copy_at(id, self.tick()).await
+        }
+
+        /// Deliver the last copy-back back to the daemon, as the compositor
+        /// does: taking the selection makes it announce the new one to every
+        /// data-control client, clippo's own watcher included.
+        async fn echo(&self) {
+            let selection = selection_of(&self.clipboard.last_offer());
+            self.daemon.capture_at(selection, self.tick()).await;
         }
 
         async fn previews(&self) -> Vec<String> {
             previews(&self.daemon).await
+        }
+
+        /// The id of the one entry whose preview matches, for readable tests.
+        async fn id_of(&self, preview: &str) -> EntryId {
+            let found = self.daemon.search(preview, 1).await.expect("search");
+            EntryId::new(found.first().expect("a matching entry").id)
+        }
+
+        async fn last_used_at(&self, id: EntryId) -> Timestamp {
+            self.daemon
+                .state
+                .lock()
+                .await
+                .store
+                .get(id)
+                .expect("the store should read")
+                .expect("the entry should still be there")
+                .entry
+                .last_used_at
         }
 
         fn emitted(&self) -> u64 {
@@ -530,6 +748,46 @@ mod tests {
             kind: SelectionKind::Clipboard,
             advertised: vec!["text/plain;charset=utf-8".to_owned()],
             flavors: vec![Flavor::new("text/plain;charset=utf-8", text)],
+            dropped: Vec::new(),
+        }
+    }
+
+    /// The `Selection` a compositor delivers for a source advertising these
+    /// flavors — including the watcher's own filter, which fetches only the
+    /// flavors clippo finds interesting.
+    fn selection_of(offered: &[Flavor]) -> Selection {
+        Selection {
+            kind: SelectionKind::Clipboard,
+            advertised: offered.iter().map(|flavor| flavor.mime.clone()).collect(),
+            flavors: offered
+                .iter()
+                .filter(|flavor| clippo_wayland::is_interesting(&flavor.mime))
+                .cloned()
+                .collect(),
+            dropped: Vec::new(),
+        }
+    }
+
+    /// A real PNG, so the store derives a real thumbnail to leave out of the
+    /// copy-back. Bytes it cannot decode would give it nothing to exclude, and
+    /// the test would pass without proving anything.
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut picture = image::RgbImage::new(width, height);
+        for (x, y, pixel) in picture.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x % 256) as u8, (y % 256) as u8, 128]);
+        }
+        let mut bytes = Vec::new();
+        picture
+            .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .expect("the test image should encode");
+        bytes
+    }
+
+    fn image_selection(png: Vec<u8>) -> Selection {
+        Selection {
+            kind: SelectionKind::Clipboard,
+            advertised: vec!["image/png".to_owned()],
+            flavors: vec![Flavor::new("image/png", png)],
             dropped: Vec::new(),
         }
     }
@@ -710,12 +968,19 @@ mod tests {
         assert_eq!(fixture.daemon.reveal(summary.id).await.unwrap(), whole);
     }
 
-    /// `Copy` is absent from this list on purpose: it refuses every id, known
-    /// or not, until it can actually paste one.
     #[tokio::test]
     async fn an_unknown_id_is_an_argument_error_on_every_member_that_takes_one() {
         let fixture = Fixture::new();
         let missing = 4_242;
+        assert!(matches!(
+            fixture.daemon.copy(missing).await,
+            Err(fdo::Error::InvalidArgs(_))
+        ));
+        assert_eq!(
+            fixture.clipboard.offer_count(),
+            0,
+            "an id that is not there must not reach the compositor"
+        );
         assert!(matches!(
             fixture.daemon.delete(missing).await,
             Err(fdo::Error::InvalidArgs(_))
@@ -785,25 +1050,224 @@ mod tests {
         assert_eq!(fixture.emitted(), 0);
     }
 
-    /// `Copy` cannot paste yet, so it must not report a success it did not
-    /// have — and must not reorder the history to record a use that never
-    /// happened. Both halves land together, next milestone.
+    /// `Copy` puts every stored flavor on the clipboard, moves the entry to the
+    /// front and says so — the same reordering a fresh duplicate copy causes.
     #[tokio::test]
-    async fn copy_refuses_rather_than_reporting_a_paste_that_did_not_happen() {
+    async fn copy_offers_the_entry_bumps_it_and_announces_the_change() {
         let fixture = Fixture::new();
         fixture.capture(&["first", "second"]).await;
-        let oldest = fixture.daemon.search("first", 1).await.unwrap()[0].id;
+        let oldest = fixture.id_of("first").await;
+        let before = fixture.last_used_at(oldest).await;
+        let announced = fixture.emitted();
 
-        assert!(matches!(
-            fixture.daemon.copy(oldest).await,
-            Err(fdo::Error::NotSupported(_))
-        ));
+        fixture.copy(oldest).await.expect("copy should work");
+
+        assert_eq!(
+            fixture.clipboard.last_offer(),
+            [Flavor::new("text/plain;charset=utf-8", "first")],
+            "what the compositor was handed"
+        );
         assert_eq!(
             fixture.previews().await,
-            ["second", "first"],
-            "the history is untouched"
+            ["first", "second"],
+            "a paste is a use, so the entry moves to the front"
         );
-        assert_eq!(fixture.emitted(), 2, "two captures and nothing else");
+        assert!(fixture.last_used_at(oldest).await > before);
+        assert_eq!(fixture.emitted(), announced + 1);
+    }
+
+    /// The specific bug the exclusion prevents: an application negotiating
+    /// `image/png;clippo-thumb` and pasting a 256-pixel version of the user's
+    /// screenshot. A paste that succeeds with the wrong picture is worse than
+    /// one that fails, so the thumbnail never reaches the compositor at all.
+    #[tokio::test]
+    async fn the_derived_thumbnail_is_never_offered_back() {
+        let fixture = Fixture::new();
+        let full_size = png(400, 300);
+        fixture
+            .daemon
+            .capture_at(image_selection(full_size.clone()), fixture.tick())
+            .await;
+
+        let id = EntryId::new(fixture.daemon.list(1, 0).await.unwrap()[0].id);
+        let stored: Vec<String> = {
+            let state = fixture.daemon.state.lock().await;
+            let entry = state.store.get(id).unwrap().unwrap();
+            entry.flavors.iter().map(|f| f.mime.clone()).collect()
+        };
+        assert!(
+            stored.iter().any(|mime| mime == THUMBNAIL_MIME),
+            "the store must have derived a thumbnail for this to be a real test: {stored:?}"
+        );
+
+        fixture.copy(id).await.expect("copy should work");
+
+        let offered = fixture.clipboard.last_offer();
+        assert_eq!(
+            offered.iter().map(|f| f.mime.as_str()).collect::<Vec<_>>(),
+            ["image/png"],
+            "every stored flavor except the one clippo derived for itself"
+        );
+        assert_eq!(offered[0].data, full_size, "and it is the full-size image");
+    }
+
+    /// DESIGN.md's risk table: *"**Self-echo loop** — a wrong hash guard
+    /// re-enters every copy-back into history → Integration test at M3."*
+    ///
+    /// Both directions, because getting this wrong the other way is also a bug:
+    /// a permanent "ignore this hash" would make a deliberate re-copy of the
+    /// same text vanish from the history with nothing to say why.
+    #[tokio::test]
+    async fn a_copy_back_does_not_re_enter_the_history_but_a_real_re_copy_still_bumps_it() {
+        let fixture = Fixture::new();
+        fixture.capture(&["first", "second"]).await;
+        let oldest = fixture.id_of("first").await;
+
+        fixture.copy(oldest).await.expect("copy should work");
+        let after_copy = fixture.emitted();
+        let bumped_by_copy = fixture.last_used_at(oldest).await;
+
+        // The compositor announces the selection clippo just took, to clippo.
+        fixture.echo().await;
+
+        assert_eq!(
+            fixture.previews().await,
+            ["first", "second"],
+            "the copy-back must not add a second entry"
+        );
+        assert_eq!(
+            fixture.last_used_at(oldest).await,
+            bumped_by_copy,
+            "nor bump the entry a second time for a use that never happened"
+        );
+        assert_eq!(fixture.emitted(), after_copy, "and nothing to announce");
+
+        // Now the other direction. Something else is copied, so "first" is no
+        // longer at the front, and then the user copies that same text by hand.
+        fixture.capture(&["third"]).await;
+        assert_eq!(fixture.previews().await, ["third", "first", "second"]);
+        let before_recopy = fixture.emitted();
+
+        fixture.capture(&["first"]).await;
+
+        assert_eq!(
+            fixture.previews().await,
+            ["first", "third", "second"],
+            "copying the same text by hand is a real copy and must bump the entry"
+        );
+        assert!(fixture.last_used_at(oldest).await > bumped_by_copy);
+        assert_eq!(fixture.emitted(), before_recopy + 1);
+    }
+
+    /// The guard is armed for one capture, so an echo that never arrives must
+    /// not leave it waiting: another application taking the clipboard is the
+    /// signal that it is not coming.
+    #[tokio::test]
+    async fn losing_the_selection_clears_the_guard_so_the_next_real_copy_registers() {
+        let fixture = Fixture::new();
+        fixture.capture(&["first"]).await;
+        let id = fixture.id_of("first").await;
+
+        fixture.copy(id).await.expect("copy should work");
+        assert!(fixture.daemon.state.lock().await.echo.is_armed());
+
+        fixture.daemon.selection_lost().await;
+        assert!(!fixture.daemon.state.lock().await.echo.is_armed());
+
+        // The very content the guard was armed for, copied by hand.
+        let before = fixture.last_used_at(id).await;
+        let announced = fixture.emitted();
+        fixture.capture(&["first"]).await;
+
+        assert!(
+            fixture.last_used_at(id).await > before,
+            "a stale guard would have swallowed this copy"
+        );
+        assert_eq!(fixture.emitted(), announced + 1);
+        assert_eq!(fixture.previews().await, ["first"], "still one entry");
+    }
+
+    /// A copy-back made while paused still spends its guard. Left armed, it
+    /// would swallow the next real copy of that content instead.
+    #[tokio::test]
+    async fn a_copy_back_that_arrives_while_paused_still_spends_the_guard() {
+        let fixture = Fixture::new();
+        fixture.capture(&["first"]).await;
+        let id = fixture.id_of("first").await;
+
+        fixture.copy(id).await.expect("copy should work");
+        fixture.daemon.set_paused(true).await.expect("pause");
+        fixture.echo().await;
+        fixture.daemon.set_paused(false).await.expect("resume");
+
+        assert!(!fixture.daemon.state.lock().await.echo.is_armed());
+        let before = fixture.last_used_at(id).await;
+        fixture.capture(&["first"]).await;
+        assert!(fixture.last_used_at(id).await > before);
+    }
+
+    /// A daemon over a temp database with a clipboard of the caller's choosing,
+    /// for the two paths [`Fixture`]'s working one cannot reach.
+    async fn daemon_with(clipboard: Option<Arc<dyn Clipboard>>) -> (Arc<Daemon>, TempDir, EntryId) {
+        let dir = tempfile::tempdir().expect("a temp dir for the test database");
+        let key = Key::random().expect("a key for the test database");
+        let daemon = Daemon::new(
+            Store::open(dir.path().join("history.db"), &key).expect("open"),
+            Signals::discard(),
+        )
+        .expect("start");
+        if let Some(clipboard) = clipboard {
+            daemon.connect_clipboard(clipboard);
+        }
+        daemon
+            .capture_at(text_selection("first"), Timestamp::from_unix_millis(1_000))
+            .await;
+        let id = EntryId::new(daemon.list(1, 0).await.unwrap()[0].id);
+        (daemon, dir, id)
+    }
+
+    /// A `Copy` the compositor never got is a failed `Copy`: nothing
+    /// reordered, and no guard left armed to swallow the next real copy of that
+    /// entry.
+    #[tokio::test]
+    async fn a_copy_the_clipboard_refused_changes_nothing_and_leaves_no_guard() {
+        let (daemon, _dir, id) = daemon_with(Some(Arc::new(BrokenClipboard))).await;
+        let announced = daemon.signals.emitted();
+
+        let refused = daemon
+            .copy_at(id, Timestamp::from_unix_millis(2_000))
+            .await
+            .expect_err("the clipboard refused it");
+        assert!(matches!(refused, fdo::Error::Failed(_)), "{refused:?}");
+
+        let entry = daemon.state.lock().await.store.get(id).unwrap().unwrap();
+        assert_eq!(
+            entry.entry.last_used_at,
+            Timestamp::from_unix_millis(1_000),
+            "a Copy that could not paste must not reorder the history"
+        );
+        assert_eq!(daemon.signals.emitted(), announced);
+        assert!(
+            !daemon.state.lock().await.echo.is_armed(),
+            "a guard armed for a copy-back that never left would swallow a real copy"
+        );
+    }
+
+    /// Before the Wayland watcher has started there is no clipboard to put an
+    /// entry on, and `Copy` says so rather than reporting a paste.
+    #[tokio::test]
+    async fn copy_before_the_watcher_is_up_says_so_and_changes_nothing() {
+        let (daemon, _dir, id) = daemon_with(None).await;
+
+        let refused = daemon
+            .copy_at(id, Timestamp::from_unix_millis(2_000))
+            .await
+            .expect_err("there is no clipboard yet");
+        assert!(matches!(refused, fdo::Error::Failed(_)), "{refused:?}");
+
+        let entry = daemon.state.lock().await.store.get(id).unwrap().unwrap();
+        assert_eq!(entry.entry.last_used_at, Timestamp::from_unix_millis(1_000));
+        assert!(!daemon.state.lock().await.echo.is_armed());
     }
 
     /// The startup sweep goes through the same commit path as every other

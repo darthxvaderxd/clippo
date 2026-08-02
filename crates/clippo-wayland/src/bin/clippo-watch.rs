@@ -17,7 +17,7 @@ use std::io::{self, Write};
 
 use clap::Parser;
 use clippo_wayland::{
-    Flavor, Selection, SelectionKind, WatchConfig, DEFAULT_MAX_FLAVOR_BYTES,
+    Flavor, Selection, SelectionKind, WatchConfig, WatchEvent, DEFAULT_MAX_FLAVOR_BYTES,
     PASSWORD_MANAGER_HINT_MIME,
 };
 use tracing_subscriber::EnvFilter;
@@ -75,7 +75,7 @@ fn main() {
         ..WatchConfig::default()
     };
 
-    let (watcher, mut selections) = match clippo_wayland::watch(config) {
+    let (watcher, mut events) = match clippo_wayland::watch(config) {
         Ok(started) => started,
         Err(error) => {
             report_failure(&error);
@@ -97,7 +97,13 @@ fn main() {
     );
 
     let mut count: u64 = 0;
-    while let Some(selection) = selections.blocking_recv() {
+    while let Some(event) = events.blocking_recv() {
+        // `clippo-watch` never puts anything on the clipboard, so it has no
+        // selection to lose; the arm exists because the event type is shared
+        // with the daemon, which does.
+        let WatchEvent::Captured(selection) = event else {
+            continue;
+        };
         count += 1;
         let mut stdout = io::stdout().lock();
         if write_selection(

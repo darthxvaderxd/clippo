@@ -45,6 +45,18 @@ pub fn is_password_manager_hint(mime: &str) -> bool {
     PASSWORD_MANAGER_HINT_MIME.eq_ignore_ascii_case(&normalize(mime))
 }
 
+/// Whether two MIME types name the same flavor.
+///
+/// The same case-and-whitespace normalisation [`is_interesting`] applies, for
+/// the same reason, but between two arbitrary types rather than against the
+/// known list. The offer half needs it: an application that pastes by asking
+/// for `text/plain; charset=utf-8` must get the flavor clippo advertised as
+/// `text/plain;charset=utf-8`, and a lookup that missed would hand it an empty
+/// pipe.
+pub fn same(mime: &str, other: &str) -> bool {
+    normalize(mime).eq_ignore_ascii_case(&normalize(other))
+}
+
 /// Strip the whitespace that some toolkits put around MIME parameters.
 fn normalize(mime: &str) -> String {
     mime.chars().filter(|c| !c.is_ascii_whitespace()).collect()
@@ -100,6 +112,17 @@ mod tests {
         assert!(is_interesting("text/plain; charset=utf-8"));
         assert!(is_interesting(" text/html "));
         assert!(is_interesting("Image/PNG"));
+    }
+
+    #[test]
+    fn two_spellings_of_one_flavor_are_the_same_flavor() {
+        assert!(same(
+            "text/plain;charset=utf-8",
+            "text/plain; charset=UTF-8"
+        ));
+        assert!(same(" IMAGE/PNG ", "image/png"));
+        assert!(!same("image/png", "image/png;clippo-thumb"));
+        assert!(!same("text/plain", "text/html"));
     }
 
     #[test]

@@ -119,7 +119,10 @@ selection atomically and re-offer all of them from a long-lived process.
   entry, and write the blob to the fd on each `send` event. The daemon staying alive is what
   keeps the clipboard populated; this is standard Wayland behavior and must be documented.
 - **Self-echo guard** — hash what we set, then ignore the next `selection` event matching that
-  hash. Without this, every copy-back re-enters the history.
+  hash. Without this, every copy-back re-enters the history. *Implemented in `clippod` rather
+  than here (M3c): the hash it matches on is `clippo-store`'s dedup hash — the exact identity a
+  capture would be stored under — and this crate would have to depend on the encrypted store to
+  compute it.*
 - Runs on its own thread, talking to the daemon over `tokio::sync::mpsc`.
 - Primary selection: config-gated, **off** by default.
 
