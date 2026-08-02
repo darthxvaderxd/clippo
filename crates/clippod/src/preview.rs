@@ -1,17 +1,41 @@
 //! Turning a captured selection into the one line a frontend shows.
 //!
-//! **This is the module M4 changes.** Masking a suspected secret is a change to
-//! [`build`] and to nothing else, because [`build`] is the only place a preview
-//! comes from and a preview is the only content [`crate::daemon`] puts in an
-//! [`EntrySummary`][clippo_ipc::EntrySummary]. The full value leaves the daemon
-//! through exactly one member, `Reveal`, which calls [`reveal`] below.
+//! **This is where masking happens** — [`describe`] and nowhere else, because a
+//! preview is the only content [`crate::daemon`] puts in an
+//! [`EntrySummary`][clippo_ipc::EntrySummary], and [`describe`] is the only
+//! place a preview comes from. The full value leaves the daemon through exactly
+//! one member, `Reveal`, which calls [`reveal`] below.
 //!
 //! Keeping those two functions side by side is the point of the module: a
 //! reader can see at a glance that the masked path and the unmasked path are
 //! different functions, and that only one of them is reachable from `List` and
 //! `Search`.
+//!
+//! # A masked preview is masked in the database
+//!
+//! [`describe`] runs once, at capture, and its answer is what
+//! `entries.preview` holds. A sensitive entry's preview column is `ab••••••••yz`
+//! — the whole value is in the `flavors` table and nowhere else. That is
+//! stronger than masking on the way out: there is no code path from `List`,
+//! from `Search`, from the cache or from a future member that could render an
+//! unmasked preview, because the daemon does not have one to render.
+//!
+//! It also means detection runs against the *whole* value rather than the
+//! 120-character preview, which the entropy rule's length gate would otherwise
+//! see the wrong end of.
+//!
+//! The cost of storing the answer is that a row keeps whatever this module
+//! concluded on the day it was captured — before masking existed, or while
+//! `entropy_rule` was off. There is no migration pass over the history, so the
+//! correction happens on use: a repeat copy re-runs detection and
+//! [`clippo_store::Store::insert`]'s bump takes the new preview whenever the
+//! new capture is the sensitive one. The flag and the mask only ever move
+//! together, and only ever towards safety.
 
-use clippo_core::{EntryKind, Flavor};
+use std::borrow::Cow;
+
+use clippo_core::secrets::{self, Signal};
+use clippo_core::{EntryKind, Flavor, SecretsConfig};
 use clippo_store::dedup;
 
 /// How much of a copy a preview keeps, in characters.
@@ -26,7 +50,12 @@ pub const PREVIEW_MAX_CHARS: usize = 120;
 /// The character marking a preview that was cut short.
 const ELLIPSIS: char = '\u{2026}';
 
-/// The one-line rendering of a copy, as stored in `entries.preview`.
+/// The one-line rendering of a copy, before masking.
+///
+/// **Private on purpose.** This is the unmasked renderer; [`describe`] is the
+/// one that decides whether a copy may be shown at all, and it is the only
+/// caller. A `pub` here would be a second way to build a preview, and the next
+/// person to need one would find it.
 ///
 /// Built once at capture and stored, not recomputed per call: the list and the
 /// search index both read it, and rebuilding it would mean loading every blob
@@ -37,7 +66,7 @@ const ELLIPSIS: char = '\u{2026}';
 /// so that a fuzzy match against it is not defeated by a newline. An image has
 /// no text to show, so it gets its type and size; the applet draws the stored
 /// thumbnail instead.
-pub fn build(kind: EntryKind, flavors: &[Flavor]) -> String {
+fn build(kind: EntryKind, flavors: &[Flavor]) -> String {
     let Some(source) = preview_source(kind, flavors) else {
         // The caller has already refused a selection with no canonical flavor —
         // it has no hash and so no identity to store under. Reachable only if
@@ -51,6 +80,64 @@ pub fn build(kind: EntryKind, flavors: &[Flavor]) -> String {
     }
 
     truncate(&flatten(&String::from_utf8_lossy(&source.data)))
+}
+
+/// What a captured copy looks like to a frontend: one line, and whether it is
+/// a suspected secret.
+///
+/// The two travel together because they are decided together — the flag is what
+/// says the line is a mask — and because a caller that could set one without
+/// the other is a caller that could store a full preview with `sensitive =
+/// true`, which every frontend would render as a lock badge next to a password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Description {
+    /// The `entries.preview` value: masked if `sensitive`.
+    pub preview: String,
+    /// The `entries.sensitive` value.
+    pub sensitive: bool,
+    /// Which rule decided, for the log line. `None` when nothing fired.
+    pub signal: Option<Signal>,
+}
+
+/// Describe a captured copy: detect, then render accordingly.
+///
+/// `hinted` is whether the selection carried the password-manager MIME marker;
+/// the daemon reads it from the [`Selection`][clippo_wayland::Selection],
+/// because the marker may be advertised and never received and is not stored.
+///
+/// A suspected secret is rendered by [`mask`][clippo_core::secrets::mask] over
+/// the *flattened* value, not the raw one. Flattening first is what keeps a
+/// newline or an `ESC` out of the two visible characters at each end: the mask
+/// is written straight into a terminal by the CLI, and `ab` is only safe if it
+/// is really `ab`. Everything else about the value — its length above all — is
+/// already gone by then.
+///
+/// An image is never masked even when the marker fires. Its preview is
+/// `image/png, 2.0 KB`, which is a type and a size and reveals nothing; masking
+/// it would hide the one useful thing on the row while protecting nothing. The
+/// `sensitive` flag is still set, so the applet still draws the badge and the
+/// blob is still only reachable through `Copy`.
+pub fn describe(
+    kind: EntryKind,
+    flavors: &[Flavor],
+    hinted: bool,
+    config: &SecretsConfig,
+) -> Description {
+    let value = whole_value(kind, flavors).unwrap_or_default();
+    let signal = secrets::detect(&value, hinted, config);
+    let sensitive = signal.is_some();
+
+    let preview = if sensitive && kind != EntryKind::Image {
+        secrets::mask(&flatten(&value), config)
+    } else {
+        build(kind, flavors)
+    };
+
+    Description {
+        preview,
+        sensitive,
+        signal,
+    }
 }
 
 /// The flavor a preview is read from, which is not always the canonical one.
@@ -100,10 +187,24 @@ fn essence(mime: &str) -> String {
 /// instead would answer a masked `<b>clip…` with `clippo`, which is a different
 /// string and looks like a bug.
 pub fn reveal(kind: EntryKind, flavors: &[Flavor]) -> Option<String> {
+    whole_value(kind, flavors).map(Cow::into_owned)
+}
+
+/// The same value [`reveal`] returns, borrowed.
+///
+/// [`describe`] needs the whole value to detect against and would otherwise
+/// copy a multi-megabyte text copy to look at the first sixty kilobytes of it,
+/// on the capture path, for every copy. `Cow` borrows for valid UTF-8, which is
+/// every text flavor that is not corrupt.
+///
+/// Detection and `Reveal` reading the *same* function is the point, and not
+/// only an optimisation: a value that detection judged and a value the user is
+/// shown must not be able to become two different strings.
+fn whole_value(kind: EntryKind, flavors: &[Flavor]) -> Option<Cow<'_, str>> {
     if kind == EntryKind::Image {
         return None;
     }
-    preview_source(kind, flavors).map(|flavor| String::from_utf8_lossy(&flavor.data).into_owned())
+    preview_source(kind, flavors).map(|flavor| String::from_utf8_lossy(&flavor.data))
 }
 
 /// Collapse every run of whitespace to a single space and trim the ends.
@@ -254,6 +355,140 @@ mod tests {
     fn an_image_has_nothing_to_reveal() {
         let flavors = vec![Flavor::new("image/png", vec![0_u8; 16])];
         assert!(reveal(EntryKind::Image, &flavors).is_none());
+    }
+
+    fn secrets() -> SecretsConfig {
+        SecretsConfig::default()
+    }
+
+    fn describe_text(value: &str) -> Description {
+        describe(EntryKind::Text, &text(value), false, &secrets())
+    }
+
+    #[test]
+    fn an_ordinary_copy_is_described_exactly_as_it_was_before() {
+        let described = describe_text("  one\n\ttwo  ");
+        assert_eq!(described.preview, "one two");
+        assert!(!described.sensitive);
+        assert_eq!(described.signal, None);
+    }
+
+    #[test]
+    fn a_suspected_secret_is_described_as_a_mask() {
+        let described = describe_text("Xr4$Tp9!Lm2#Wq7&Zc5%");
+        assert_eq!(
+            described.preview,
+            "Xr\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}5%"
+        );
+        assert!(described.sensitive);
+        assert_eq!(described.signal, Some(Signal::Entropy));
+    }
+
+    /// The marker masks and does not skip: there is still an entry, still with
+    /// its flavors, and `reveal` still answers with the password.
+    #[test]
+    fn a_password_manager_copy_is_masked_rather_than_discarded() {
+        let flavors = text("hunter2");
+        let described = describe(EntryKind::Text, &flavors, true, &secrets());
+        assert!(described.sensitive);
+        assert_eq!(described.signal, Some(Signal::PasswordManagerHint));
+        assert!(!described.preview.contains("hunter2"));
+        assert_eq!(reveal(EntryKind::Text, &flavors).unwrap(), "hunter2");
+    }
+
+    /// Detection reads the whole value and masking reads the whole value, so a
+    /// secret longer than a preview still shows its real last two characters
+    /// rather than the last two of a truncation.
+    #[test]
+    fn the_mask_is_built_from_the_whole_value_not_from_the_truncated_preview() {
+        let long = format!("sk-{}ZZ", "a1B2".repeat(50));
+        assert!(long.chars().count() > PREVIEW_MAX_CHARS);
+
+        let described = describe_text(&long);
+        assert!(described.sensitive);
+        assert!(described.preview.starts_with("sk"), "{}", described.preview);
+        assert!(described.preview.ends_with("ZZ"), "{}", described.preview);
+        assert_eq!(described.preview.chars().count(), 2 + 8 + 2);
+    }
+
+    /// The mask goes straight into a terminal, so the two visible characters at
+    /// each end must be characters. Flattening before masking is what makes the
+    /// ends of a value that begins with an escape sequence safe.
+    #[test]
+    fn a_mask_never_carries_a_control_character_out_of_the_value() {
+        let described = describe_text("sk-ClippoFixtureNotARealKey0000000000\u{1b}[0m\n");
+        assert!(described.sensitive);
+        assert!(
+            !described.preview.chars().any(char::is_control),
+            "{:?}",
+            described.preview
+        );
+        // The escape is gone, so the visible characters are the value's.
+        assert!(described.preview.starts_with("sk"), "{}", described.preview);
+    }
+
+    /// The other half of that: a value whose only whitespace is the newline the
+    /// copy came with is still one token, and still a secret.
+    #[test]
+    fn a_trailing_newline_does_not_hide_a_password() {
+        let described = describe_text("Xr4$Tp9!Lm2#Wq7&Zc5%\n");
+        assert!(described.sensitive);
+        assert_eq!(described.signal, Some(Signal::Entropy));
+        assert_eq!(
+            described.preview,
+            "Xr\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}5%"
+        );
+    }
+
+    /// An image's preview is its type and its size, which gives nothing away.
+    /// The flag is still set, so the applet still marks the row.
+    #[test]
+    fn an_image_from_a_password_manager_keeps_its_size_preview() {
+        let flavors = vec![Flavor::new("image/png", vec![0_u8; 2048])];
+        let described = describe(EntryKind::Image, &flavors, true, &secrets());
+        assert_eq!(described.preview, "image/png, 2.0 KB");
+        assert!(described.sensitive);
+    }
+
+    /// The config half, at the level the daemon uses: the same copy, described
+    /// twice, once with the entropy rule and once without.
+    #[test]
+    fn the_entropy_knob_changes_what_this_module_masks() {
+        let without = SecretsConfig {
+            entropy_rule: false,
+            ..secrets()
+        };
+        let generated = text("Xr4$Tp9!Lm2#Wq7&Zc5%");
+
+        assert!(describe(EntryKind::Text, &generated, false, &secrets()).sensitive);
+        let unmasked = describe(EntryKind::Text, &generated, false, &without);
+        assert!(!unmasked.sensitive);
+        assert_eq!(unmasked.preview, "Xr4$Tp9!Lm2#Wq7&Zc5%");
+
+        // …and the two rules that do not guess are unaffected.
+        let token = text("AKIAIOSFODNN7EXAMPLE");
+        assert!(describe(EntryKind::Text, &token, false, &without).sensitive);
+        assert!(describe(EntryKind::Text, &generated, true, &without).sensitive);
+    }
+
+    /// How much of the value is visible is the user's setting, and the bullet
+    /// run is not.
+    #[test]
+    fn the_visible_ends_of_a_mask_follow_the_config() {
+        let described = describe(
+            EntryKind::Text,
+            &text("Xr4$Tp9!Lm2#Wq7&Zc5%"),
+            false,
+            &SecretsConfig {
+                mask_prefix: 4,
+                mask_suffix: 0,
+                ..secrets()
+            },
+        );
+        assert_eq!(
+            described.preview,
+            "Xr4$\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
+        );
     }
 
     #[test]

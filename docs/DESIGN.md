@@ -161,7 +161,11 @@ The differentiating feature. It gets its own module and its own test suite.
    plus two dot-separated segments), `-----BEGIN … PRIVATE KEY-----`,
    `postgres://user:pass@`.
 3. *Entropy heuristic* — single token, no whitespace, length 8–128, at least three character
-   classes, Shannon entropy above 3.5 bits/char.
+   classes, Shannon entropy above 3.5 bits/char. *Two refinements came out of tuning against
+   the corpus (M4), both in `clippo_core::secrets::entropy`: `-` and `_` are separators rather
+   than a character class, without which every UUID is flagged; and a value that is a URL or a
+   filesystem path is exempt, without which every link is. Both are documented where they are
+   implemented, with the fixture that motivated them.*
 
 **Masking is display-only.** `mask(s)` → `ab••••••••yz`: first two and last two characters
 (both configurable), middle replaced by a fixed-width bullet run that does **not** leak the

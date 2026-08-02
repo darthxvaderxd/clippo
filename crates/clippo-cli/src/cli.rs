@@ -66,6 +66,12 @@ last used, its kind (text, html, uris, image), two flag characters — `p` when 
 the entry is pinned, `s` when clippo suspects a password or token — and a \
 one-line preview.
 
+An `s` entry's preview is a mask: `ab••••••••yz`, the first and last couple of \
+characters with a fixed-width run between them that does not say how long the \
+value is. The value itself is unchanged — `clippo copy` pastes it in full, and \
+`clippo reveal` prints it. Masking is what the list shows, not what clippo \
+stores.
+
 Previews are clipboard content, which is arbitrary bytes: newlines are \
 collapsed and control characters are escaped before printing, so a copied \
 terminal escape sequence cannot repaint your terminal. `--json` keeps whole, \
@@ -194,6 +200,10 @@ stored — no truncation, no masking, and no trailing newline added, so it \
 composes in a pipe:
 
   clippo reveal 2 > key.pem
+
+This is how a masked `s` entry is read: `Reveal` is the only member of the \
+daemon's interface that returns a suspected secret in full, and it does it \
+only when asked for one entry by ID.
 
 This is the one command that does not make what it prints safe for a \
 terminal. A copy containing escape sequences will be acted on by the terminal \

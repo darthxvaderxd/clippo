@@ -1,0 +1,348 @@
+# clippo's secret-detection fixture corpus.
+#
+# DESIGN.md, `clippo-core`:
+#
+# > The entropy threshold must be tuned against a fixture corpus of real-world
+# > strings (git SHAs, base64 blobs, UUIDs, minified JS, prose). False positives
+# > here are annoying; false negatives are the actual risk.
+#
+# This is that corpus, and `corpus.rs` is the test that asserts the expected
+# classification of every entry in it. Three sections, in the order the risk
+# runs:
+#
+#   [[secret]]                  must be detected, by the named rule
+#   [[safe]]                    must not be detected at all
+#   [[accepted_false_positive]] is detected, is not a secret, and we know
+#
+# **Nothing here is a real credential.** Every value is synthetic: the tokens
+# are the right shape with `ClippoFixture`/`EXAMPLE`/zero padding where the
+# random part would be, the passwords were made up for this file, and the AWS
+# id is the one from Amazon's own documentation. They are checked into a public
+# repository, so they had better be worthless — and a fixture that was ever
+# real would be one nobody could rotate.
+#
+# # Adding a fixture
+#
+# A new shape rule needs a `[[secret]]` here naming it; the test fails if any
+# variant of `secrets::Shape` has no fixture, so the two lists cannot drift.
+# When a user reports a false positive, the answer is a `[[safe]]` entry and
+# whatever tuning makes it pass — in that order, so the report is pinned before
+# it is fixed.
+
+# ---------------------------------------------------------------------------
+# Rule 1 — the password-manager MIME marker.
+#
+# `hint = true` is the selection carrying `x-kde-passwordManagerHint`. Both of
+# these are values no heuristic would catch on its own, which is the point of
+# the rule: the application told us.
+# ---------------------------------------------------------------------------
+
+[[secret]]
+name = "keepassxc-password"
+rule = "mime-hint"
+hint = true
+value = "Tr0ub4dor&3"
+why = """
+Eleven characters, so the entropy rule cannot reach it — nothing under twelve
+can clear 3.5 bits/char. This is the copy from ROADMAP verification 4, and the
+marker is the only thing that catches it."""
+
+[[secret]]
+name = "weak-password-from-a-manager"
+rule = "mime-hint"
+hint = true
+value = "hunter2"
+why = """
+A terrible password is still a password. It is stored and pasteable like any
+other entry — DESIGN.md is explicit that the marker masks rather than skips."""
+
+# ---------------------------------------------------------------------------
+# Rule 2 — provider-token shapes. One per pattern, at minimum.
+# ---------------------------------------------------------------------------
+
+[[secret]]
+name = "openai-api-key"
+rule = "shape:openai-api-key"
+value = "sk-ClippoFixtureNotARealKey00000000000000000000"
+why = "The `sk-…` shape DESIGN.md names. Base62 after the prefix."
+
+[[secret]]
+name = "openai-project-key"
+rule = "shape:openai-api-key"
+value = "sk-proj-ClippoFixtureNotARealKey_0000000000000000000000"
+why = "The newer `sk-proj-` form, which does carry `-` and `_`."
+
+[[secret]]
+name = "github-personal-access-token"
+rule = "shape:github-token"
+value = "ghp_ClippoFixtureNotARealToken0000000000"
+why = "`ghp_` from DESIGN.md's list."
+
+[[secret]]
+name = "github-oauth-token"
+rule = "shape:github-token"
+value = "gho_ClippoFixtureNotARealToken0000000000"
+why = "`gho_`, the same shape with a different second letter."
+
+[[secret]]
+name = "github-fine-grained-pat"
+rule = "shape:github-token"
+value = "github_pat_11ACLIPPOFIXTURE0000000_ClippoFixtureNotARealTokenPaddedToNinetyThreeCharacters00"
+why = """
+`github_pat_`, 93 characters — the longest true positive in the corpus, and
+what the 128-character entropy ceiling has to stay clear of."""
+
+[[secret]]
+name = "aws-access-key-id"
+rule = "shape:aws-access-key-id"
+value = "AKIAIOSFODNN7EXAMPLE"
+why = "Amazon's own documentation example. Exactly 20 characters, as all of them are."
+
+[[secret]]
+name = "slack-bot-token"
+rule = "shape:slack-token"
+value = "xoxb-0000000000-0000000000-ClippoFixtureNotAReal"
+why = "`xox[baprs]-` from DESIGN.md's list."
+
+[[secret]]
+name = "json-web-token"
+rule = "shape:jwt"
+value = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJjbGlwcG8tZml4dHVyZSJ9.ClippoFixtureNotARealSignature00000000000"
+why = """
+`eyJ` and two dot-separated segments. The payload decodes to
+`{"sub":"clippo-fixture"}` and the signature is padding. This is the third of
+ROADMAP verification 4's three copies."""
+
+[[secret]]
+name = "rsa-private-key"
+rule = "shape:private-key-block"
+value = """
+-----BEGIN RSA PRIVATE KEY-----
+Q2xpcHBvIGZpeHR1cmUuIFRoaXMgaXMgbm90IGEga2V5LiBJdCBpcyBiYXNlNjQg
+b2YgYSBzZW50ZW5jZSBzYXlpbmcgc28sIHNvIHRoYXQgbm9ib2R5IGV2ZXIgdHJp
+ZXMgdG8gcm90YXRlIGl0Lg==
+-----END RSA PRIVATE KEY-----
+"""
+why = """
+The PEM header is the whole signal, and it is on the first line — which is why
+the shape rules only need the front of a copy. Note this value has newlines in
+it: the entropy rule could never see it, because it is not one token."""
+
+[[secret]]
+name = "openssh-private-key"
+rule = "shape:private-key-block"
+value = "-----BEGIN OPENSSH PRIVATE KEY-----"
+why = "The same rule, a different key type. `BEGIN … PRIVATE KEY` is the pattern."
+
+[[secret]]
+name = "postgres-url-with-password"
+rule = "shape:database-url-password"
+value = "postgres://clippo:not-a-real-password@db.example.internal:5432/clippo"
+why = """
+`postgres://user:pass@`, verbatim from DESIGN.md. Detected by its shape before
+the entropy rule's locator gate can exempt it for being a URL — which is why
+that gate is safe."""
+
+[[secret]]
+name = "mongodb-url-with-password"
+rule = "shape:database-url-password"
+value = "mongodb+srv://clippo:not-a-real-password@cluster0.example.mongodb.net/clippo"
+why = "The same shape, one more of the family."
+
+# ---------------------------------------------------------------------------
+# Rule 3 — the entropy heuristic. The tunable one.
+#
+# These are the fixtures the threshold is tuned against; the figures are in the
+# doc comment on `ENTROPY_THRESHOLD_BITS_PER_CHAR`. With `entropy_rule = false`
+# in the config, every fixture in this group stops being detected and every
+# fixture above keeps working — the corpus test asserts exactly that.
+# ---------------------------------------------------------------------------
+
+[[secret]]
+name = "generated-password-20"
+rule = "entropy"
+value = "Xr4$Tp9!Lm2#Wq7&Zc5%"
+why = "4.32 bits/char, four character classes. What a password manager generates."
+
+[[secret]]
+name = "generated-password-16"
+rule = "entropy"
+value = "mK8vT2qXw9RzB4nP"
+why = "4.00 bits/char, three classes. The alphanumeric-only default of most generators."
+
+[[secret]]
+name = "generated-password-12"
+rule = "entropy"
+value = "aB3!xY9zQ7#w"
+why = """
+3.59 bits/char — the nearest true positive to the threshold, and the shortest
+value that can clear it at all, since twelve distinct characters cap out at
+log₂(12) = 3.585."""
+
+[[secret]]
+name = "api-secret-32"
+rule = "entropy"
+value = "Zk4mQ8pR2vN6xL0tJ7wY3bF5hD9sG1cA"
+why = """
+The shapeless kind: a 32-character application secret from a provider clippo
+has no pattern for. This is the case the entropy rule exists for, and the one
+that would be a false negative without it."""
+
+# ---------------------------------------------------------------------------
+# True negatives. DESIGN.md's list first, then the ones the corpus added.
+# ---------------------------------------------------------------------------
+
+[[safe]]
+name = "git-sha-full"
+value = "e2f9b1c4a7d63805fe1a2b3c4d5e6f7089abcdef"
+why = """
+3.95 bits/char, comfortably over the threshold, and stopped by the class gate:
+hex is lowercase and digits, two classes. ROADMAP verification 4 copies one of
+these and expects nothing to happen."""
+
+[[safe]]
+name = "git-sha-short"
+value = "3e98799"
+why = "Seven characters — under the length floor before anything else is asked."
+
+[[safe]]
+name = "git-sha-256"
+value = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+why = "Longer hex, same two classes. SHA-256 object ids look like this."
+
+[[safe]]
+name = "uuid-v4-lowercase"
+value = "3f2b9c7e-8a41-4d6b-95e0-1c7a2f8d4b63"
+why = """
+4.02 bits/char — the highest-scoring true negative in the corpus, and the
+reason hyphens do not count as a character class. Counting them would make this
+three classes and flag every UUID anybody copies, which is DESIGN.md's own
+false-positive check."""
+
+[[safe]]
+name = "uuid-v4-uppercase"
+value = "3F2B9C7E-8A41-4D6B-95E0-1C7A2F8D4B63"
+why = "The same, uppercased. Still two classes."
+
+[[safe]]
+name = "base64-blob"
+value = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggolFTkSuQmCCiVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+why = """
+A base64 blob of the sort people actually paste — an encoded PNG. 172
+characters, so the 128-character ceiling stops it. That ceiling is doing real
+work here: by entropy alone this is 4.7 bits/char and indistinguishable from an
+encoded key."""
+
+[[safe]]
+name = "base64-short"
+value = "SGVsbG8gV29ybGQh"
+why = """
+3.45 bits/char — the nearest true negative under the threshold, along with the
+timestamp below. Decodes to `Hello World!`."""
+
+[[safe]]
+name = "minified-js"
+value = "!function(e,t){\"object\"==typeof exports&&\"undefined\"!=typeof module?t(exports):\"function\"==typeof define&&define.amd?define([\"exports\"],t):t((e=e||self).clippo={})}(this,function(e){\"use strict\";"
+why = """
+Minified JavaScript, from DESIGN.md's list. Two gates stop it: it has spaces in
+it, so it is not one token, and at 196 characters it is over the ceiling
+anyway. Real bundles are longer still."""
+
+[[safe]]
+name = "prose-paragraph"
+value = """
+The clipboard is the most-used feature nobody thinks about. clippo keeps a
+history of it, encrypted at rest, and refuses to render anything that looks
+like a password in a panel where a colleague can read it."""
+why = "Prose, from DESIGN.md's list. Whitespace: not one token, and never will be."
+
+[[safe]]
+name = "prose-sentence-with-a-word-that-looks-random"
+value = "Ask Rk8Wt2Nq about the deploy"
+why = "Whitespace again. The entropy rule does not go looking inside a sentence."
+
+[[safe]]
+name = "joined-english-words"
+value = "correcthorsebatterystaple"
+why = """
+3.36 bits/char and one character class. A single token with no whitespace, so
+the class gate is what stops it."""
+
+[[safe]]
+name = "iso-8601-timestamp"
+value = "2026-08-02T04:51:06.489Z"
+why = """
+3.49 bits/char — one hundredth of a bit below the threshold, and the closest
+call in the corpus. Three classes and in range, so nothing else stops it."""
+
+[[safe]]
+name = "https-url"
+value = "https://github.com/nilfactor/clippo/blob/main/docs/DESIGN.md"
+why = """
+4.40 bits/char, three classes, 60 characters: this clears every one of
+DESIGN.md's four gates and is not remotely a secret. It is why the locator gate
+exists. Masking every link a user copies would break the feature clipboard
+managers are for."""
+
+[[safe]]
+name = "absolute-path"
+value = "/home/Richard/Projects/Clippo7/crates/clippo-core"
+why = "The same gate. A mixed-case path with a digit in it otherwise clears all four."
+
+[[safe]]
+name = "kebab-case-identifier"
+value = "sk-invoice-line-item-renderer"
+why = """
+Starts with `sk-`, which is why the OpenAI pattern requires base62 after the
+prefix rather than anything token-shaped. One character class, so the entropy
+rule declines it too."""
+
+[[safe]]
+name = "screaming-snake-constant"
+value = "MAX_IMAGE_BYTES_LIMIT"
+why = "Underscores are structure, not a class, so this is one class and not three."
+
+[[safe]]
+name = "database-url-without-a-password"
+value = "postgres://localhost:5432/clippo"
+why = """
+The shape rule requires `user:pass@`. A connection string with no credential in
+it is the thing people put in READMEs."""
+
+[[safe]]
+name = "empty"
+value = ""
+why = "Nothing is not a secret. Detection is called on every copy, including odd ones."
+
+# ---------------------------------------------------------------------------
+# Accepted false positives.
+#
+# Detected, not actually secret, and left that way deliberately. DESIGN.md's
+# ordering is that false positives are annoying and false negatives are the
+# risk, so the bar for narrowing a rule is that the narrowing does not cost a
+# true positive. Neither of these clears that bar — both would need the entropy
+# rule to understand what the value *means*, not what it looks like.
+#
+# They are here rather than unlisted so that the behaviour is pinned: if a
+# future change stops flagging them, this file is where the deliberate part of
+# it gets written down. A user hitting one sees a masked entry that still
+# pastes correctly, and `clippo reveal` shows it in full.
+# ---------------------------------------------------------------------------
+
+[[accepted_false_positive]]
+name = "base64-of-a-sentence"
+rule = "entropy"
+value = "VGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZy4="
+why = """
+4.96 bits/char and 60 characters, so it is inside the range the long blob above
+escapes. Base64 of a sentence and base64 of a 32-byte key are the same string
+to every rule clippo has; flagging both is the safe direction."""
+
+[[accepted_false_positive]]
+name = "version-string-with-build-metadata"
+rule = "entropy"
+value = "clippo-0.1.0-alpha.3+build.42"
+why = """
+3.98 bits/char, and three classes because `.` and `+` count as symbols where
+`-` does not. Adding them to the structure set would fix this and would also
+stop counting the symbols in a password that happens to use them."""

@@ -208,6 +208,19 @@ impl Store {
     /// sensitive, and clearing the flag stays something a user gesture asks for
     /// rather than something a later copy does by accident.
     ///
+    /// **The preview travels with the flag.** Since M4 the preview is masked
+    /// before it is stored, so it is the thing that decides whether a password
+    /// is on screen — raising `sensitive` while leaving the unmasked preview in
+    /// place would flag the row correctly and still show the value, which is
+    /// worse than not flagging it at all. The bump therefore takes the new
+    /// capture's preview whenever that capture is sensitive. `CASE` rather than
+    /// an unconditional assignment keeps the two columns moving in the same
+    /// direction: a sensitive arrival always overwrites with its mask, and a
+    /// *non*-sensitive repeat of an already-masked entry leaves the mask alone,
+    /// exactly as `sensitive = sensitive | ?2` leaves the flag alone. This is
+    /// also what upgrades a row captured before M4, or captured while
+    /// `entropy_rule` was off, the next time the user copies it.
+    ///
     /// Three things happen around the write itself:
     ///
     /// - **The image cap.** An image flavor over
@@ -265,9 +278,11 @@ impl Store {
                 )?;
                 tx.execute(
                     "UPDATE entries
-                     SET last_used_at = ?1, sensitive = sensitive | ?2
+                     SET last_used_at = ?1,
+                         preview = CASE WHEN ?2 THEN ?4 ELSE preview END,
+                         sensitive = sensitive | ?2
                      WHERE id = ?3",
-                    params![captured_at, new.sensitive, id],
+                    params![captured_at, new.sensitive, id, new.preview],
                 )?;
                 Insertion::Bumped(EntryId::new(id))
             }
@@ -1080,27 +1095,51 @@ mod tests {
         let mut store = temp.open();
 
         let id = store.insert(&text(1_000, "hunter2")).unwrap().id();
-        assert!(!store.get(id).unwrap().unwrap().entry.sensitive);
+        let stored = store.get(id).unwrap().unwrap();
+        assert!(!stored.entry.sensitive);
+        assert_eq!(stored.entry.preview, "hunter2");
 
+        // The daemon masks before it stores, so a sensitive capture arrives
+        // with a masked preview. The flag and the preview have to move
+        // together: a row flagged sensitive whose preview is still the
+        // password is the worst of both, because the applet draws its lock
+        // badge next to the plaintext.
         let mut from_password_manager = text(2_000, "hunter2");
         from_password_manager.sensitive = true;
+        from_password_manager.preview = "hu••••••••r2".to_owned();
         assert_eq!(
             store.insert(&from_password_manager).unwrap(),
             Insertion::Bumped(id)
         );
-        assert!(store.get(id).unwrap().unwrap().entry.sensitive);
+        let stored = store.get(id).unwrap().unwrap();
+        assert!(stored.entry.sensitive);
+        assert_eq!(
+            stored.entry.preview, "hu••••••••r2",
+            "the better-informed capture's preview replaces the one in the clear"
+        );
 
         // And not back again: an entry that was ever sensitive stays sensitive
-        // until something with a user behind it says otherwise.
+        // until something with a user behind it says otherwise — and so does
+        // its mask, or an unmarked third copy would put the password back on
+        // screen with the flag still set.
         assert_eq!(
             store.insert(&text(3_000, "hunter2")).unwrap(),
             Insertion::Bumped(id)
         );
         let stored = store.get(id).unwrap().unwrap();
         assert!(stored.entry.sensitive);
+        assert_eq!(stored.entry.preview, "hu••••••••r2", "the mask stays too");
         assert_eq!(
             stored.entry.last_used_at,
             Timestamp::from_unix_millis(3_000)
+        );
+
+        // The value itself is untouched by any of this — the flavors are what
+        // `Reveal` and the copy-back path read, and a bump never rewrites them.
+        assert_eq!(
+            stored.flavors[0].as_str().unwrap(),
+            "hunter2",
+            "masking is display-only, even across a bump"
         );
     }
 

@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use clippo_core::{EntryId, EntryKind, Flavor, NewEntry, Timestamp};
+use clippo_core::{EntryId, EntryKind, Flavor, NewEntry, SecretsConfig, Timestamp};
 use clippo_ipc::{ClippoBackend, ClippoInterface, EntrySummary};
 use clippo_store::{dedup, is_offerable, Store, StoreError};
 use clippo_wayland::{Clipboard, Selection};
@@ -69,6 +69,9 @@ pub struct Daemon {
     /// Outside the lock, so `Paused()` answers instantly and `SetPaused(true)`
     /// takes effect even while a large image capture holds the store.
     paused: AtomicBool,
+    /// The detection and masking knobs, read once at startup like the rest of
+    /// the config. Not behind the lock: capture reads it and nothing writes it.
+    secrets: SecretsConfig,
     signals: Signals,
     /// Where `Copy` puts an entry. Filled in once, after the Wayland watcher
     /// has started — see [`Daemon::connect_clipboard`].
@@ -81,7 +84,17 @@ impl Daemon {
     /// The cache is built here rather than lazily so that a database that will
     /// not read fails at startup, in the journal, rather than on a user's first
     /// `List`.
-    pub fn new(store: Store, signals: Signals) -> Result<Arc<Self>, StoreError> {
+    ///
+    /// `secrets` is the `[secrets]` table of the user's config, which decides
+    /// how much of a masked entry is shown and whether the entropy rule runs at
+    /// all. It is read once, here, for the reason the config module gives:
+    /// re-deriving it mid-run would leave a history captured under two
+    /// different sets of rules.
+    pub fn new(
+        store: Store,
+        signals: Signals,
+        secrets: SecretsConfig,
+    ) -> Result<Arc<Self>, StoreError> {
         let mut state = State {
             store,
             cache: PreviewCache::new(),
@@ -95,6 +108,7 @@ impl Daemon {
         Ok(Arc::new(Self {
             state: Mutex::new(state),
             paused: AtomicBool::new(false),
+            secrets,
             signals,
             clipboard: OnceLock::new(),
         }))
@@ -171,7 +185,7 @@ impl Daemon {
             return;
         }
 
-        let Some(new) = new_entry(selection, now) else {
+        let Some(new) = new_entry(selection, now, &self.secrets) else {
             debug!("a copy carried no flavor clippo can store, so it was skipped");
             return;
         };
@@ -385,24 +399,38 @@ fn reload(state: &mut State) -> Result<(), StoreError> {
 /// bare `x-kde-passwordManagerHint`, say. Such a copy has no
 /// [`EntryKind`] and therefore no canonical flavor, so it has no
 /// `entries.hash`, so there is no identity to store it under.
-fn new_entry(selection: Selection, now: Timestamp) -> Option<NewEntry> {
+///
+/// Detection and masking happen here, once, because this is where the whole
+/// value is: the marker flavor may never be stored, and the entropy rule needs
+/// the value rather than the 120 characters of it a preview keeps. What goes
+/// into the database is already masked — see [`crate::preview`].
+fn new_entry(selection: Selection, now: Timestamp, secrets: &SecretsConfig) -> Option<NewEntry> {
     // Read before the flavors are moved out.
-    let sensitive = selection.has_password_manager_hint();
+    let hinted = selection.has_password_manager_hint();
     let flavors = selection.flavors;
 
     let kind = EntryKind::for_flavors(&flavors)?;
     let hash = dedup::hash(kind, &flavors)?;
+    let described = preview::describe(kind, &flavors, hinted, secrets);
+
+    if let Some(signal) = described.signal {
+        // The rule, never the value: this is the line that answers "why is my
+        // UUID masked?" from the journal rather than from a rebuild.
+        debug!(
+            rule = %signal,
+            kind = %kind,
+            "clippo is treating a copy as a secret"
+        );
+    }
+
     Some(NewEntry {
         created_at: now,
         kind,
-        preview: preview::build(kind, &flavors),
+        preview: described.preview,
         hash,
-        // The MIME hint, which is the one detection signal that needs no
-        // heuristic and that only the capture path can see — the marker flavor
-        // may not even be stored. The shape regexes and the entropy rule join
-        // it at M4, in `clippo-core`; the store ORs this flag on a repeat copy
-        // so a later, better-informed capture can only ever raise it.
-        sensitive,
+        // The store ORs this flag on a repeat copy, so a later, better-informed
+        // capture of the same bytes can only ever raise it.
+        sensitive: described.sensitive,
         flavors,
     })
 }
@@ -673,11 +701,18 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_secrets(SecretsConfig::default())
+        }
+
+        /// The same, with the `[secrets]` table the caller wants — the entropy
+        /// knob is the only thing any test needs to vary.
+        fn with_secrets(secrets: SecretsConfig) -> Self {
             let dir = tempfile::tempdir().expect("a temp dir for the test database");
             let key = Key::random().expect("a key for the test database");
             let store =
                 Store::open(dir.path().join("history.db"), &key).expect("the store should open");
-            let daemon = Daemon::new(store, Signals::discard()).expect("the daemon should start");
+            let daemon =
+                Daemon::new(store, Signals::discard(), secrets).expect("the daemon should start");
             let clipboard = Arc::new(FakeClipboard::default());
             daemon.connect_clipboard(Arc::clone(&clipboard) as Arc<dyn Clipboard>);
             Self {
@@ -700,6 +735,28 @@ mod tests {
                     .capture_at(text_selection(text), self.tick())
                     .await;
             }
+        }
+
+        /// A copy out of a password manager: the text, plus the marker flavor
+        /// KeePassXC attaches to it.
+        async fn capture_password(&self, password: &str) {
+            self.daemon
+                .capture_at(
+                    Selection {
+                        kind: SelectionKind::Clipboard,
+                        advertised: vec![
+                            "text/plain".to_owned(),
+                            PASSWORD_MANAGER_HINT_MIME.to_owned(),
+                        ],
+                        flavors: vec![
+                            Flavor::new("text/plain", password),
+                            Flavor::new(PASSWORD_MANAGER_HINT_MIME, "secret"),
+                        ],
+                        dropped: Vec::new(),
+                    },
+                    self.tick(),
+                )
+                .await;
         }
 
         /// `Copy(id)`, on the same fresh-millisecond clock.
@@ -823,8 +880,12 @@ mod tests {
         let key = Key::random().expect("a key for the test database");
         let path = dir.path().join("history.db");
 
-        let first = Daemon::new(Store::open(&path, &key).expect("open"), Signals::discard())
-            .expect("start");
+        let first = Daemon::new(
+            Store::open(&path, &key).expect("open"),
+            Signals::discard(),
+            SecretsConfig::default(),
+        )
+        .expect("start");
         first
             .capture_at(
                 text_selection("survives a restart"),
@@ -836,6 +897,7 @@ mod tests {
         let second = Daemon::new(
             Store::open(&path, &key).expect("reopen"),
             Signals::discard(),
+            SecretsConfig::default(),
         )
         .expect("restart");
         assert_eq!(second.search("restart", 10).await.unwrap().len(), 1);
@@ -996,29 +1058,15 @@ mod tests {
     }
 
     /// The password-manager marker is the one detection signal only the capture
-    /// path can see — the marker flavor need not even be stored — so it is read
-    /// here rather than left to M4.
+    /// path can see — the marker flavor need not even be stored.
+    ///
+    /// **Masked, not skipped**, which DESIGN.md is explicit about: the entry is
+    /// there, it is a text entry, and the value is still in the store. What
+    /// changes is the one line a frontend shows.
     #[tokio::test]
     async fn a_password_manager_copy_is_recorded_as_sensitive() {
         let fixture = Fixture::new();
-        fixture
-            .daemon
-            .capture_at(
-                Selection {
-                    kind: SelectionKind::Clipboard,
-                    advertised: vec![
-                        "text/plain".to_owned(),
-                        PASSWORD_MANAGER_HINT_MIME.to_owned(),
-                    ],
-                    flavors: vec![
-                        Flavor::new("text/plain", "hunter2"),
-                        Flavor::new(PASSWORD_MANAGER_HINT_MIME, "secret"),
-                    ],
-                    dropped: Vec::new(),
-                },
-                Timestamp::from_unix_millis(1_000),
-            )
-            .await;
+        fixture.capture_password("hunter2").await;
 
         let entry = fixture.daemon.list(1, 0).await.unwrap().remove(0);
         assert!(entry.sensitive);
@@ -1026,6 +1074,167 @@ mod tests {
             entry.kind, "text",
             "the marker carries no content of its own"
         );
+        assert!(!entry.preview.contains("hunter2"), "{}", entry.preview);
+        assert_eq!(fixture.daemon.reveal(entry.id).await.unwrap(), "hunter2");
+    }
+
+    /// The same bytes twice, and only the second copy knows they are a secret.
+    ///
+    /// `hunter2` out of a text editor and then out of a password manager hash
+    /// alike — the marker is never the canonical flavor — so the second arrival
+    /// is a bump rather than a new row. The bump has to bring its *preview*
+    /// with it and not just its flag: a row marked sensitive whose preview is
+    /// still the password is worse than one that was never flagged, because the
+    /// applet draws its lock badge next to the plaintext.
+    ///
+    /// The same shape covers the two routes with no password manager in them —
+    /// a row captured while `entropy_rule` was off, and a row captured before
+    /// masking existed at all. Both are upgraded by the next copy.
+    #[tokio::test]
+    async fn a_repeat_copy_that_knows_better_masks_the_preview_it_already_stored() {
+        let fixture = Fixture::new();
+
+        fixture.capture(&["hunter2"]).await;
+        let entry = fixture.daemon.list(1, 0).await.unwrap().remove(0);
+        assert!(!entry.sensitive, "nothing about it looks like a secret yet");
+        assert_eq!(entry.preview, "hunter2");
+
+        fixture.capture_password("hunter2").await;
+
+        let listed = fixture.daemon.list(0, 0).await.unwrap();
+        assert_eq!(listed.len(), 1, "the same bytes are still one entry");
+        let entry = &listed[0];
+        assert!(entry.sensitive);
+        assert!(
+            !entry.preview.contains("hunter2"),
+            "the preview stored in the clear survived the bump: {}",
+            entry.preview
+        );
+        assert!(
+            !format!("{listed:?}").contains("hunter2"),
+            "the password crossed the bus in a List response"
+        );
+        assert_eq!(
+            fixture.daemon.reveal(entry.id).await.unwrap(),
+            "hunter2",
+            "and the value is still there to be revealed and pasted"
+        );
+    }
+
+    /// The acceptance criterion, as a test: no member but `Reveal` returns a
+    /// sensitive value, and this is the check that is supposed to fail the next
+    /// time a preview-building helper is refactored.
+    ///
+    /// It asserts on the *whole serialised payload* rather than on the preview
+    /// field, so a value that turned up in some field added later — a subtitle,
+    /// a tooltip, a search snippet — would fail it too.
+    #[tokio::test]
+    async fn no_sensitive_value_ever_appears_in_a_list_or_search_payload() {
+        let fixture = Fixture::new();
+        let secrets = [
+            "sk-ClippoFixtureNotARealKey00000000000000000000",
+            "Xr4$Tp9!Lm2#Wq7&Zc5%",
+            "postgres://clippo:not-a-real-password@db.example.internal:5432/clippo",
+        ];
+        fixture.capture(&secrets).await;
+        fixture.capture_password("Tr0ub4dor&3").await;
+
+        let listed = fixture.daemon.list(0, 0).await.unwrap();
+        assert_eq!(listed.len(), 4, "every one of them is stored");
+        assert!(
+            listed.iter().all(|entry| entry.sensitive),
+            "all four should have been detected: {:?}",
+            listed.iter().map(|e| &e.preview).collect::<Vec<_>>()
+        );
+
+        let mut payload = format!("{listed:?}");
+        // Search reaches the same summaries by another route, so it gets the
+        // same treatment. A masked preview is unmatchable, so search by what a
+        // user would actually type.
+        for query in ["sk", "clippo", "Tr0ub4dor", "postgres"] {
+            payload.push_str(&format!(
+                "{:?}",
+                fixture.daemon.search(query, 10).await.unwrap()
+            ));
+        }
+
+        for secret in secrets.iter().chain(&["Tr0ub4dor&3"]) {
+            assert!(
+                !payload.contains(secret),
+                "{secret} crossed the bus in a List or Search response"
+            );
+        }
+
+        // …and `Reveal` does return them, or the masking above would be
+        // hiding the values from their owner rather than from the room.
+        for entry in listed {
+            let revealed = fixture.daemon.reveal(entry.id).await.unwrap();
+            assert!(
+                secrets.contains(&revealed.as_str()) || revealed == "Tr0ub4dor&3",
+                "reveal returned {revealed:?}"
+            );
+        }
+    }
+
+    /// The highest-severity bug this milestone could introduce: a mask reaching
+    /// the clipboard. `Copy` must offer the stored bytes, whatever the preview
+    /// says. M3c's path is untouched by masking, and this is what says so.
+    #[tokio::test]
+    async fn copying_a_masked_entry_puts_the_real_value_on_the_clipboard() {
+        let fixture = Fixture::new();
+        let password = "Xr4$Tp9!Lm2#Wq7&Zc5%";
+        fixture.capture(&[password]).await;
+
+        let entry = fixture.daemon.list(1, 0).await.unwrap().remove(0);
+        assert!(entry.sensitive && !entry.preview.contains("Tp9"));
+
+        fixture.copy(EntryId::new(entry.id)).await.expect("copy");
+        let offered = fixture.clipboard.last_offer();
+        assert_eq!(
+            offered
+                .iter()
+                .find(|flavor| flavor.mime.starts_with("text/plain"))
+                .and_then(|flavor| flavor.as_str()),
+            Some(password),
+            "a paste must get the value, not the mask"
+        );
+        assert!(
+            offered
+                .iter()
+                .all(|flavor| !String::from_utf8_lossy(&flavor.data).contains('\u{2022}')),
+            "a bullet reached the clipboard"
+        );
+    }
+
+    /// DESIGN.md's escape hatch, at the daemon level: the knob switches off the
+    /// entropy rule for captures and leaves the other two working.
+    #[tokio::test]
+    async fn the_entropy_knob_turns_off_one_rule_and_not_the_others() {
+        let fixture = Fixture::with_secrets(SecretsConfig {
+            entropy_rule: false,
+            ..SecretsConfig::default()
+        });
+        fixture
+            .capture(&["Xr4$Tp9!Lm2#Wq7&Zc5%", "AKIAIOSFODNN7EXAMPLE"])
+            .await;
+        fixture.capture_password("Tr0ub4dor&3").await;
+
+        let previews = fixture.previews().await;
+        assert!(
+            previews.contains(&"Xr4$Tp9!Lm2#Wq7&Zc5%".to_owned()),
+            "the entropy rule should be off: {previews:?}"
+        );
+
+        let flagged: Vec<bool> = fixture
+            .daemon
+            .list(0, 0)
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| entry.sensitive)
+            .collect();
+        // Newest first: the password-manager copy, the AWS id, the password.
+        assert_eq!(flagged, [true, true, false]);
     }
 
     /// A copy of nothing but the marker has no canonical flavor, so it has no
@@ -1214,6 +1423,7 @@ mod tests {
         let daemon = Daemon::new(
             Store::open(dir.path().join("history.db"), &key).expect("open"),
             Signals::discard(),
+            SecretsConfig::default(),
         )
         .expect("start");
         if let Some(clipboard) = clipboard {

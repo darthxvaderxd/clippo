@@ -55,11 +55,14 @@
 //! It also means clippo hears its own copy-back come back round as a capture —
 //! see [`echo`], the guard that keeps it out of the history.
 //!
-//! # What is not here yet
+//! # Secrets never leave here unmasked
 //!
-//! Masking is M4 — until then `sensitive` is set from the password-manager MIME
-//! hint and previews go out as stored; see [`preview`], which is the one
-//! function that changes.
+//! Detection runs once, at capture, and a suspected secret's preview is stored
+//! already masked — `List` and `Search` hand out `entries.preview` and have
+//! nothing else to hand out. The whole value lives in the `flavors` table and
+//! leaves through two doors only: `Reveal`, which a user asks for by name, and
+//! `Copy`, which puts the real bytes on the clipboard so a masked entry pastes
+//! correctly. See [`preview`].
 //!
 //! # Running it
 //!
@@ -129,6 +132,7 @@ async fn run(logging: &str) -> anyhow::Result<()> {
         max_age_days = config.max_age_days,
         max_image_bytes = config.max_image_bytes,
         capture_primary = config.capture_primary,
+        entropy_rule = config.secrets.entropy_rule,
         "clippo's configuration"
     );
 
@@ -153,7 +157,8 @@ async fn run(logging: &str) -> anyhow::Result<()> {
     let signals = Signals::bus(
         clippo_ipc::emitter(&connection).context("clippo could not prepare its D-Bus signals")?,
     );
-    let daemon = Daemon::new(store, signals).context("clippo could not load its history")?;
+    let daemon = Daemon::new(store, signals, config.secrets.clone())
+        .context("clippo could not load its history")?;
 
     // Export first, take the name second: a caller that resolves the name and
     // immediately calls must find the object already there.

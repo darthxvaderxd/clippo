@@ -8,11 +8,12 @@ pasting the real value.
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, components, and the decisions on record.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — build order (M0–M6) and how each stage is verified.
 
-> **Status:** M3 complete. Capture, encrypted storage, the daemon, the `clippo` CLI and the
-> copy-back path are in: `clippod` records every copy, serves `com.nilfactor.Clippo` on the
-> session bus, and `clippo copy <id>` puts an entry back on the clipboard for any application
-> to paste. Still to come — masking of suspected secrets, and the applet. See the roadmap for
-> what lands when.
+> **Status:** M4 complete. Capture, encrypted storage, the daemon, the `clippo` CLI, the
+> copy-back path and secret masking are in: `clippod` records every copy, serves
+> `com.nilfactor.Clippo` on the session bus, `clippo copy <id>` puts an entry back on the
+> clipboard for any application to paste, and a suspected password or token shows as
+> `ab••••••••yz` rather than in full — see [Secrets](#secrets). Still to come — the applet.
+> See the roadmap for what lands when.
 
 ## ⚠️ Build and run from a host terminal, not RustRover's Flatpak
 
@@ -130,7 +131,7 @@ list of candidates rather than guessing:
 ```
 $ clippo copy 1
 clippo: `1` could mean any of these 3 entries — type more of the id:
-   12  hunter2 second line
+   12  hu••••••••ne
   120  a long preview that goes on and on and …
   127  image/png, 2.0 KB
 ```
@@ -145,13 +146,14 @@ bad reference fails the command rather than half of it, and two references to th
 $ clippo list
  ID  AGE  KIND   FL  PREVIEW
   3   6s  text   ..  hello from cosmic-term
- 12   1m  text   .s  hunter2 second line
+ 12   1m  text   .s  hu••••••••ne
 120   3h  html   p.  a long preview that goes on and on and on and on and on and on …
 127   4d  image  ..  image/png, 2.0 KB
 ```
 
 `AGE` is since the entry was last used. `FL` is two flags: `p` when the entry is pinned, `s`
-when clippo suspects a password or a token. The preview is cut to fit the column — `--json`
+when clippo suspects a password or a token. Entry 12 above is one — its preview is a mask, and
+[Secrets](#secrets) is what that means. The preview is cut to fit the column — `--json`
 carries the daemon's whole preview, its timestamps as Unix milliseconds, and every other field
 under the same name, which is what to script against.
 
@@ -183,6 +185,93 @@ with `systemctl --user start clippod`, or run it in a host terminal with `cargo 
 ```
 
 (The systemd unit itself arrives with packaging in M6; until then, `just run-daemon`.)
+
+## Secrets
+
+The feature clippo exists for. A clipboard history is a list of the last five hundred things
+you copied, and some of them were passwords — so clippo **never renders a suspected secret in
+full**. It masks it instead, and masking changes nothing but the display.
+
+### What gets flagged
+
+Three rules, checked in this order, at the moment a copy is captured. The rule that fired is in
+the journal (`journalctl --user -u clippod`) at debug level, by name, so "why is that masked?"
+has an answer that is not a guess:
+
+| Rule | Fires on | Notes |
+|---|---|---|
+| `mime-hint` | The `x-kde-passwordManagerHint` flavor | KeePassXC and Bitwarden set it. The application is telling us; nothing is inferred. |
+| `shape:<name>` | `sk-…`, `ghp_`/`gho_`/`github_pat_`, `AKIA…`, `xox[baprs]-`, a JWT, a `-----BEGIN … PRIVATE KEY-----` block, `postgres://user:pass@…` | Prefix matches. Adding a provider is one regex. |
+| `entropy` | A single token, 8–128 characters, three or more character classes, above 3.5 bits/char | The one heuristic, and the one you can turn off. |
+
+A copy from a password manager is **masked, not skipped**: the entry is there, it pastes, and
+`clippo reveal` prints it. A clipboard manager that silently drops a copy is worse than one that
+hides it on screen.
+
+The entropy rule declines git SHAs and UUIDs (hex is two character classes, and hyphens do not
+count as a third), prose (whitespace), long base64 blobs and minified JavaScript (over 128
+characters), and URLs and paths (structure, not randomness). Those are in
+`crates/clippo-core/tests/corpus.toml` alongside the tokens and passwords that must be caught —
+a fixture corpus in both directions, with the tuning written down next to the threshold it
+justifies. A false positive there is annoying; a false negative is a password on a screen.
+
+### What masking is
+
+```
+supersecretvalue  →  su••••••••ue
+```
+
+The first and last two characters, and a **fixed-width** run of bullets between them — eight,
+whatever the value's length, because a mask that grew with the input would leak how long the
+password was. A value with no more than four characters is hidden completely. Both counts are
+configurable; the middle is not.
+
+Masking is display-only, and that is a property of where it happens rather than a promise:
+
+- **`clippo copy ID` pastes the real value.** The clipboard gets the stored bytes; the mask
+  never leaves the list.
+- **`clippo reveal ID` prints the real value**, and it is the only member of the daemon's D-Bus
+  interface that returns one. `List` and `Search` hand out `entries.preview`, which for a
+  sensitive entry is *already the mask in the database* — there is no unmasked preview for them
+  to return.
+
+Two consequences of masking before storage rather than on the way out, both worth knowing
+before you go looking for them:
+
+- **`clippo search` cannot find a masked entry by its contents.** Search matches previews, and
+  a sensitive entry's preview is the mask, so the only thing that matches is the four visible
+  characters. Find it in `clippo list` instead — masked rows are the ones with `s` in the `FL`
+  column.
+- **Entries copied before this version keep the preview they were stored with.** There is no
+  migration pass over an existing history. Copying the same value again re-runs detection and
+  replaces the preview with a mask, so anything you still use is corrected as you use it; to
+  clear the rest at once, `clippo clear`.
+
+### Configuring it
+
+```toml
+# ~/.config/clippo/config.toml
+[secrets]
+entropy_rule = true   # false keeps the MIME and shape rules and drops the heuristic
+mask_prefix  = 2      # characters shown at the front; 0 shows none
+mask_suffix  = 2      # …and at the back. The two together may not exceed 16.
+```
+
+`systemctl --user restart clippod` after editing — the config is read once, at startup.
+
+### Checking it by hand
+
+The automated half is `cargo test --workspace`; this is the half that needs a compositor, from
+a host terminal with `clippod` running. It is [verification 4](docs/ROADMAP.md#4-secrets) in
+the roadmap:
+
+1. Copy a password out of KeePassXC, an `sk-`-prefixed token, and a JWT. Each shows as
+   `ab••••••••yz` in `clippo list`, with `s` in the `FL` column.
+2. `clippo copy <id>` on each, then paste into `cosmic-edit`. Each pastes **in full**. This is
+   the one that matters: a mask reaching the clipboard would be the worst bug in this feature.
+3. `clippo reveal <id>` prints each value whole.
+4. Then the false-positive check: copy a git SHA (`git rev-parse HEAD`), a UUID
+   (`uuidgen`), and a paragraph of prose. None of the three is flagged — no `s`, no bullets.
 
 ## Debugging capture
 

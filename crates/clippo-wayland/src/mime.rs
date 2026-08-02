@@ -9,7 +9,11 @@
 /// as one of the signals that an entry is sensitive (see DESIGN.md, "secret
 /// detection"). clippo masks such entries rather than skipping them, so the
 /// marker has to be captured alongside the real flavors.
-pub const PASSWORD_MANAGER_HINT_MIME: &str = "x-kde-passwordManagerHint";
+///
+/// Re-exported rather than declared: the string this crate must *receive* and
+/// the string `clippo-core` reads as a signal are one string, and two copies of
+/// it could be edited apart into a rule that never fires.
+pub use clippo_core::secrets::PASSWORD_MANAGER_HINT_MIME;
 
 /// Every flavor clippo receives from a selection, and nothing else.
 ///
@@ -41,9 +45,10 @@ pub fn is_interesting(mime: &str) -> bool {
 }
 
 /// Whether a MIME type is the password-manager marker.
-pub fn is_password_manager_hint(mime: &str) -> bool {
-    PASSWORD_MANAGER_HINT_MIME.eq_ignore_ascii_case(&normalize(mime))
-}
+///
+/// `clippo-core`'s rule, not a second implementation of it: this is detection
+/// rule 1, and it lives with the other two.
+pub use clippo_core::secrets::is_password_manager_hint;
 
 /// Whether two MIME types name the same flavor.
 ///
