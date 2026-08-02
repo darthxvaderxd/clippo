@@ -2,11 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
-use clippo_core::{Entry, EntryId, EntryKind, Flavor, NewEntry, Timestamp};
+use clippo_core::{Config, Entry, EntryId, EntryKind, Flavor, NewEntry, Timestamp};
 use rusqlite::{params, Connection, OpenFlags};
 
 use crate::key::Key;
-use crate::{schema, StoreError};
+use crate::retention::{self, Retention, Sweep};
+use crate::{dedup, images, schema, StoreError};
 
 /// One stored copy with every flavor it was captured with.
 ///
@@ -61,6 +62,8 @@ const ENTRY_COLUMNS: &str = "id, created_at, last_used_at, kind, preview, hash, 
 pub struct Store {
     conn: Connection,
     path: PathBuf,
+    retention: Retention,
+    max_image_bytes: u64,
 }
 
 impl Store {
@@ -121,13 +124,68 @@ impl Store {
         // blobs behind after a delete.
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
+        // Before `schema::ensure`, because a fresh database only takes this
+        // from the pragma while it still has no tables. See
+        // `convert_to_incremental_vacuum` for the other half.
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
+
         schema::ensure(&conn, &path)?;
-        Ok(Self { conn, path })
+
+        // After `ensure`, because converting an existing database is a full
+        // rewrite and nothing should rewrite a file clippo has just decided it
+        // does not understand.
+        convert_to_incremental_vacuum(&conn)?;
+
+        Ok(Self {
+            conn,
+            path,
+            retention: Retention::default(),
+            max_image_bytes: clippo_core::config::DEFAULT_MAX_IMAGE_BYTES,
+        })
     }
 
     /// The file this store is backed by.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Apply a loaded [`Config`]: the retention limits and the image cap.
+    ///
+    /// A store that is never configured behaves as `Config::default()` does,
+    /// so forgetting this weakens nothing — it only means the user's file was
+    /// not read.
+    #[must_use]
+    pub fn with_config(mut self, config: &Config) -> Self {
+        self.set_config(config);
+        self
+    }
+
+    /// [`Store::with_config`] on an already-opened store.
+    pub fn set_config(&mut self, config: &Config) {
+        self.retention = Retention::from_config(config);
+        self.max_image_bytes = config.max_image_bytes;
+    }
+
+    /// Set only the retention limits, leaving the image cap alone.
+    #[must_use]
+    pub fn with_retention(mut self, retention: Retention) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    /// [`Store::with_retention`] on an already-opened store.
+    pub fn set_retention(&mut self, retention: Retention) {
+        self.retention = retention;
+    }
+
+    /// The limits this store enforces after every insert.
+    pub fn retention(&self) -> Retention {
+        self.retention
+    }
+
+    /// The largest image blob this store will accept, in bytes.
+    pub fn max_image_bytes(&self) -> u64 {
+        self.max_image_bytes
     }
 
     /// The underlying connection, for the schema tests.
@@ -159,8 +217,28 @@ impl Store {
     /// safe direction for a heuristic: an entry that was ever sensitive stays
     /// sensitive, and clearing the flag stays something a user gesture asks for
     /// rather than something a later copy does by accident.
+    ///
+    /// Three things happen around the write itself:
+    ///
+    /// - **The image cap.** An image flavor over
+    ///   [`max_image_bytes`](Store::max_image_bytes) is not stored. If it is
+    ///   the entry's canonical flavor, the whole insert is refused with
+    ///   [`StoreError::ImageTooLarge`] rather than stored short — see
+    ///   [`Store::storable_flavors`].
+    /// - **The thumbnail.** An image entry gets a PNG thumbnail generated and
+    ///   stored beside it as a second flavor. A failure here is logged and the
+    ///   entry stored without one.
+    /// - **Retention**, in this same transaction, so the history is never
+    ///   observably over its limits. See [`crate::retention`] for why here
+    ///   rather than on a timer.
     pub fn insert(&mut self, new: &NewEntry) -> Result<Insertion, StoreError> {
-        let flavors = distinct_flavors(&new.flavors);
+        let flavors = self.storable_flavors(new)?;
+        // Before the transaction rather than inside it: decoding a screenshot
+        // is the slowest thing on this path and a write transaction is the last
+        // place to spend that time. The cost is that a repeat copy of the same
+        // image thumbnails it again for nothing, which is a rare copy paying
+        // for the common one.
+        let thumbnail = self.thumbnail_for(new, &flavors);
         let captured_at = new.created_at.as_unix_millis();
 
         let tx = self.conn.transaction()?;
@@ -181,7 +259,7 @@ impl Store {
                     let mut statement = tx.prepare(
                         "INSERT INTO flavors (entry_id, mime, data) VALUES (?1, ?2, ?3)",
                     )?;
-                    for flavor in &flavors {
+                    for flavor in flavors.iter().copied().chain(thumbnail.iter()) {
                         statement.execute(params![id.get(), flavor.mime, flavor.data])?;
                     }
                 }
@@ -205,9 +283,114 @@ impl Store {
             }
             Err(error) => return Err(error.into()),
         };
+        let swept = retention::sweep(&tx, &self.retention, new.created_at)?;
         tx.commit()?;
 
+        if !swept.is_empty() {
+            self.reclaim()?;
+        }
         Ok(insertion)
+    }
+
+    /// The flavors of `new` that this store will actually write.
+    ///
+    /// [`distinct_flavors`] first, then the image cap. The cap is applied per
+    /// flavor, and what happens when one is over it depends on whether the
+    /// entry's identity rests on it:
+    ///
+    /// - **The canonical flavor is over the cap** → the whole insert is
+    ///   refused. `entries.hash` is BLAKE3 of that flavor, so storing the entry
+    ///   without it would leave a row whose identity refers to bytes that are
+    ///   not in the database: it would dedup against future copies of an image
+    ///   it cannot produce, and paste as nothing. A truncated blob would be
+    ///   worse still — a corrupt image that looks like a successful copy.
+    /// - **Any other image flavor is over the cap** → it is dropped and the
+    ///   entry stored without it, because the entry is still whole without a
+    ///   redundant second encoding of the same picture.
+    ///
+    /// Both paths log. A copy that silently did not happen is the failure mode
+    /// this whole crate is least able to explain after the fact.
+    fn storable_flavors<'a>(&self, new: &'a NewEntry) -> Result<Vec<&'a Flavor>, StoreError> {
+        let distinct = distinct_flavors(&new.flavors);
+
+        if let Some(canonical) = dedup::canonical_flavor(new.kind, distinct.iter().copied()) {
+            if self.is_over_image_cap(canonical) {
+                tracing::warn!(
+                    mime = %canonical.mime,
+                    bytes = canonical.data.len(),
+                    cap = self.max_image_bytes,
+                    "clippo did not store a copied image: it is over max_image_bytes"
+                );
+                return Err(StoreError::ImageTooLarge {
+                    mime: canonical.mime.clone(),
+                    bytes: canonical.data.len() as u64,
+                    cap: self.max_image_bytes,
+                });
+            }
+        }
+
+        Ok(distinct
+            .into_iter()
+            .filter(|flavor| {
+                let over = self.is_over_image_cap(flavor);
+                if over {
+                    tracing::warn!(
+                        mime = %flavor.mime,
+                        bytes = flavor.data.len(),
+                        cap = self.max_image_bytes,
+                        "clippo dropped one image flavor of a copy: it is over max_image_bytes. \
+                         The entry is stored without it"
+                    );
+                }
+                !over
+            })
+            .collect())
+    }
+
+    /// Whether this flavor is an image bigger than the configured cap.
+    ///
+    /// Only images are capped. A text flavor is bounded by what a compositor
+    /// will hand over and by `clippo-wayland`'s own per-flavor limit; an image
+    /// is the one thing routinely large enough to be worth a policy.
+    fn is_over_image_cap(&self, flavor: &Flavor) -> bool {
+        EntryKind::from_mime(&flavor.mime) == Some(EntryKind::Image)
+            && flavor.data.len() as u64 > self.max_image_bytes
+    }
+
+    /// The thumbnail flavor to store beside an image entry, if there is one.
+    ///
+    /// `None` — with a logged reason where there was one — in four cases: the
+    /// entry is not an image, the capture already carried a thumbnail, nothing
+    /// image-shaped survived the cap, or the image would not decode. DESIGN.md
+    /// asks for the entry either way: a list row without a picture is a much
+    /// better outcome than a copy that vanished because it was a format this
+    /// build of `image` has no decoder for.
+    fn thumbnail_for(&self, new: &NewEntry, flavors: &[&Flavor]) -> Option<Flavor> {
+        if new.kind != EntryKind::Image {
+            return None;
+        }
+        if flavors
+            .iter()
+            .any(|flavor| images::is_thumbnail(&flavor.mime))
+        {
+            return None;
+        }
+
+        // The canonical image, so the thumbnail is generated from the same
+        // flavor the entry's identity is keyed on — PNG in preference to JPEG.
+        let source = dedup::canonical_flavor(EntryKind::Image, flavors.iter().copied())?;
+        match images::thumbnail(&source.data) {
+            Ok(png) => Some(Flavor::new(images::THUMBNAIL_MIME, png)),
+            Err(error) => {
+                tracing::warn!(
+                    mime = %source.mime,
+                    bytes = source.data.len(),
+                    error = %error,
+                    "clippo stored a copied image without a thumbnail"
+                );
+                None
+            }
+        }
     }
 
     /// The history, newest use first.
@@ -264,12 +447,81 @@ impl Store {
 
     /// Delete an entry and, through the foreign key's cascade, its flavors.
     ///
-    /// Returns whether there was anything to delete.
+    /// Returns whether there was anything to delete. Pinning does not protect
+    /// an entry here: this is `Delete(id)`, a user pointing at one row.
     pub fn delete(&mut self, id: EntryId) -> Result<bool, StoreError> {
         let deleted = self
             .conn
             .execute("DELETE FROM entries WHERE id = ?1", [id.get()])?;
+        if deleted > 0 {
+            self.reclaim()?;
+        }
         Ok(deleted > 0)
+    }
+
+    /// Empty the history, returning how many entries went.
+    ///
+    /// `Clear()` over D-Bus. **Pinned entries survive unless `include_pinned`**
+    /// — DESIGN.md, `clippo-store` → "Retention". The flag is a parameter
+    /// rather than a second method so that a caller has to say which one it
+    /// means; a `clear()` that took no argument would be a data-loss bug
+    /// waiting for someone to assume the other default.
+    pub fn clear(&mut self, include_pinned: bool) -> Result<usize, StoreError> {
+        let deleted = if include_pinned {
+            self.conn.execute("DELETE FROM entries", [])?
+        } else {
+            self.conn
+                .execute("DELETE FROM entries WHERE pinned = 0", [])?
+        };
+        if deleted > 0 {
+            tracing::info!(
+                deleted,
+                include_pinned,
+                "clippo cleared the clipboard history"
+            );
+            self.reclaim()?;
+        }
+        Ok(deleted)
+    }
+
+    /// Apply the retention limits now, against the caller's clock.
+    ///
+    /// [`Store::insert`] already does this after every copy, so this is for the
+    /// gap that leaves: a daemon nobody has copied anything into all week has
+    /// not swept, and entries can pass the age limit while it idles. `clippod`
+    /// runs it at startup. See [`crate::retention`].
+    pub fn enforce_retention(&mut self, now: Timestamp) -> Result<Sweep, StoreError> {
+        let swept = retention::sweep(&self.conn, &self.retention, now)?;
+        if !swept.is_empty() {
+            self.reclaim()?;
+        }
+        Ok(swept)
+    }
+
+    /// Give the pages a delete freed back to the operating system.
+    ///
+    /// The database is set to incremental auto-vacuum at open, which moves
+    /// freed pages onto a free list; this is what actually truncates the file.
+    /// Run after anything that deletes rows, and only then — the whole point of
+    /// *incremental* is that the work is proportional to what was freed rather
+    /// than to the size of the database, so a no-op call is cheap but a
+    /// pointless one still costs a statement.
+    ///
+    /// It matters here more than it would elsewhere. An 8 MB screenshot that
+    /// retention dropped would otherwise stay on disk as reusable free space
+    /// inside an encrypted file the user cannot inspect — technically deleted,
+    /// indefinitely resident, and impossible to reassure anyone about.
+    ///
+    /// Stepped to completion by hand rather than run through `execute_batch`.
+    /// `PRAGMA incremental_vacuum` frees **one page per step**, so the obvious
+    /// one-line spelling silently reclaims a single 4 KB page and leaves the
+    /// rest of an 8 MB screenshot on the free list — a bug that looks exactly
+    /// like working code.
+    fn reclaim(&self) -> Result<(), StoreError> {
+        let mut statement = self.conn.prepare("PRAGMA incremental_vacuum")?;
+        let mut rows = statement.query([])?;
+        while rows.next()?.is_some() {}
+        Ok(())
     }
 
     /// Pin or unpin an entry. Returns whether there was such an entry.
@@ -341,6 +593,37 @@ fn distinct_flavors(flavors: &[Flavor]) -> Vec<&Flavor> {
     kept
 }
 
+/// SQLite's auto-vacuum mode, as `PRAGMA auto_vacuum` reports it.
+const AUTO_VACUUM_INCREMENTAL: i64 = 2;
+
+/// Bring an existing database into incremental auto-vacuum mode, so deleted
+/// blobs can be given back rather than growing the file for ever.
+///
+/// Incremental rather than `FULL`: full auto-vacuum reorganises pages inside
+/// every commit that frees one, on the daemon's write path. Incremental puts
+/// freed pages on a free list and leaves the truncation to [`Store::reclaim`],
+/// which the store calls after a delete and never during an ordinary copy.
+///
+/// The ordering is the fiddly part. SQLite only lets this mode change on a
+/// database that has no tables yet, or through a full `VACUUM`, so the two
+/// cases are split: [`Store::open`] sets the pragma before the schema exists,
+/// which is all a new file needs, and this converts one written by a clippo
+/// from before the setting. That rewrite is a one-off — the mode lives in the
+/// file header, so the next open finds it already there — and it is safe with
+/// SQLCipher, which encrypts the temporary file `VACUUM` writes with the same
+/// key as the database.
+fn convert_to_incremental_vacuum(conn: &Connection) -> Result<(), StoreError> {
+    let mode: i64 = conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+    if mode != AUTO_VACUUM_INCREMENTAL {
+        tracing::info!(
+            mode,
+            "converting the clippo history database to incremental auto-vacuum"
+        );
+        conn.execute_batch("VACUUM;")?;
+    }
+    Ok(())
+}
+
 /// A count from the caller as SQLite's `INTEGER`, saturating rather than
 /// wrapping a `usize` that will not fit.
 fn as_i64(value: usize) -> i64 {
@@ -370,7 +653,7 @@ fn is_not_a_database(error: &rusqlite::Error) -> bool {
 mod tests {
     use super::*;
     use crate::testing::Temp;
-    use crate::{dedup, Key, StoreError};
+    use crate::{Key, StoreError};
 
     /// A selection, hashed by the same rule the daemon will use.
     fn selection(at: i64, flavors: Vec<Flavor>) -> NewEntry {
@@ -387,6 +670,294 @@ mod tests {
 
     fn text(at: i64, body: &str) -> NewEntry {
         selection(at, vec![Flavor::new("text/plain;charset=utf-8", body)])
+    }
+
+    /// A screenshot: one `image/png` flavor of a real, decodable PNG.
+    fn screenshot(at: i64, width: u32, height: u32) -> NewEntry {
+        selection(
+            at,
+            vec![Flavor::new(
+                "image/png",
+                images::testing::png(width, height),
+            )],
+        )
+    }
+
+    /// The stored flavor with this MIME type, if the entry has one.
+    fn stored_flavor<'a>(stored: &'a StoredEntry, mime: &str) -> Option<&'a Flavor> {
+        stored.flavors.iter().find(|flavor| flavor.mime == mime)
+    }
+
+    #[test]
+    fn an_image_round_trips_with_a_thumbnail_generated_beside_it() {
+        let temp = Temp::new();
+        let mut store = temp.open();
+
+        let new = screenshot(1_000, 800, 400);
+        let original = new.flavors[0].data.clone();
+        let id = store.insert(&new).unwrap().id();
+
+        let stored = store.get(id).unwrap().unwrap();
+        assert_eq!(stored.entry.kind, EntryKind::Image);
+        assert_eq!(
+            stored.flavors.len(),
+            2,
+            "the captured image and the thumbnail clippo derived from it"
+        );
+
+        // The full-size image is byte-for-byte what was copied.
+        assert_eq!(
+            stored_flavor(&stored, "image/png").unwrap().data,
+            original,
+            "the stored image must paste as the image that was copied"
+        );
+
+        // The thumbnail is a real, smaller PNG under its own MIME type.
+        let thumb = stored_flavor(&stored, images::THUMBNAIL_MIME)
+            .expect("an image entry carries a thumbnail flavor");
+        let decoded = image::load_from_memory(&thumb.data).expect("the thumbnail should decode");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (images::THUMBNAIL_MAX_EDGE, images::THUMBNAIL_MAX_EDGE / 2),
+            "scaled into the box with its aspect ratio kept"
+        );
+        assert!(
+            thumb.data.len() < original.len(),
+            "a list must be renderable without touching the full-size blob"
+        );
+
+        // And the thumbnail is not part of the entry's identity: the same
+        // screenshot copied again is still one entry.
+        assert!(store
+            .insert(&screenshot(2_000, 800, 400))
+            .unwrap()
+            .was_deduplicated());
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn the_thumbnail_is_the_one_flavor_a_paste_must_not_offer_back() {
+        // M3c reads this filter rather than reinventing it; pasting a 256-pixel
+        // thumbnail in place of a screenshot is a silent wrong answer.
+        let temp = Temp::new();
+        let mut store = temp.open();
+        let id = store.insert(&screenshot(1_000, 500, 500)).unwrap().id();
+
+        let stored = store.get(id).unwrap().unwrap();
+        let offerable: Vec<&str> = stored
+            .flavors
+            .iter()
+            .filter(|flavor| images::is_offerable(&flavor.mime))
+            .map(|flavor| flavor.mime.as_str())
+            .collect();
+        assert_eq!(offerable, vec!["image/png"]);
+    }
+
+    #[test]
+    fn an_image_at_the_cap_is_stored_and_one_over_it_is_refused() {
+        let temp = Temp::new();
+        let picture = images::testing::png(200, 200);
+        let mut store = temp.open().with_config(&Config {
+            // Exactly the size of the picture: at the cap, not over it.
+            max_image_bytes: picture.len() as u64,
+            ..Config::default()
+        });
+
+        let at_the_cap = selection(1_000, vec![Flavor::new("image/png", picture.clone())]);
+        assert!(store.insert(&at_the_cap).is_ok(), "at the cap is under it");
+
+        let over_the_cap = screenshot(2_000, 400, 400);
+        let bytes = over_the_cap.flavors[0].data.len();
+        assert!(bytes > picture.len(), "the fixture must actually be bigger");
+
+        let error = store.insert(&over_the_cap).unwrap_err();
+        assert!(
+            matches!(&error, StoreError::ImageTooLarge { bytes: reported, .. }
+                if *reported == bytes as u64),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("max_image_bytes"), "{message}");
+        assert!(message.contains("image/png"), "{message}");
+
+        // Refused rather than truncated: no half-written entry, no blob.
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(
+            flavor_rows(&store),
+            2,
+            "only the first image and its thumbnail"
+        );
+    }
+
+    #[test]
+    fn an_over_cap_image_beside_a_smaller_one_is_dropped_rather_than_refused() {
+        // The entry's identity rests on the canonical `image/png`, which fits.
+        // The redundant JPEG encoding of the same picture does not, and losing
+        // it costs the user nothing.
+        let temp = Temp::new();
+        let small = images::testing::png(8, 8);
+        let large = images::testing::jpeg(600, 600);
+        assert!(large.len() > small.len());
+
+        let mut store = temp.open().with_config(&Config {
+            max_image_bytes: small.len() as u64,
+            ..Config::default()
+        });
+
+        let id = store
+            .insert(&selection(
+                1_000,
+                vec![
+                    Flavor::new("image/png", small),
+                    Flavor::new("image/jpeg", large),
+                ],
+            ))
+            .unwrap()
+            .id();
+
+        let stored = store.get(id).unwrap().unwrap();
+        assert!(stored_flavor(&stored, "image/png").is_some());
+        assert!(
+            stored_flavor(&stored, "image/jpeg").is_none(),
+            "the over-cap flavor was dropped, not truncated"
+        );
+        assert!(stored_flavor(&stored, images::THUMBNAIL_MIME).is_some());
+    }
+
+    #[test]
+    fn a_cap_of_zero_means_no_image_is_ever_small_enough() {
+        // config.rs documents that reading; this is where it takes effect.
+        let temp = Temp::new();
+        let mut store = temp.open().with_config(&Config {
+            max_image_bytes: 0,
+            ..Config::default()
+        });
+        assert!(matches!(
+            store.insert(&screenshot(1_000, 4, 4)).unwrap_err(),
+            StoreError::ImageTooLarge { .. }
+        ));
+        // Text is unaffected — only images are capped.
+        assert!(store.insert(&text(2_000, "hello")).is_ok());
+    }
+
+    #[test]
+    fn an_image_that_will_not_decode_is_stored_without_a_thumbnail() {
+        // A truncated or unsupported image must not cost the user the copy: a
+        // list row without a picture beats an entry that vanished.
+        let temp = Temp::new();
+        let mut store = temp.open();
+        let id = store
+            .insert(&selection(
+                1_000,
+                vec![Flavor::new(
+                    "image/png",
+                    b"\x89PNG\r\n\x1a\n truncated".to_vec(),
+                )],
+            ))
+            .unwrap()
+            .id();
+
+        let stored = store.get(id).unwrap().unwrap();
+        assert_eq!(stored.entry.kind, EntryKind::Image);
+        assert_eq!(stored.flavors.len(), 1, "the entry, without a thumbnail");
+        assert!(stored_flavor(&stored, images::THUMBNAIL_MIME).is_none());
+        assert_eq!(
+            stored_flavor(&stored, "image/png").unwrap().data,
+            b"\x89PNG\r\n\x1a\n truncated".to_vec(),
+            "the bytes are kept as captured, in case something else can read them"
+        );
+    }
+
+    #[test]
+    fn a_capture_that_already_carried_a_thumbnail_does_not_get_a_second_one() {
+        let temp = Temp::new();
+        let mut store = temp.open();
+        let id = store
+            .insert(&selection(
+                1_000,
+                vec![
+                    Flavor::new("image/png", images::testing::png(64, 64)),
+                    Flavor::new(images::THUMBNAIL_MIME, b"whatever was carried".to_vec()),
+                ],
+            ))
+            .unwrap()
+            .id();
+
+        let stored = store.get(id).unwrap().unwrap();
+        assert_eq!(stored.flavors.len(), 2);
+        assert_eq!(
+            stored_flavor(&stored, images::THUMBNAIL_MIME).unwrap().data,
+            b"whatever was carried".to_vec()
+        );
+    }
+
+    #[test]
+    fn text_entries_get_no_thumbnail() {
+        let temp = Temp::new();
+        let mut store = temp.open();
+        let id = store
+            .insert(&selection(
+                1_000,
+                vec![
+                    Flavor::new("text/html", "<b>hi</b>"),
+                    Flavor::new("text/plain", "hi"),
+                ],
+            ))
+            .unwrap()
+            .id();
+        assert_eq!(store.get(id).unwrap().unwrap().flavors.len(), 2);
+    }
+
+    #[test]
+    fn the_space_a_deleted_blob_used_is_given_back_rather_than_kept_for_ever() {
+        // The written decision the criterion asks for, as a test: incremental
+        // auto-vacuum, triggered by anything that deletes rows. Without it an
+        // 8 MB screenshot that retention dropped stays resident inside an
+        // encrypted file nobody can inspect to check.
+        let temp = Temp::new();
+        let mut store = temp.open().with_retention(crate::Retention {
+            max_entries: 2,
+            max_age: None,
+        });
+
+        let mode: i64 = store
+            .conn
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            mode, AUTO_VACUUM_INCREMENTAL,
+            "set before the schema exists"
+        );
+
+        // Twenty copies of a quarter-megabyte of incompressible bytes, keeping
+        // two: a file that grew with the churn would be some 5 MB.
+        for n in 0..20u32 {
+            let blob: Vec<u8> = (0..250_000u32)
+                .map(|byte| (byte.wrapping_mul(2_654_435_761).wrapping_add(n)) as u8)
+                .collect();
+            store
+                .insert(&selection(
+                    1_000 + i64::from(n),
+                    vec![Flavor::new("image/png", blob)],
+                ))
+                .unwrap();
+        }
+
+        assert_eq!(store.count().unwrap(), 2);
+        let free: i64 = store
+            .conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            free, 0,
+            "freed pages were handed back, not left on the list"
+        );
+
+        let size = std::fs::metadata(temp.db()).unwrap().len();
+        assert!(
+            size < 2 * 1024 * 1024,
+            "the file grew to {size} bytes holding two 250 KB entries"
+        );
     }
 
     #[test]
@@ -746,6 +1317,49 @@ mod tests {
             !bytes.starts_with(b"SQLite format 3\0"),
             "the file still looks like a plain SQLite database"
         );
+    }
+
+    #[test]
+    fn a_database_written_before_auto_vacuum_existed_is_converted_on_open() {
+        // The mode lives in the file header and SQLite only lets it change on a
+        // database with no tables, or through a full VACUUM. A history written
+        // by an earlier clippo would otherwise never reclaim anything, silently.
+        let temp = Temp::new();
+        let hash = {
+            // The database as M2b made it: keyed, schema'd, no auto-vacuum.
+            let conn = Connection::open(temp.db()).unwrap();
+            conn.execute_batch(&temp.key.pragma()).unwrap();
+            schema::ensure(&conn, &temp.db()).unwrap();
+            let mode: i64 = conn
+                .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, 0, "the fixture has to actually predate the setting");
+
+            let new = text(1_000, "written by the old clippo");
+            conn.execute(
+                "INSERT INTO entries (created_at, last_used_at, kind, preview, hash)
+                 VALUES (1000, 1000, 'text', 'written by the old clippo', ?1)",
+                [&new.hash],
+            )
+            .unwrap();
+            new.hash
+        };
+
+        let store = temp.open();
+        let mode: i64 = store
+            .conn
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, AUTO_VACUUM_INCREMENTAL, "converted by the VACUUM");
+
+        // And the rewrite kept the history rather than starting it again.
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(store.list(1, 0).unwrap()[0].hash, hash);
+
+        // Once converted, it stays converted — the next open does no VACUUM.
+        drop(store);
+        let store = temp.open();
+        assert_eq!(store.count().unwrap(), 1);
     }
 
     /// The ids in the history, newest use first.

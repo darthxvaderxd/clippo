@@ -1,5 +1,5 @@
 //! Encrypted clipboard history: SQLCipher-backed entries and flavor blobs, with
-//! dedup.
+//! dedup, images and retention.
 //!
 //! This crate is the security floor of the whole project. Everything clippo
 //! captures ends up here, passwords included, so "encrypted at rest" has to be
@@ -20,6 +20,13 @@
 //!   per entry, enforced by `entries.hash UNIQUE` rather than by a check the
 //!   caller is trusted to have made. See [`dedup`].
 //!
+//! Two more concerns sit on top of that floor, one per module:
+//!
+//! - [`images`] — the cap on a stored image blob, the PNG thumbnail generated
+//!   beside it, and [`NEVER_OFFERED`], the flavors a paste must not hand back.
+//! - [`retention`] — the count and age limits, when they run, and the pin
+//!   exemption that applies to both of them and to [`Store::clear`].
+//!
 //! # Using it
 //!
 //! ```no_run
@@ -27,9 +34,10 @@
 //! use clippo_core::{EntryKind, Flavor, NewEntry, Timestamp};
 //! use clippo_store::{dedup, key, Store};
 //!
+//! let config = clippo_core::Config::load()?;
 //! let (key, source) = key::acquire().await?;
 //! tracing::info!("clippo's database key came from {source}");
-//! let mut store = Store::open_default(&key)?;
+//! let mut store = Store::open_default(&key)?.with_config(&config);
 //!
 //! let flavors = vec![Flavor::new("text/plain;charset=utf-8", "hello")];
 //! let kind = EntryKind::for_flavors(&flavors).expect("a text flavor implies a kind");
@@ -48,17 +56,22 @@
 //! # }
 //! ```
 //!
-//! Retention, image thumbnails and search are not here yet; they arrive with
-//! the rest of M2 and M3. See `docs/ROADMAP.md`.
+//! Retention runs itself from there — every [`Store::insert`] applies the
+//! limits the config asked for. Search is not here yet; it arrives with M3.
+//! See `docs/ROADMAP.md`.
 
 pub mod dedup;
+pub mod images;
 pub mod key;
+pub mod retention;
 mod schema;
 mod store;
 
 use std::path::PathBuf;
 
+pub use images::{is_offerable, thumbnail, ThumbnailError, NEVER_OFFERED, THUMBNAIL_MIME};
 pub use key::{Key, KeyError, KeySource};
+pub use retention::{Retention, Sweep};
 pub use schema::SCHEMA_VERSION;
 pub use store::{Insertion, Store, StoredEntry};
 
@@ -128,6 +141,28 @@ pub enum StoreError {
     SchemaUnversioned {
         /// The database file.
         path: PathBuf,
+    },
+
+    /// A copied image is bigger than `max_image_bytes`, so the entry was not
+    /// stored at all.
+    ///
+    /// Not a failure of the database, and not something a caller needs to
+    /// retry: the copy is simply too big for the history clippo was configured
+    /// to keep. `clippod` reports it and carries on. It is an error rather than
+    /// a quiet skip so that a user who wonders where their screenshot went can
+    /// be told, and told which knob to turn.
+    #[error(
+        "the copied image ({mime}, {bytes} bytes) is over clippo's max_image_bytes limit of \
+         {cap} bytes, so it was not stored. Raise max_image_bytes in the config file to keep \
+         images this large"
+    )]
+    ImageTooLarge {
+        /// The MIME type of the flavor that was too big.
+        mime: String,
+        /// How big it was.
+        bytes: u64,
+        /// The configured cap it exceeded.
+        cap: u64,
     },
 
     /// The key could not be obtained.

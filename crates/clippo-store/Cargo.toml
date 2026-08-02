@@ -12,6 +12,7 @@ rust-version.workspace = true
 clippo-core = { workspace = true }
 blake3 = { workspace = true }
 getrandom = { workspace = true }
+image = { workspace = true }
 oo7 = { workspace = true }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
