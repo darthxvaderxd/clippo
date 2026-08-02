@@ -60,9 +60,13 @@ const PREVIEW_CHARS: usize = 96;
 /// The longest revealed value drawn on one row.
 ///
 /// Generous where [`PREVIEW_CHARS`] is tight, because a revealed value is the
-/// one thing on a row the user asked to *read* rather than to browse: M4 will
-/// not call anything longer than 128 characters a secret on entropy, so every
-/// value the mask exists for fits in here many times over.
+/// one thing on a row the user asked to *read* rather than to browse. M4's
+/// entropy rule will not call anything longer than 128 characters a secret, so
+/// a password or a token is far inside this. Its *shape* rules are the
+/// exception and are what set the figure: they have no length gate at all, and
+/// `shape:private-key-block` matches a whole PEM block, which for an RSA-2048
+/// key is around 1 750 characters. That fits. A 4096-bit key does not, and gets
+/// the ellipsis and `clippo reveal <id>` like any other oversized value.
 ///
 /// It is a bound rather than no limit because `Reveal` returns the whole
 /// flavor — `clippod` sets `max_flavor_bytes` to at least 8 MiB — and the row
@@ -83,7 +87,15 @@ const REVEAL_CHARS: usize = 2_000;
 /// [`REVEAL_CHARS`] newlines they are [`REVEAL_CHARS`] of them. Previews cannot
 /// reach this because the daemon flattens those, but a revealed value is the
 /// stored bytes verbatim.
-const REVEAL_LINES: usize = 12;
+///
+/// The figure is set by the same key [`REVEAL_CHARS`] is. A PEM block is one
+/// line per 64 base64 characters, so an RSA-2048 private key — the longest
+/// thing M4's shape rules call a secret, and the most likely long one in the
+/// picker — is 28 lines, and a cap that cut it would cut it in half. This still
+/// bounds the height hard: at most 32 explicit runs plus the few dozen that
+/// [`REVEAL_CHARS`] wraps into, around 1 400 pixels against a 560-pixel popup,
+/// where an unbounded row reached 400 000.
+const REVEAL_LINES: usize = 32;
 
 /// Pixel size of a thumbnail in the list.
 const THUMB: f32 = 40.0;
@@ -284,25 +296,47 @@ fn kind_icon(kind: &str) -> &'static str {
 /// A cut is marked with the same ellipsis a cut preview gets, so a value that
 /// did not fit is visibly a value that did not fit rather than one that looks
 /// complete. `clippo reveal <id>` in a terminal is the way to see the rest, and
-/// the values this exists for are far inside the cap.
+/// the values the mask exists for are inside both caps — up to and including a
+/// PEM private key, which is what sets them.
+///
+/// The scan is bounded by the caps rather than by the value, because this runs
+/// on every redraw of a revealed row — including the ones mouse motion over the
+/// popup causes — and `Ctrl+R` is not restricted to rows the daemon called
+/// sensitive, so the value can be an ordinary multi-megabyte paste. It stops at
+/// whichever cap comes first, which makes the cost a function of the caps.
 fn readable(value: &str) -> String {
-    // `split('\n')` then `join("\n")` reconstructs verbatim, so `head` is a byte
-    // prefix of `value` and the two lengths differing is exactly "lines were
-    // dropped".
-    let head = value
-        .split('\n')
-        .take(REVEAL_LINES)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let drawn = shorten(&head, REVEAL_CHARS);
+    // Byte index the character cap cuts at: the start of character number
+    // `REVEAL_CHARS - 1`, so the ellipsis is the last of the `REVEAL_CHARS`
+    // drawn. Reaching the read below means having passed that character, so the
+    // initial value is never the one used.
+    let mut ellipsis_at = 0;
+    let mut newlines = 0;
 
-    let lines_dropped = head.len() < value.len();
-    let chars_dropped = drawn.chars().count() < head.chars().count();
-    if lines_dropped && !chars_dropped {
-        drawn + "\u{2026}"
-    } else {
-        drawn
+    // `chars` is how many characters precede this one, so seeing `REVEAL_CHARS`
+    // of them is exactly "the value is longer than the cap".
+    for (chars, (index, character)) in value.char_indices().enumerate() {
+        if chars == REVEAL_CHARS {
+            return value[..ellipsis_at].to_owned() + "\u{2026}";
+        }
+        if chars + 1 == REVEAL_CHARS {
+            ellipsis_at = index;
+        }
+        if character == '\n' {
+            newlines += 1;
+            if newlines == REVEAL_LINES {
+                // Everything from this newline on is dropped. If that is only
+                // the newline itself — a value that ends in one — then there is
+                // no more to promise, and the ellipsis would be a lie.
+                let more = if value[index + 1..].is_empty() {
+                    ""
+                } else {
+                    "\u{2026}"
+                };
+                return value[..index].to_owned() + more;
+            }
+        }
     }
+    value.to_owned()
 }
 
 /// Cut a preview to a width the list can draw, on a character boundary.
@@ -348,20 +382,31 @@ mod tests {
         assert_eq!(shorten("abc", 0), "\u{2026}");
     }
 
-    /// Every value the mask exists for. M4 refuses to call anything over 128
-    /// characters a secret on entropy, so a password, a token or a private key
-    /// is read whole — the cap is not a cut in any case `Ctrl+R` was added for.
+    /// Every value the mask exists for. M4's entropy rule refuses to call
+    /// anything over 128 characters a secret, and its shape rules — which have
+    /// no length gate — top out at a PEM private key, so the caps are not a cut
+    /// in any case `Ctrl+R` was added for.
+    ///
+    /// The key is a real RSA-2048 block's shape rather than one sized to the
+    /// caps: 26 body lines of 64 base64 characters between the header and the
+    /// footer. Calibrating the fixture to the constant instead would make this
+    /// pass for a cap that halves the most likely long secret in the picker.
     #[test]
     fn a_secret_is_revealed_whole() {
+        let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDGh3Zx8kKp3nQ7";
         let key = format!(
-            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
-            (0..10)
-                .map(|_| "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ")
-                .collect::<Vec<_>>()
-                .join("\n")
+            "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----",
+            vec![body; 26].join("\n")
         );
+        assert_eq!(
+            key.lines().count(),
+            28,
+            "the shape of an RSA-2048 PEM block"
+        );
+        assert!(key.chars().count() > 1_700, "{}", key.chars().count());
+
         assert_eq!(readable("hunter2"), "hunter2");
-        assert_eq!(readable(&key), key, "12 lines, ~600 characters");
+        assert_eq!(readable(&key), key);
     }
 
     /// The blocking half. `Reveal` returns the whole flavor — megabytes, if the
@@ -401,6 +446,18 @@ mod tests {
 
         assert_eq!(drawn.chars().count(), REVEAL_CHARS);
         assert_eq!(drawn.matches('\u{2026}').count(), 1);
+    }
+
+    /// A value that fills the line cap and ends in a newline has dropped
+    /// nothing but that empty final line, so it must not claim there is more.
+    #[test]
+    fn a_trailing_newline_is_not_more_to_see() {
+        let exactly = "x\n".repeat(REVEAL_LINES);
+
+        let drawn = readable(&exactly);
+
+        assert_eq!(drawn, exactly.trim_end_matches('\n'));
+        assert!(!drawn.contains('\u{2026}'));
     }
 
     #[test]
