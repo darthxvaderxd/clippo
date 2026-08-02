@@ -69,7 +69,9 @@ mod store;
 
 use std::path::PathBuf;
 
-pub use images::{is_offerable, thumbnail, ThumbnailError, NEVER_OFFERED, THUMBNAIL_MIME};
+pub use images::{
+    is_offerable, is_thumbnail, thumbnail, ThumbnailError, NEVER_OFFERED, THUMBNAIL_MIME,
+};
 pub use key::{Key, KeyError, KeySource};
 pub use retention::{Retention, Sweep};
 pub use schema::SCHEMA_VERSION;

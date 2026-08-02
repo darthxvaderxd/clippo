@@ -28,8 +28,23 @@
 //! | `Pin` | `(id, bool)` |
 //! | `Clear` | `(include_pinned)` |
 //! | `Reveal` | `(id) -> String` |
+//! | `Thumbnail` | `(id) -> Vec<u8>` |
 //! | `SetPaused` / `Paused` | `(bool)` / `-> bool` |
 //! | `HistoryChanged` | signal |
+//!
+//! `Thumbnail` is the one member DESIGN.md's table does not list, added at M5.
+//! Its absence was a gap rather than a decision: the design has capture derive
+//! and store a thumbnail expressly "so the applet never decodes full-size
+//! images", and without a member to fetch one the applet could only have got
+//! there through the full-size blob — the thing the thumbnail exists to avoid.
+//! It returns derived bytes, not stored content, so it does not widen what
+//! [`Reveal`][ClippoBackend::reveal] is the sole route for.
+//!
+//! # The other direction
+//!
+//! [`AppletInterface`] and [`ClippoAppletProxy`] are a second, much smaller
+//! interface that the *applet* serves and `clippo show` calls. See
+//! [`applet`](crate::applet) for why it is a separate bus name.
 //!
 //! # Previews and full values
 //!
@@ -52,12 +67,17 @@
 //! # }
 //! ```
 
+mod applet;
 mod proxy;
 mod service;
 
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
 
+pub use applet::{
+    AppletFrontend, AppletInterface, ClippoAppletProxy, ClippoAppletProxyBlocking, APPLET_BUS_NAME,
+    APPLET_INTERFACE_NAME, APPLET_OBJECT_PATH,
+};
 pub use proxy::{ClippoProxy, ClippoProxyBlocking};
 pub use service::{emitter, ClippoBackend, ClippoInterface};
 

@@ -190,6 +190,7 @@ are the actual risk.
   | `Pin` | `(id, bool)` |
   | `Clear` | `(include_pinned)` |
   | `Reveal` | `(id) -> String` |
+  | `Thumbnail` | `(id) -> Vec<u8>` — the stored `image/png;clippo-thumb` flavor (M5) |
   | `SetPaused` / `Paused` | `(bool)` / `-> bool` |
   | `HistoryChanged` | signal, so the applet updates live |
 
@@ -199,7 +200,8 @@ are the actual risk.
 ### `clippo-cli`
 
 A thin `zbus` client over the same interface:
-`clippo list|search|copy|pin|rm|clear|pause|reveal`.
+`clippo list|search|copy|pin|rm|clear|pause|reveal`, plus `clippo show` from M5, which is
+the only one that calls the applet rather than the daemon.
 
 Ship it before the GUI — it makes every layer below testable without touching a UI.
 
@@ -212,11 +214,13 @@ Ship it before the GUI — it makes every layer below testable without touching 
 - Sensitive rows render the mask plus a small lock badge.
 - Images render from the stored thumbnail flavor.
 - `.desktop` carries `X-CosmicApplet=true` so it appears in COSMIC's panel configuration.
-- **Global shortcut** (e.g. `Super+V`) — the applet registers `Toggle()` on D-Bus, and a custom
-  COSMIC shortcut in `~/.config/cosmic/com.system76.CosmicSettings.Shortcuts` runs
-  `clippo show`, which calls it. Whether libcosmic can open an applet popup programmatically
-  needs verifying during implementation; **fallback** is a standalone floating picker window.
-  The shortcut is manual setup for v1 — editing the user's shortcuts RON is out of scope.
+- **Global shortcut** (e.g. `Super+V`) — the applet registers `Toggle()` on D-Bus under its own
+  bus name `com.nilfactor.ClippoApplet`, and a custom COSMIC shortcut in
+  `~/.config/cosmic/com.system76.CosmicSettings.Shortcuts` runs `clippo show`, which calls it.
+  libcosmic *can* open an applet popup programmatically on the pinned revision, so the
+  standalone floating picker **fallback was not taken** — see the decisions section for what
+  was checked and what stays a host-terminal question. The shortcut is manual setup for v1 —
+  editing the user's shortcuts RON is out of scope, but the README carries the exact snippet.
 
 ## Known risks
 
@@ -242,3 +246,22 @@ Choices made during planning that a future reader might otherwise re-litigate:
 - **Whole-DB encryption over per-field** — one place to get crypto right instead of many.
 - **Fuzzy in-memory search over FTS5** — better matching, and avoids the FTS5-on-SQLCipher
   build.
+- **The applet popup *is* programmatically openable, so the standalone-window fallback was not
+  taken** (M5). The risk table asked for this to be settled before the list UI was built, and
+  it was, by reading the pinned libcosmic revision. Two things had to hold and both do:
+  `get_popup` is an ordinary `Task` returned from `update`, so the message that opens the popup
+  can come from the D-Bus subscription just as well as from a click; and a missing input serial
+  is not fatal — `xdg_popup::grab` needs a serial from a recent input event, which a popup
+  opened by `clippo show` has none of, and iced looks that serial up with `and_then` and simply
+  skips the grab rather than refusing the popup. What reading the source cannot settle is the
+  *consequence* of the second point: without a grab the compositor is under no obligation to
+  give the popup keyboard focus, and a picker that cannot be typed into is no use. That is
+  [verification 6](ROADMAP.md#6-restart-resilience), by hand on the host. The mitigation stands
+  either way — `clippo-applet`'s `surface` module is the only file that knows the picker is a
+  popup, so taking the fallback later means rewriting that one file.
+- **`Thumbnail(id)` added to the daemon's interface** (M5), which the member table above did not
+  originally list. Its absence was a gap rather than a decision: capture derives and stores a
+  thumbnail expressly "so the applet never decodes full-size images", and with no member to
+  fetch one the applet could only have reached it through the full-size blob — the thing the
+  thumbnail exists to avoid. It returns derived bytes rather than stored content, so it does
+  not widen what `Reveal` is the sole route for.

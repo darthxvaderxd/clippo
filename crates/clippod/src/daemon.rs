@@ -528,6 +528,43 @@ impl ClippoBackend for Daemon {
         })
     }
 
+    /// The stored thumbnail, or a reason there is not one.
+    ///
+    /// Read straight out of the flavors — nothing is decoded or scaled here.
+    /// The whole point of the derived `image/png;clippo-thumb` row is that
+    /// drawing an image row costs one blob read, so generating a missing
+    /// thumbnail on demand would quietly reintroduce the full-size decode this
+    /// member exists to avoid. An image stored without one is reported as such
+    /// and the frontend draws a placeholder.
+    async fn thumbnail(&self, id: i64) -> fdo::Result<Vec<u8>> {
+        let id = EntryId::new(id);
+        let state = self.state.lock().await;
+        let stored = state
+            .store
+            .get(id)
+            .map_err(|error| failed("thumbnail", error))?
+            .ok_or_else(|| no_such_entry(id))?;
+
+        if stored.entry.kind != EntryKind::Image {
+            return Err(fdo::Error::NotSupported(format!(
+                "entry {id} is {}, which has no thumbnail",
+                stored.entry.kind
+            )));
+        }
+
+        stored
+            .flavors
+            .iter()
+            .find(|flavor| clippo_store::is_thumbnail(&flavor.mime))
+            .map(|flavor| flavor.data.clone())
+            .ok_or_else(|| {
+                fdo::Error::NotSupported(format!(
+                    "entry {id} is an image stored without a thumbnail; \
+                     it was too large or could not be decoded at capture"
+                ))
+            })
+    }
+
     async fn set_paused(&self, paused: bool) -> fdo::Result<()> {
         // `swap` rather than a load and a store: two frontends toggling at once
         // must not both decide they were the one that changed it.

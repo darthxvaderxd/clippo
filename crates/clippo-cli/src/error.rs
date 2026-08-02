@@ -43,6 +43,15 @@ pub enum CliError {
     DaemonNotRunning,
 
     #[error(
+        "the clippo applet is not running — nothing owns {bus} on the session bus. `clippo \
+         show` asks the panel applet to open its picker, so it needs the applet, not just the \
+         daemon: add clippo to the panel in COSMIC Settings → Desktop → Panel → Configure \
+         panel applets",
+        bus = clippo_ipc::APPLET_BUS_NAME
+    )]
+    AppletNotRunning,
+
+    #[error(
         "could not reach the session bus, which is where clippod serves ({0}). A desktop \
          session sets DBUS_SESSION_BUS_ADDRESS; a bare login shell or a container may not"
     )]
@@ -85,6 +94,23 @@ impl CliError {
     pub fn from_call(member: &'static str, error: zbus::Error) -> Self {
         if error_name(&error).is_some_and(|name| NO_DAEMON.contains(&name.as_str())) {
             return CliError::DaemonNotRunning;
+        }
+        CliError::Call {
+            member,
+            message: describe(&error),
+        }
+    }
+
+    /// The same, for the applet's interface rather than the daemon's.
+    ///
+    /// Separate from [`from_call`][Self::from_call] because the two absences
+    /// have different fixes: starting `clippod` will not put the applet on the
+    /// panel, and a user told to do the wrong one of those will not get their
+    /// popup. The bus reports both the same way, so telling them apart is a
+    /// matter of knowing which name was being called.
+    pub fn from_applet_call(member: &'static str, error: zbus::Error) -> Self {
+        if error_name(&error).is_some_and(|name| NO_DAEMON.contains(&name.as_str())) {
+            return CliError::AppletNotRunning;
         }
         CliError::Call {
             member,

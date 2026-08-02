@@ -115,6 +115,14 @@ pub fn run(command: Command) -> Result<(), CliError> {
             // this subcommand's --help.
             emit(&client.reveal(id)?)
         }
+
+        Command::Show => {
+            client.toggle_applet()?;
+            // No confirmation: this is what a keypress runs, and a line on
+            // stderr per press would be noise in the journal rather than
+            // something anybody reads. The popup appearing is the feedback.
+            Ok(())
+        }
     }
 }
 

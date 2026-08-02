@@ -16,3 +16,22 @@ path = "src/main.rs"
 # [workspace.dependencies] since no other crate shares it.
 [dependencies]
 clippo-ipc = { workspace = true }
+async-trait = { workspace = true }
+zbus = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# A revealed secret is wiped when it is dropped rather than left in freed
+# memory. See `model::Revealed`.
+zeroize = { workspace = true }
+
+# Pinned to a revision rather than tracked to a branch: libcosmic has no
+# releases on crates.io and its main branch breaks API regularly, so an
+# unpinned build would stop reproducing the moment upstream lands a change.
+# `default-features = false` keeps x11 and a11y out — a panel applet is
+# Wayland-only, and both pull in trees this does not need.
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic.git"
+rev = "dc1cf9f"
+default-features = false
+features = ["applet", "tokio", "wayland", "winit", "multi-window"]
