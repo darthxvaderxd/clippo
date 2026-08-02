@@ -65,6 +65,33 @@ self-echo guard.
 
 Detection, masking, `Reveal`, and the fixture corpus with its tests.
 
+- [x] `clippo-core::secrets` computes `sensitive` at capture from all three of DESIGN.md's
+      signals, each a module of its own with its own entry point rather than one fused
+      predicate: the `x-kde-passwordManagerHint` marker, the provider-token shapes, and the
+      entropy heuristic. `detect` reports *which* rule fired, so a false positive can be
+      answered by name.
+- [x] Shape regexes for every provider DESIGN.md lists — `sk-…`, `ghp_`/`gho_`/`github_pat_`,
+      `AKIA…`, `xox[baprs]-`, JWT, `-----BEGIN … PRIVATE KEY-----` and `postgres://user:pass@`
+      — each widened to the rest of its family and each with a corpus fixture.
+- [x] The entropy rule gated on a single token, 8–128 characters, three or more character
+      classes and above 3.5 bits/char, disableable through `[secrets] entropy_rule` while the
+      MIME and shape rules keep working.
+- [x] A password-manager copy is **masked, not skipped** — stored, listed and pasteable like
+      any other entry.
+- [x] `mask()` renders `ab••••••••yz`: configurable first and last counts, a fixed-width bullet
+      run that does not leak the value's length, and no panic or leak on a short value, on
+      multi-byte UTF-8, or on a grapheme cluster boundary.
+- [x] Masking is display-only. The preview is masked before it is stored, so `List` and
+      `Search` have no unmasked one to return; `Reveal(id)` is the only member that returns a
+      whole value; and `Copy` puts the real bytes on the clipboard.
+- [x] A fixture corpus in both directions at `crates/clippo-core/tests/corpus.toml` — tokens,
+      high-entropy secrets and a hinted password against git SHAs, UUIDs, base64 blobs,
+      minified JS, prose, URLs and paths — with a test asserting every fixture's
+      classification, failing loudest on a missed secret, and refusing a shape rule that has no
+      fixture.
+- [x] The entropy threshold's tuning rationale written down next to the constant, with the
+      measured figures for the fixtures either side of it asserted by a test.
+
 ### M5 — applet
 
 libcosmic UI: search, pins, images, live updates via `HistoryChanged`, and `Toggle()`.
@@ -135,6 +162,24 @@ Copy a KeePassXC password, an `sk-`-prefixed token, and a JWT. Each should show 
 
 Then the false-positive check: copy a git SHA, a UUID, and a paragraph of prose, and confirm
 none are flagged.
+
+- [ ] A KeePassXC password shows as `ab••••••••yz` with `s` in the `FL` column.
+- [ ] An `sk-`-prefixed token and a JWT do the same.
+- [ ] `clippo copy <id>` on each, then `Ctrl+V` in `cosmic-edit` — each pastes **in full**. A
+      mask reaching the clipboard is the highest-severity bug this feature can have.
+- [ ] `clippo reveal <id>` prints each value whole.
+- [ ] A git SHA, a UUID and a paragraph of prose are not flagged: no `s`, no bullets.
+- [ ] The applet renders the same masks with a lock badge — M5, once there is an applet.
+
+Manual for the usual reason: the first two need a compositor and a password manager, and the
+third needs somewhere to paste. They stay unchecked in the repository. The automated half is
+the fixture corpus and the daemon tests — `crates/clippo-core/tests/corpus.toml` covers both
+directions of detection, and `clippod` asserts that no sensitive value appears in a `List` or
+`Search` payload and that `Copy` offers the stored bytes rather than the mask. What no test
+here can cover is the compositor actually handing a paste the bytes clippo wrote.
+
+The README's [Secrets](../README.md#secrets) section documents this list for users, along with
+what each rule fires on and how to turn the entropy one off.
 
 ### 5. Pins and retention
 

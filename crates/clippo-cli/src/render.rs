@@ -470,6 +470,30 @@ mod tests {
         assert!(rendered.ends_with('\n'), "{rendered:?}");
     }
 
+    /// What a masked entry looks like on the way out of `clippo list`. The
+    /// daemon has already replaced the value with `ab••••••••yz`, and the CLI's
+    /// job is to print that unchanged: a bullet is neither a control character
+    /// nor an invisible one, so nothing here escapes or collapses it.
+    #[test]
+    fn a_masked_preview_reaches_the_terminal_as_bullets() {
+        let masked = "su\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}ue";
+        let entries = vec![EntrySummary {
+            sensitive: true,
+            ..entry(3, masked)
+        }];
+
+        let table = table(&entries, now());
+        assert!(table.contains(masked), "{table}");
+        // …under the `s` flag, which is what says the row is a mask and not a
+        // value that happens to contain bullets.
+        assert!(table.contains(".s  su"), "{table}");
+
+        let rendered = json(&entries).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed[0]["preview"], masked);
+        assert_eq!(parsed[0]["sensitive"], true);
+    }
+
     /// JSON's own escaping is what makes emitting an unflattened preview safe.
     #[test]
     fn json_escapes_control_characters_rather_than_emitting_them() {

@@ -53,6 +53,13 @@ pub trait ClippoBackend: Send + Sync + 'static {
     async fn clear(&self, include_pinned: bool) -> fdo::Result<()>;
 
     /// The full stored value of one entry. The only member that returns one.
+    ///
+    /// A masked entry's value comes out of here unmasked, which is the point:
+    /// masking is display-only, and this is the display asking for the value
+    /// on the user's explicit instruction. Everything else — `List`, `Search`,
+    /// and anything added later that renders a row — gets
+    /// [`EntrySummary::preview`][crate::EntrySummary::preview], which is a mask
+    /// for a sensitive entry before it reaches the database.
     async fn reveal(&self, id: i64) -> fdo::Result<String>;
 
     /// Stop or resume recording new copies.

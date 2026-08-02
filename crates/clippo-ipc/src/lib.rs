@@ -95,9 +95,13 @@ pub struct EntrySummary {
     pub last_used_at: i64,
     /// The [`clippo_core::EntryKind`] word: `text`, `html`, `uris` or `image`.
     pub kind: String,
-    /// A short, single-line rendering of the content — masked from M4 onwards
-    /// when the entry is [`sensitive`](Self::sensitive). Never the whole value;
-    /// that is `Reveal`'s job alone.
+    /// A short, single-line rendering of the content — `ab••••••••yz` when the
+    /// entry is [`sensitive`](Self::sensitive). Never the whole value; that is
+    /// `Reveal`'s job alone.
+    ///
+    /// The masking happened at capture: this field is `entries.preview`, which
+    /// is already a mask in the database for a sensitive entry. There is no
+    /// unmasked preview anywhere for a `List` or a `Search` to return.
     pub preview: String,
     /// Whether the entry is exempt from retention and from an ordinary
     /// `Clear`.
