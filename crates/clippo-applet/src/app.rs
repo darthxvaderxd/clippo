@@ -70,7 +70,7 @@ pub enum Message {
 
 /// The keyboard actions, named for what they do rather than for their keys.
 ///
-/// Separated from the key that produces them so that [`Application::update`]
+/// Separated from the key that produces them so that [`cosmic::Application::update`]
 /// reads as a list of behaviours, and so rebinding is a change in one `match`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -117,9 +117,12 @@ impl Clippo {
     /// and the alternative is blocking the frame.
     ///
     /// The return value matters for anything that also records *that* it asked.
-    /// The executor is single-threaded, so the worker cannot drain a slot while
-    /// this is running: a caller that marks first and sends second turns one
-    /// full queue into a permanent gap.
+    /// Marking after the send is correct whether or not a slot happens to free
+    /// up in the meantime — `cosmic::SingleThreadExecutor` is a one-worker tokio
+    /// runtime on its own thread, so the bus worker does run concurrently with
+    /// this — because the failure it prevents is one-sided: a caller that marks
+    /// first and sends second turns one full queue into a permanent gap, while
+    /// marking second can at worst ask twice.
     fn ask(&self, request: Request) -> bool {
         let Some(requests) = self.requests.as_ref() else {
             debug!(?request, "clippo-applet is not on the bus yet; dropping");
@@ -221,10 +224,11 @@ impl Clippo {
     ///
     /// The entry is marked as asked only once [`Clippo::ask`] says the worker
     /// took the request, which is [`Thumbnails`]'s rule and the reason it is a
-    /// separate call. And the loop stops at the first refusal rather than
-    /// carrying on: the executor is single-threaded, so nothing can drain a
-    /// slot in the middle of it and every later `try_send` would fail the same
-    /// way. The backlog is picked up in [`Clippo::on_bus`] as replies come in.
+    /// separate call. The loop then stops at the first refusal, which costs at
+    /// most one round trip: the bus worker is on its own thread and may free a
+    /// slot mid-loop, so carrying on could have got another request through —
+    /// but anything left unmarked comes back from [`Thumbnails::wanted`] the
+    /// next time this runs, and [`Clippo::on_bus`] runs it on every reply.
     fn fetch_thumbnails(&mut self) {
         for key in self.thumbnails.wanted(self.model.entries()) {
             if !self.ask(Request::Thumbnail(key)) {
@@ -245,10 +249,16 @@ impl Clippo {
                 // was dropped for want of a sender.
                 self.refresh_if_visible();
             }
-            bus::Event::Entries(entries) => {
-                self.model.set_entries(entries);
-                self.thumbnails.prune(self.model.entries());
-                self.fetch_thumbnails();
+            bus::Event::Entries(query, entries) => {
+                // Dropped rather than drawn when the user has typed since it was
+                // asked for: a superseded ranking is on its way out anyway, and
+                // showing it costs the *next* one its landing rule. See
+                // [`Model::accepts`].
+                if self.model.accepts(&query) {
+                    self.model.set_entries(entries);
+                    self.thumbnails.prune(self.model.entries());
+                    self.fetch_thumbnails();
+                }
             }
             bus::Event::Revealed(id, value) => {
                 // Straight into the model, which will only draw it while its

@@ -216,7 +216,7 @@ start typing immediately, and nothing below needs the mouse.
 | `Enter` | Copy the highlighted entry and close. The picker gets out of the way because you are about to paste. |
 | `Delete` | Remove the highlighted entry. No confirmation — this is one row of a rolling history, and `clippo clear` is the destructive one. |
 | `Ctrl+P` | Pin or unpin. A pinned entry is exempt from retention and from `clear`. |
-| `Ctrl+R` | Reveal a masked entry — see below. |
+| `Ctrl+R` | Show the highlighted entry's stored value in place, up to a bound. This is how a masked row is read — see below. |
 | `Escape` | Close without doing anything. |
 
 The highlight follows the *entry*, not the row number. That matters because the list changes
@@ -236,6 +236,13 @@ the selection stops it being drawn, and it is dropped when the popup closes — 
 closed it or clicked away. The value is held zeroized from the moment it arrives, so dropping
 it wipes the memory rather than leaving the secret in a freed buffer for a core dump to pick
 up — with one honest gap: the buffer zbus deserialises the reply into is not clippo's to wipe.
+
+The revealed value is wrapped rather than cut at the width of the list, but it is bounded — the
+first 2 000 characters over at most 12 lines, with an `…` when there was more. That is far more
+than any value the mask exists for: nothing longer than 128 characters is flagged on entropy in
+the first place. The cap is there because `Reveal` returns the whole stored value, the binding
+works on any row rather than only a masked one, and a megabyte of pasted text would otherwise
+draw a row hundreds of screens tall. Use `clippo reveal <id>` to see a long value whole.
 
 Copying a masked row still copies the **real** value. Masking is display-only everywhere in
 clippo; see [Secrets](#secrets).

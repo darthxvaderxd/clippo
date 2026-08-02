@@ -122,7 +122,10 @@ pub fn is_service_absent(error: &zbus::Error) -> bool {
 /// Not every [`zbus::Error`] is an error *reply* — a transport failure has no
 /// name at all — which is why this is an `Option` rather than a string that
 /// would sometimes be empty.
-pub fn error_name(error: &zbus::Error) -> Option<String> {
+///
+/// Private: [`is_service_absent`] is the question both frontends actually ask,
+/// and a name on its own is not a decision anybody outside this module makes.
+fn error_name(error: &zbus::Error) -> Option<String> {
     use zbus::DBusError as _;
 
     match error {

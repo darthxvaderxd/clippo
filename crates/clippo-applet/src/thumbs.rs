@@ -14,12 +14,15 @@
 //!
 //! # An entry is marked as asked only once the request has been taken
 //!
-//! The request channel is bounded and the applet's executor is single-threaded,
-//! so a `try_send` that fails cannot succeed again later in the same batch. If
-//! marking happened first, one full queue would be permanent: every id past the
-//! limit would be marked, dropped, and never requested again for the life of
-//! the applet — drawing the generic image icon, which is also what a genuinely
-//! thumbnail-less image draws, so the failure is invisible.
+//! The request channel is bounded, so a `try_send` can fail while the worker is
+//! behind. If marking happened first, one full queue would be permanent: every
+//! id past the limit would be marked, dropped, and never requested again for
+//! the life of the applet — drawing the generic image icon, which is also what
+//! a genuinely thumbnail-less image draws, so the failure is invisible.
+//!
+//! The two orderings are not symmetrical, which is why this holds without any
+//! claim about when the worker runs: marking after a send that failed asks
+//! again, and marking before one asks never.
 //!
 //! [`Thumbnails::asked`] is therefore a separate call the caller makes *after*
 //! the send succeeds, and [`Thumbnails::wanted`] keeps returning anything that

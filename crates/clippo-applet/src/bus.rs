@@ -56,7 +56,7 @@ use crate::model::EntryKey;
 pub const ROW_LIMIT: u32 = 200;
 
 /// Something the UI wants the daemon to do.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Request {
     /// Re-read the list for this query. An empty query is the whole history.
     Refresh(String),
@@ -76,6 +76,25 @@ pub enum Request {
     Thumbnail(EntryKey),
 }
 
+/// Hand-written for the same reason [`Event`]'s is, one step weaker:
+/// [`Request::Refresh`] carries what the user typed into the search field.
+/// That is not clipboard content, but it is the one string in this pair that
+/// comes from the keyboard — somebody searching for a fragment of a password
+/// has typed a fragment of a password — and a derived `Debug` would put it in
+/// the journal on the first `debug!(?request)` anybody adds.
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Request::Refresh(query) => write!(f, "Refresh({} chars)", query.chars().count()),
+            Request::Copy(id) => write!(f, "Copy({id})"),
+            Request::Delete(id) => write!(f, "Delete({id})"),
+            Request::Pin(id, pinned) => write!(f, "Pin({id}, {pinned})"),
+            Request::Reveal(id) => write!(f, "Reveal({id})"),
+            Request::Thumbnail(key) => write!(f, "Thumbnail({key:?})"),
+        }
+    }
+}
+
 /// Something that happened, for the UI to fold in.
 #[derive(Clone)]
 pub enum Event {
@@ -83,7 +102,12 @@ pub enum Event {
     /// once, before anything else.
     Ready(mpsc::Sender<Request>),
     /// The answer to a [`Request::Refresh`], already ranked by the daemon.
-    Entries(Vec<EntrySummary>),
+    ///
+    /// Carries the query it was asked for, because two refreshes can be in
+    /// flight at once — a keystroke sends one per character — and the UI has to
+    /// be able to tell the answer it is waiting for from one it has already
+    /// moved on from. See [`Model::accepts`][crate::model::Model::accepts].
+    Entries(String, Vec<EntrySummary>),
     /// The answer to a [`Request::Reveal`]. Held only as long as its row stays
     /// focused — see [`crate::model`].
     ///
@@ -127,7 +151,9 @@ impl std::fmt::Debug for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Event::Ready(_) => f.write_str("Ready"),
-            Event::Entries(entries) => write!(f, "Entries({} rows)", entries.len()),
+            // The row count and not the query, for the reason `Request`'s own
+            // `Debug` does not print it either.
+            Event::Entries(_, entries) => write!(f, "Entries({} rows)", entries.len()),
             Event::Revealed(id, value) => {
                 write!(f, "Revealed({id}, {} chars)", value.chars().count())
             }
@@ -357,7 +383,7 @@ async fn serve_request(
             // query matches everything, so this is `List` with a limit, and
             // routing both through one member is what stops the applet's
             // unfiltered order drifting from `clippo search`'s.
-            Ok(entries) => Event::Entries(entries),
+            Ok(entries) => Event::Entries(query, entries),
             Err(error) => down("Search", &error),
         },
         Request::Copy(id) => match clippo.copy(id).await {
@@ -435,6 +461,17 @@ mod tests {
         assert_eq!(rendered, "Revealed(3, 7 chars)");
     }
 
+    /// The weaker half of the same rule: what the user typed is not clipboard
+    /// content, but it is theirs, and `ask` does log a dropped request.
+    #[test]
+    fn debugging_a_request_never_prints_the_search_query() {
+        let rendered = format!("{:?}", Request::Refresh("hunter2".to_owned()));
+
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert_eq!(rendered, "Refresh(7 chars)");
+        assert_eq!(format!("{:?}", Request::Pin(3, true)), "Pin(3, true)");
+    }
+
     /// The same through the type that actually reaches a log line.
     #[test]
     fn debugging_the_message_that_wraps_it_is_no_different() {
@@ -447,7 +484,10 @@ mod tests {
     #[test]
     fn the_other_events_still_say_what_they_are() {
         assert_eq!(format!("{:?}", Event::DaemonDown), "DaemonDown");
-        assert_eq!(format!("{:?}", Event::Entries(vec![])), "Entries(0 rows)");
+        assert_eq!(
+            format!("{:?}", Event::Entries("hunter".to_owned(), vec![])),
+            "Entries(0 rows)"
+        );
 
         let key = EntryKey {
             id: 42,

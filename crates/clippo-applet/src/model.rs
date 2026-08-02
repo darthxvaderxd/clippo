@@ -199,6 +199,21 @@ impl Model {
         self.land_at_top = true;
     }
 
+    /// Whether a list the daemon answered with is still the one being waited
+    /// for.
+    ///
+    /// Every keystroke sends its own `Search`, so two answers can be in flight
+    /// at once and the first to arrive is not necessarily the one the user is
+    /// looking at. Feeding an overtaken answer to
+    /// [`set_entries`](Self::set_entries) is not merely a stale list for a
+    /// millisecond: it consumes [`land_at_top`](Self::land_at_top), so the
+    /// answer that *is* current then lands by the deletion rule instead — the
+    /// highlight on whatever survived rather than on the best match, which is
+    /// the one thing that rule exists to prevent.
+    pub fn accepts(&self, query: &str) -> bool {
+        query == self.query
+    }
+
     /// Replace the rows with what the daemon just returned.
     ///
     /// The daemon has already ranked these; re-sorting or filtering here is
@@ -583,6 +598,36 @@ mod tests {
         model.set_entries(vec![entry(9), entry(1), entry(2), entry(3)]);
 
         assert_eq!(model.selected_id(), Some(9));
+    }
+
+    /// Two keystrokes, two `Search` calls: the answer to the first must not be
+    /// drawn once the second has been asked for, because it would spend the
+    /// landing rule the second one needs.
+    #[test]
+    fn an_answer_to_a_query_the_user_has_moved_on_from_is_not_accepted() {
+        let mut model = model_with(&[1, 2, 3]);
+        model.set_query("a".to_owned());
+        model.set_query("ab".to_owned());
+
+        assert!(!model.accepts("a"), "the reply to the first keystroke");
+        assert!(model.accepts("ab"), "and the one being waited for");
+    }
+
+    /// Which is the whole point, so it is worth pinning end to end: the
+    /// overtaken list is what would otherwise eat the flag.
+    #[test]
+    fn an_overtaken_reply_does_not_cost_the_current_one_its_landing() {
+        let mut model = model_with(&[1, 2, 3, 4]);
+        model.select_next();
+        model.select_next();
+
+        model.set_query("a".to_owned());
+        model.set_query("ab".to_owned());
+        // The reply for "a" arrives first and is refused, so the flag survives.
+        assert!(!model.accepts("a"));
+        model.set_entries(vec![entry(9), entry(3), entry(1)]);
+
+        assert_eq!(model.selected_id(), Some(9), "the best match for `ab`");
     }
 
     #[test]
