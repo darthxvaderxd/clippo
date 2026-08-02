@@ -210,7 +210,7 @@ Ship it before the GUI — it makes every layer below testable without touching 
 ### `clippo-applet` — libcosmic panel applet
 
 - `libcosmic` with the `applet` feature; `cosmic::applet::run`.
-- Panel icon → popup with an auto-focused search field over a scrollable list. Keyboard-first:
+- Panel icon → picker with an auto-focused search field over a scrollable list. Keyboard-first:
   type to filter, `↑`/`↓` to move, `Enter` copy and close, `Delete` remove, `Ctrl+P` pin,
   `Ctrl+R` reveal a masked entry.
 - Sensitive rows render the mask plus a small lock badge.
@@ -219,9 +219,9 @@ Ship it before the GUI — it makes every layer below testable without touching 
 - **Global shortcut** (e.g. `Super+V`) — the applet registers `Toggle()` on D-Bus under its own
   bus name `com.nilfactor.ClippoApplet`, and a custom COSMIC shortcut in
   `~/.config/cosmic/com.system76.CosmicSettings.Shortcuts` runs `clippo show`, which calls it.
-  libcosmic *can* open an applet popup programmatically on the pinned revision, so the
-  standalone floating picker **fallback was not taken** — see the decisions section for what
-  was checked and what stays a host-terminal question. The shortcut is manual setup for v1 —
+  libcosmic *can* open an applet surface programmatically on the pinned revision. It cannot
+  give an `xdg_popup` keyboard focus without an input serial, which a global shortcut does not
+  supply, so **the picker is a layer surface** — see the decisions section. The shortcut is manual setup for v1 —
   editing the user's shortcuts RON is out of scope, but the README carries the exact snippet.
 
 ## Known risks
@@ -229,7 +229,7 @@ Ship it before the GUI — it makes every layer below testable without touching 
 | Risk | Mitigation |
 |---|---|
 | **Flatpak-proxied Wayland socket** hides data-control | Highest-probability source of lost time. Check `$WAYLAND_DISPLAY` whenever capture silently stops working. |
-| **Applet popup may not be programmatically openable** in libcosmic | Design M5 so swapping to a standalone picker window is cheap. |
+| **Applet popup may not be programmatically openable** in libcosmic | Design M5 so swapping to a standalone picker window is cheap. *Materialised, in the keyboard-focus form:* the popup opened but took no keys. The mitigation paid — see the decisions section. |
 | **Self-echo loop** — a wrong hash guard re-enters every copy-back into history | Integration test at M3. |
 | **Secret heuristics will need iteration** | Config escape hatch to disable the entropy rule while keeping the regex and MIME rules. |
 | **Daemon owns the selection** — if `clippod` dies, the clipboard empties | Expected Wayland behavior. `Restart=on-failure` mitigates; document in the README. |
@@ -248,19 +248,51 @@ Choices made during planning that a future reader might otherwise re-litigate:
 - **Whole-DB encryption over per-field** — one place to get crypto right instead of many.
 - **Fuzzy in-memory search over FTS5** — better matching, and avoids the FTS5-on-SQLCipher
   build.
-- **The applet popup *is* programmatically openable, so the standalone-window fallback was not
-  taken** (M5). The risk table asked for this to be settled before the list UI was built, and
-  it was, by reading the pinned libcosmic revision. Two things had to hold and both do:
-  `get_popup` is an ordinary `Task` returned from `update`, so the message that opens the popup
-  can come from the D-Bus subscription just as well as from a click; and a missing input serial
-  is not fatal — `xdg_popup::grab` needs a serial from a recent input event, which a popup
-  opened by `clippo show` has none of, and iced looks that serial up with `and_then` and simply
-  skips the grab rather than refusing the popup. What reading the source cannot settle is the
-  *consequence* of the second point: without a grab the compositor is under no obligation to
-  give the popup keyboard focus, and a picker that cannot be typed into is no use. That is
-  [verification 6](ROADMAP.md#6-restart-resilience), by hand on the host. The mitigation stands
-  either way — `clippo-applet`'s `surface` module is the only file that knows the picker is a
-  popup, so taking the fallback later means rewriting that one file.
+- **The picker is a layer surface, not an `xdg_popup`** (M5, revised after
+  [verification 6](ROADMAP.md#6-restart-resilience)). It started as a popup: reading the pinned
+  libcosmic revision settled that `get_popup` is an ordinary `Task` returned from `update`, so
+  the message that opens the picker can come from the D-Bus subscription just as well as from a
+  click, and that a missing input serial is not fatal — `xdg_popup::grab` needs a serial from a
+  recent input event, which a picker opened by `clippo show` has none of, and iced looks that
+  serial up with `and_then` and skips the grab rather than refusing the popup. What reading the
+  source could not settle was the *consequence*: without a grab the compositor is under no
+  obligation to give the popup keyboard focus. Run on a real session, it does not. The picker
+  came up with a focus ring and a blinking caret — `text_input::focus` sets the widget's own
+  focus state and the caret blinks off that alone — and no keystroke reached it until the
+  surface was clicked in. There is no second route to focus on a popup: `window::Action::GainFocus`
+  is winit's `focus_window`, a no-op on Wayland, and `SctkPopupSettings` has no
+  keyboard-interactivity field. `zwlr_layer_shell_v1` does, so the picker is now a layer surface
+  with `KeyboardInteractivity::Exclusive`, which asks for focus on map with no serial and no
+  click. An applet may do this despite being a `cosmic-panel` client rather than a direct one:
+  the panel's embedded compositor advertises the layer-shell global to its applets and proxies
+  their surfaces out to `cosmic-comp`, interactivity included. The mitigation held — the
+  `surface` module was the only file that knew what kind of surface the picker was, and the swap
+  cost that file plus three event arms in `app.rs`, because a layer surface is not dismissed by
+  a click outside it the way a grabbed popup was.
+
+  What the swap then cost was the size. A layer surface cannot be fitted to its contents the way
+  a popup was, and — the part that took the longest to find — asking `cosmic-panel` for a
+  *fully-specified* size means the surface is never drawn at all. The panel forwards the request
+  to `cosmic-comp` and forwards the reply back only when the two differ, so a size granted
+  verbatim produces no configure, and iced waits for a configure before it renders. The surface
+  maps far enough to take the exclusive keyboard focus and never far enough to show anything:
+  an invisible picker that swallows every keystroke, silent in every log. So the surface asks for
+  no size at all — anchored to all four edges, both axes left to the compositor — and comes back
+  as the whole output, which is both what makes the reply differ from the request and what gives
+  `Picker::content` somewhere to centre the picker. This is written against a `cosmic-panel` bug
+  rather than against the protocol, and `surface.rs` says so at the point that depends on it.
+
+  Position followed from the same constraint. A popup hung under the applet's icon; a layer
+  surface is placed by anchors and margins, which can say "this edge, that far in" but cannot say
+  "the middle". A full-output surface can, because the middle is then an ordinary layout inside
+  it — so the picker is centred on screen, where COSMIC's own keyboard-opened surfaces sit.
+
+  `Context::popup_container` could not be used for the frame, which is why `surface.rs` builds
+  its own with the same styling. It returns an `Autosize`, whose purpose is to resize the surface
+  to its contents: correct for a popup, fatal here, because it shrinks the layer surface back down
+  and a surface smaller than its anchors is dropped in a corner — no amount of wrapping outside it
+  can centre what it has already collapsed. It also clamps the width to exactly 360, so the
+  picker's own `WIDTH` never applied while it was in use.
 - **`Thumbnail(id)` added to the daemon's interface** (M5), which the member table above did not
   originally list. Its absence was a gap rather than a decision: capture derives and stores a
   thumbnail expressly "so the applet never decodes full-size images", and with no member to

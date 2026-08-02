@@ -139,18 +139,21 @@ libcosmic UI: search, pins, images, live updates via `HistoryChanged`, and `Togg
       to — and shows an explicit "clippod is not running" panel rather than an empty list that
       would read as a lost history.
 - [x] `Toggle()` on `com.nilfactor.ClippoApplet`, a second interface served by the applet and
-      called by the new `clippo show`. libcosmic turned out to support opening the popup
-      programmatically, so the standalone-window fallback was not taken; the reasoning is in
-      [DESIGN.md](DESIGN.md#decisions-on-record) and the popup-hosting layer is one file, so
-      taking it later stays cheap.
+      called by the new `clippo show`. libcosmic supports opening the picker programmatically;
+      what it cannot do is give an `xdg_popup` keyboard focus without an input serial, so the
+      picker is a layer surface with `KeyboardInteractivity::Exclusive`. The reasoning is in
+      [DESIGN.md](DESIGN.md#decisions-on-record), and the surface-hosting layer being one file
+      is what made the swap cheap when the gate below failed.
 - [x] Every action goes through the same D-Bus members the CLI uses — `Copy`, `Delete`, `Pin`,
       `Search`, `Reveal`. There is no second code path and no direct store access: the applet
       has no `clippo-store` dependency and cannot reach the history any other way.
 
-> **Gate:** the applet survives `cosmic-panel` being killed and restarted, and its popup takes
+> **Gate:** the applet survives `cosmic-panel` being killed and restarted, and its picker takes
 > keyboard focus when opened by `clippo show`. This is
-> [verification 6](#6-restart-resilience) below, and it is manual — the popup's keyboard focus
-> in particular cannot be settled by reading libcosmic's source, only by a compositor.
+> [verification 6](#6-restart-resilience) below, and it is manual — the picker's keyboard focus
+> in particular cannot be settled by reading libcosmic's source, only by a compositor. Run on a
+> host, it failed as an `xdg_popup` and the picker was moved to a layer surface; see DESIGN.md's
+> decisions section.
 
 ### M6 — packaging
 
@@ -298,12 +301,35 @@ unpinned remain.
       without the popup being reopened, and `clippo rm <id>` in a terminal removes that row.
 - [ ] `clippo show` from a terminal opens the picker, and a second `clippo show` closes it.
       Then bind it to `Super+V` as the README's "Global shortcut" section describes and repeat
-      — **the popup must take keyboard focus**, i.e. typing filters the list. This is the one
-      thing reading libcosmic's source could not settle: a popup opened from a global shortcut
-      has no input serial, so it gets no `xdg_popup` grab, and whether the compositor focuses
-      it anyway is cosmic-comp's decision. If it does not, DESIGN.md's standalone-window
-      fallback is what to take, and `clippo-applet`'s `surface` module is the only file it
-      touches.
+      — **the picker must take keyboard focus**, i.e. typing filters the list *and* `↑`/`↓`
+      move the highlight, with no click first. This was run and it **failed** as a popup: no
+      input serial from a global shortcut means no `xdg_popup` grab, and cosmic-comp gives an
+      ungrabbed popup no keyboard. The blinking caret was misleading — `text_input::focus` sets
+      the widget's own focus state, which is what the caret blinks off, not the compositor's.
+      The fallback was taken: the picker is now a `zwlr_layer_shell_v1` surface with
+      `KeyboardInteractivity::Exclusive`, which asks for focus on map. This was rerun on a real
+      session and **passes**: typing filters, `↑`/`↓` move the highlight, and `Escape` closes,
+      all with no click first. The three things the popup's grab used to do for free were
+      checked with it — `Escape` closes, the panel icon still toggles, and a second
+      `clippo show` still closes — because **a click outside the picker no longer dismisses
+      it**.
+
+      Getting there needed one thing that is not in the protocol. `cosmic-panel` proxies an
+      applet's layer surface out to `cosmic-comp` and forwards the reply back *only when the
+      size it returns differs from the size we asked for*
+      (`xdg_shell_wrapper/client/handlers/layer_shell.rs`, where `send_configure` is guarded by
+      `requested_size != configure.new_size`). Ask for a fully-specified size, get it granted
+      verbatim, and no configure is ever delivered — so iced never renders and never attaches a
+      buffer, while the compositor has already handed the surface the exclusive keyboard focus.
+      The symptom is a picker that is invisible and swallows every keystroke, with nothing
+      logged anywhere. The surface therefore asks for no size at all — anchored to all four
+      edges, both axes left to the compositor — which is what makes the two differ. It comes back
+      as the whole output, and the picker is centred inside it. If a future `cosmic-panel`
+      forwards the configure unconditionally, `surface.rs` can go back to asking for a size.
+- [ ] The picker is **centred on screen** and picker-sized, not stretched across the output and
+      not parked in a corner. A corner means something has shrunk the surface back to its
+      contents — `Context::popup_container` did exactly that, via the `Autosize` it returns, and
+      is why the frame in `surface.rs` is built by hand.
 - [ ] With clippo *not* on the panel, `clippo show` says the applet is not running and names
       the panel setting — not a raw bus error, and not the daemon's message.
 

@@ -345,7 +345,7 @@ start typing immediately, and nothing below needs the mouse.
 | `Delete` | Remove the highlighted entry. No confirmation — this is one row of a rolling history, and `clippo clear` is the destructive one. |
 | `Ctrl+P` | Pin or unpin. A pinned entry is exempt from retention and from `clear`. |
 | `Ctrl+R` | Show the highlighted entry's stored value in place, up to a bound. This is how a masked row is read — see below. |
-| `Escape` | Close without doing anything. |
+| `Escape` | Close without doing anything. Clicking outside the picker does *not* — see [the applet](#the-applet) for why. |
 
 The highlight follows the *entry*, not the row number. That matters because the list changes
 while you are looking at it: a copy made in another window arrives at the top and shifts every
@@ -360,8 +360,8 @@ looks like that.
 
 `Ctrl+R` calls `Reveal(id)` for that one row and shows the answer in place. It is **never
 cached**: the applet answers with it only while that same row is still highlighted, so moving
-the selection stops it being drawn, and it is dropped when the popup closes — whether you
-closed it or clicked away. The value is held zeroized from the moment it arrives, so dropping
+the selection stops it being drawn, and it is dropped when the picker closes — however it
+closed, including when the compositor took the focus away. The value is held zeroized from the moment it arrives, so dropping
 it wipes the memory rather than leaving the secret in a freed buffer for a core dump to pick
 up — with one honest gap: the buffer zbus deserialises the reply into is not clippo's to wipe.
 
@@ -428,10 +428,14 @@ Two things worth knowing about this path:
 
 - `clippo show` needs the **applet**, not just the daemon. A running `clippod` is not enough,
   and the error says so and names the panel setting.
-- A picker opened by a global shortcut has no input serial to hand the compositor, so it gets
-  no `xdg_popup` grab. Whether it takes keyboard focus anyway is cosmic-comp's call — it is
-  the one part of this that could not be settled by reading libcosmic, and it is on the
-  [verification list](docs/ROADMAP.md#6-restart-resilience).
+- A picker opened by a global shortcut has no input serial to hand the compositor, so it could
+  get no `xdg_popup` grab — and with no grab, no keyboard. That is why the picker is a layer
+  surface rather than a popup: layer shell can ask for keyboard focus outright. The visible
+  cost is that **clicking outside the picker does not close it**; `Escape` does, as does the
+  panel icon or a second `clippo show`.
+- The picker opens **in the middle of the screen** rather than under the panel icon. A layer
+  surface is positioned against the whole output rather than against the applet that opened it,
+  so it goes where COSMIC's other keyboard-opened surfaces go.
 
 ## Secrets
 

@@ -3,8 +3,8 @@
 //! Deliberately thin. The three things that are hard to get right live
 //! elsewhere and are tested there — [`crate::model`] owns the selection and the
 //! revealed value, [`crate::bus`] owns D-Bus, [`crate::surface`] owns the
-//! popup. What is left here is the wiring, which is the part a compositor is
-//! needed to exercise anyway.
+//! picker's surface. What is left here is the wiring, which is the part a
+//! compositor is needed to exercise anyway.
 //!
 //! # Every action is a D-Bus call the CLI also makes
 //!
@@ -29,6 +29,7 @@
 //! binding, and this is the cost.
 
 use cosmic::app::{Core, Task};
+use cosmic::iced::event::{wayland, PlatformSpecific};
 use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
 use cosmic::iced::window::Id;
 use cosmic::iced::{Event, Subscription};
@@ -65,6 +66,8 @@ pub enum Message {
     Opened(Id),
     /// A surface went away, possibly ours.
     Closed(Id),
+    /// A surface lost keyboard focus, possibly ours.
+    Unfocused(Id),
     /// The search field changed.
     QueryChanged(String),
     /// A row was clicked.
@@ -210,7 +213,7 @@ impl Clippo {
         // pointing at the entry the user just copied, not at row nine of the
         // list they were looking at then.
         self.model.restart();
-        let opening = self.picker.show(&self.core);
+        let opening = self.picker.show();
         // After `show` rather than before it, so that a picker which could not
         // open — no panel surface yet — does not spend a `Search` and a burst
         // of `Thumbnail` calls on a list nobody is going to see.
@@ -415,13 +418,20 @@ impl cosmic::Application for Clippo {
 
             Message::Closed(id) => {
                 if self.picker.closed(id) {
-                    // The popup is gone, so the revealed value goes with it —
+                    // The picker is gone, so the revealed value goes with it —
                     // M5's "not after the popup closes", for the path where the
                     // compositor closed it rather than the applet.
                     self.model.forget_revealed();
                 }
                 Task::none()
             }
+
+            // Stands in for the click-outside dismissal an `xdg_popup` grab did
+            // for free — see [`crate::surface`]. Routed through `dismiss` rather
+            // than through `Picker::closed` because the surface is still there:
+            // it has to be destroyed, not just forgotten.
+            Message::Unfocused(id) if self.picker.id() == Some(id) => self.dismiss(),
+            Message::Unfocused(_) => Task::none(),
 
             Message::QueryChanged(query) => {
                 self.model.set_query(query);
@@ -469,7 +479,7 @@ impl cosmic::Application for Clippo {
             return cosmic::widget::text("").into();
         }
         self.picker
-            .content(&self.core, view::picker(&self.model, &self.thumbnails))
+            .content(view::picker(&self.model, &self.thumbnails))
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -485,13 +495,34 @@ impl cosmic::Application for Clippo {
                         modifiers,
                         ..
                     }) => action_for(&key, modifiers).map(Message::Key),
-                    // The only route to knowing the popup's surface exists. The
+                    // The only route to knowing the picker's surface exists. The
                     // `Application` trait has `on_close_requested` for the other
                     // half of this and no counterpart for the opening, so it is
                     // read off the runtime's event stream instead.
                     Event::Window(cosmic::iced::window::Event::Opened { .. }) => {
                         Some(Message::Opened(window))
                     }
+                    // A layer surface is not dismissed by a click outside it the
+                    // way a popup with a grab was, so losing keyboard focus is
+                    // what stands in for that.
+                    //
+                    // It has to be read from the Wayland event rather than from
+                    // `window::Event::Unfocused`, which iced only emits for a
+                    // real window: a layer surface's keyboard leave arrives as
+                    // `LayerEvent::Unfocused` and nothing else
+                    // (`iced/winit/src/platform_specific/wayland/sctk_event.rs`,
+                    // the `KeyboardEventVariant::Leave` arm, which matches on
+                    // the surface kind).
+                    //
+                    // The picker being closed by the *compositor* needs nothing
+                    // here: `LayerEvent::Done` is one of the two events libcosmic
+                    // turns into `on_close_requested`, so it already arrives as
+                    // `Message::Closed`.
+                    Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::Layer(
+                        wayland::LayerEvent::Unfocused,
+                        _,
+                        id,
+                    ))) => Some(Message::Unfocused(id)),
                     _ => None,
                 }
             }),
