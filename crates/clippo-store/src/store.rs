@@ -178,16 +178,6 @@ impl Store {
         self.retention = retention;
     }
 
-    /// The limits this store enforces after every insert.
-    pub fn retention(&self) -> Retention {
-        self.retention
-    }
-
-    /// The largest image blob this store will accept, in bytes.
-    pub fn max_image_bytes(&self) -> u64 {
-        self.max_image_bytes
-    }
-
     /// The underlying connection, for the schema tests.
     #[cfg(test)]
     pub(crate) fn connection(&self) -> &Connection {
@@ -221,7 +211,7 @@ impl Store {
     /// Three things happen around the write itself:
     ///
     /// - **The image cap.** An image flavor over
-    ///   [`max_image_bytes`](Store::max_image_bytes) is not stored. If it is
+    ///   [`Config::max_image_bytes`] is not stored. If it is
     ///   the entry's canonical flavor, the whole insert is refused with
     ///   [`StoreError::ImageTooLarge`] rather than stored short — see
     ///   [`Store::storable_flavors`].
@@ -287,7 +277,7 @@ impl Store {
         tx.commit()?;
 
         if !swept.is_empty() {
-            self.reclaim()?;
+            self.reclaim_after("insert");
         }
         Ok(insertion)
     }
@@ -382,10 +372,15 @@ impl Store {
         match images::thumbnail(&source.data) {
             Ok(png) => Some(Flavor::new(images::THUMBNAIL_MIME, png)),
             Err(error) => {
+                // `?` rather than `%`: the `Display` of both variants is a fixed
+                // string, so a decompression bomb refused by the decode
+                // allocation limit and a genuinely corrupt image log
+                // identically. What tells them apart is the `image` error in
+                // `#[source]`, which only the `Debug` form carries.
                 tracing::warn!(
                     mime = %source.mime,
                     bytes = source.data.len(),
-                    error = %error,
+                    error = ?error,
                     "clippo stored a copied image without a thumbnail"
                 );
                 None
@@ -454,7 +449,7 @@ impl Store {
             .conn
             .execute("DELETE FROM entries WHERE id = ?1", [id.get()])?;
         if deleted > 0 {
-            self.reclaim()?;
+            self.reclaim_after("delete");
         }
         Ok(deleted > 0)
     }
@@ -479,7 +474,7 @@ impl Store {
                 include_pinned,
                 "clippo cleared the clipboard history"
             );
-            self.reclaim()?;
+            self.reclaim_after("clear");
         }
         Ok(deleted)
     }
@@ -493,7 +488,7 @@ impl Store {
     pub fn enforce_retention(&mut self, now: Timestamp) -> Result<Sweep, StoreError> {
         let swept = retention::sweep(&self.conn, &self.retention, now)?;
         if !swept.is_empty() {
-            self.reclaim()?;
+            self.reclaim_after("enforce_retention");
         }
         Ok(swept)
     }
@@ -507,21 +502,57 @@ impl Store {
     /// than to the size of the database, so a no-op call is cheap but a
     /// pointless one still costs a statement.
     ///
-    /// It matters here more than it would elsewhere. An 8 MB screenshot that
-    /// retention dropped would otherwise stay on disk as reusable free space
-    /// inside an encrypted file the user cannot inspect — technically deleted,
-    /// indefinitely resident, and impossible to reassure anyone about.
+    /// It matters here more than it would elsewhere. A history of 8 MB
+    /// screenshots that retention keeps dropping and replacing would otherwise
+    /// grow to the high-water mark of everything it ever held and stay there,
+    /// which is a file size nothing in the user's configuration explains. The
+    /// *contents* of those pages are already gone — SQLCipher forces
+    /// `PRAGMA secure_delete` on, so a freed page is zeroed in place before it
+    /// reaches the free list — so this is about the size of the file, not about
+    /// blobs lingering inside it.
     ///
     /// Stepped to completion by hand rather than run through `execute_batch`.
     /// `PRAGMA incremental_vacuum` frees **one page per step**, so the obvious
     /// one-line spelling silently reclaims a single 4 KB page and leaves the
     /// rest of an 8 MB screenshot on the free list — a bug that looks exactly
     /// like working code.
+    ///
+    /// Callers go through [`Store::reclaim_after`]; see there for why a failure
+    /// is not the caller's failure.
     fn reclaim(&self) -> Result<(), StoreError> {
         let mut statement = self.conn.prepare("PRAGMA incremental_vacuum")?;
         let mut rows = statement.query([])?;
         while rows.next()?.is_some() {}
         Ok(())
+    }
+
+    /// [`Store::reclaim`] as housekeeping: log a failure, never report one.
+    ///
+    /// Every caller runs this *after* its own write is committed and durable.
+    /// Propagating a vacuum error from there would tell the caller that the
+    /// operation it asked for failed, when it did not: `clear` would report
+    /// failure with the history already gone — and running it again returns
+    /// `Ok(0)`, so the user is left with no way to make the reported failure
+    /// come true — and `insert` would report a lost copy that is in fact stored,
+    /// which at M3 means no `HistoryChanged` for a row the applet then does not
+    /// know about.
+    ///
+    /// Failing to *shrink* a file is not failing to delete rows, and it is
+    /// recoverable in a way a swallowed result is not: the pages stay on the
+    /// free list and the next successful call picks them up. Deferring is
+    /// exactly what incremental vacuum is for. `warn!` rather than `error!` for
+    /// the same reason — nothing is wrong with the history, only with the file's
+    /// size, and only until the next delete.
+    fn reclaim_after(&self, operation: &'static str) {
+        if let Err(error) = self.reclaim() {
+            tracing::warn!(
+                operation,
+                error = ?error,
+                "clippo could not reclaim the space a delete freed. The database file \
+                 stays its current size until a later delete vacuums it; the deleted \
+                 entries are gone either way"
+            );
+        }
     }
 
     /// Pin or unpin an entry. Returns whether there was such an entry.
@@ -1360,6 +1391,36 @@ mod tests {
         drop(store);
         let store = temp.open();
         assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_reclaim_that_fails_is_logged_rather_than_reported_as_a_failed_delete() {
+        // Reclaiming runs after the delete is already committed, so an error
+        // from it must not become the caller's error: a `clear` that reports
+        // failure with the history already gone leaves the user with nothing to
+        // retry — the second run returns Ok(0) — and an `insert` that reports
+        // failure with the row stored is a history M3's applet never hears about.
+        let temp = Temp::new();
+        let mut store = temp.open();
+        store.insert(&text(1_000, "something to free")).unwrap();
+
+        // The delete itself succeeds, and reports what it did.
+        assert_eq!(store.clear(false).unwrap(), 1);
+        assert_eq!(store.count().unwrap(), 0);
+
+        // Now make the vacuum genuinely fail — this is the probe that keeps the
+        // rest of the test from passing vacuously, because `reclaim_after`
+        // swallowing an error only means anything if there is one to swallow.
+        store.conn.execute_batch("PRAGMA query_only = ON;").unwrap();
+        assert!(
+            store.reclaim().is_err(),
+            "the probe has to actually break the vacuum"
+        );
+
+        // Swallowed: no panic, nothing to propagate, and the history the delete
+        // emptied is still empty.
+        store.reclaim_after("test");
+        assert_eq!(store.count().unwrap(), 0);
     }
 
     /// The ids in the history, newest use first.
