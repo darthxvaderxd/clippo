@@ -16,6 +16,7 @@
 use std::io::{self, Write};
 
 use clap::Parser;
+use clippo_core::display::is_invisible_or_reordering;
 use clippo_wayland::{
     Flavor, Selection, SelectionKind, WatchConfig, WatchEvent, DEFAULT_MAX_FLAVOR_BYTES,
     PASSWORD_MANAGER_HINT_MIME,
@@ -260,6 +261,11 @@ fn is_text(mime: &str) -> bool {
 
 /// The first `max_chars` characters, quoted, with control characters escaped so
 /// a multi-line copy stays on one line of output.
+///
+/// Quoting is this tool's own — a flavor dump shows `\n` where it sits, rather
+/// than collapsing whitespace the way a list column does — but which characters
+/// are dangerous is not: that set is [`is_invisible_or_reordering`], shared with
+/// the CLI's table and the applet's rows.
 fn preview(data: &[u8], max_chars: usize) -> String {
     let text = String::from_utf8_lossy(data);
     let mut out = String::new();
@@ -289,26 +295,6 @@ fn preview(data: &[u8], max_chars: usize) -> String {
     } else {
         format!("\"{out}\"")
     }
-}
-
-/// Characters `char::is_control` misses that a terminal still acts on.
-///
-/// `is_control` is category Cc only. The bidi overrides and isolates are Cf,
-/// and a copied string containing one visually reorders the rest of the line —
-/// the size column, and every flavor printed after it. Same hazard as the ESC
-/// case above, so it is escaped the same way. The zero-width characters are
-/// here because "invisible in a preview" defeats the point of the preview.
-fn is_invisible_or_reordering(c: char) -> bool {
-    matches!(c,
-        '\u{00ad}'              // soft hyphen
-        | '\u{061c}'            // arabic letter mark
-        | '\u{180e}'            // mongolian vowel separator
-        | '\u{200b}'..='\u{200f}' // zero-width space … RTL mark
-        | '\u{202a}'..='\u{202e}' // bidi embeddings and overrides
-        | '\u{2060}'..='\u{206f}' // word joiner, isolates, deprecated formatting
-        | '\u{feff}'            // zero-width no-break space / BOM
-        | '\u{fff9}'..='\u{fffb}' // interlinear annotation
-    )
 }
 
 #[cfg(test)]

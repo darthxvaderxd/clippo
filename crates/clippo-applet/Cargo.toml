@@ -6,7 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-rust-version.workspace = true
+# Not the workspace's 1.75: libcosmic is edition 2024 and declares 1.93, so a
+# crate that depends on it cannot honestly claim to build on anything older.
+# Every other crate here still can, which is why this is the one override and
+# why `clippy.toml` has no workspace-wide `msrv` key.
+rust-version = "1.93"
 
 [[bin]]
 name = "clippo-applet"

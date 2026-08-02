@@ -1,5 +1,9 @@
-# Keep lints in step with the workspace MSRV.
-msrv = "1.75"
+# No `msrv` key on purpose, so clippy reads each crate's own `rust-version`
+# from its `Cargo.toml`. There is no longer one number for the workspace:
+# `clippo-applet` depends on libcosmic, which is edition 2024 and declares 1.93,
+# while every other crate here really does still build on 1.75. A single value
+# here would have to be one or the other, and either way it would be wrong for
+# most of the workspace.
 
 # Clipboard blobs and D-Bus payloads make some functions legitimately wide;
 # these thresholds are a little looser than the defaults on purpose.

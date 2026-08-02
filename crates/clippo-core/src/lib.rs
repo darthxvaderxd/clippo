@@ -10,6 +10,10 @@
 //! - [`secrets`] — detection and masking, the differentiating feature: three
 //!   separable rules producing one `sensitive` flag, and the display-only
 //!   [`mask`] that flag drives. Its knobs are [`SecretsConfig`].
+//! - [`display`] — making a preview safe to show. Previews are arbitrary
+//!   copied bytes, and the escape sequences and bidi overrides in them mislead
+//!   a panel row as readily as a terminal column, so every frontend shares one
+//!   set rather than keeping its own.
 //!
 //! ```no_run
 //! let config = clippo_core::Config::load()?;
@@ -18,11 +22,13 @@
 //! ```
 
 pub mod config;
+pub mod display;
 pub mod entry;
 pub mod paths;
 pub mod secrets;
 
 pub use config::{Config, ConfigError, SecretsConfig};
+pub use display::{is_invisible_or_reordering, one_line};
 pub use entry::{Entry, EntryId, EntryKind, Flavor, NewEntry, ParseEntryKindError, Timestamp};
 pub use paths::PathError;
 pub use secrets::{detect, is_sensitive, mask, Signal, PASSWORD_MANAGER_HINT_MIME};

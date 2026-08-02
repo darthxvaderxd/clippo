@@ -25,9 +25,8 @@
 
 use std::fmt;
 
+use clippo_core::display::one_line;
 use clippo_ipc::EntrySummary;
-
-use crate::render;
 
 /// Why the id a user typed does not name exactly one entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +70,7 @@ impl fmt::Display for ResolveError {
                 f,
                 "`{}` is not an entry id. Ids are the numbers in the ID column of \
                  `clippo list`, and may be shortened to any unambiguous start",
-                render::one_line(typed, TYPED_ECHO_CHARS)
+                one_line(typed, TYPED_ECHO_CHARS)
             ),
             ResolveError::NoSuchEntry {
                 typed,
@@ -151,7 +150,7 @@ pub fn resolve(typed: &str, entries: &[EntrySummary]) -> Result<i64, ResolveErro
                 .iter()
                 .map(|entry| Candidate {
                     id: entry.id,
-                    preview: render::one_line(&entry.preview, CANDIDATE_PREVIEW_CHARS),
+                    preview: one_line(&entry.preview, CANDIDATE_PREVIEW_CHARS),
                 })
                 .collect(),
         }),
