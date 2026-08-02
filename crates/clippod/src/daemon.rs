@@ -179,6 +179,33 @@ impl Daemon {
         self.paused.load(Ordering::Relaxed)
     }
 
+    /// Apply the retention limits to a history that has been sitting idle.
+    ///
+    /// Retention normally runs inside `Store::insert`, so a daemon nobody has
+    /// copied anything into since Friday has not swept: entries can pass the
+    /// age limit while it idles. This is the pass that covers the gap, at
+    /// startup.
+    ///
+    /// It is a *write*, which is why it belongs here rather than in `main`'s
+    /// setup: a second `clippod` must not delete rows out of a database the
+    /// running one is serving from, so this is called only once the well-known
+    /// name is ours. See [`crate::main`]'s ordering.
+    pub async fn sweep_retention(&self, now: Timestamp) -> Result<(), StoreError> {
+        let mut state = self.state.lock().await;
+        let swept = state.store.enforce_retention(now)?;
+        if !swept.is_empty() {
+            info!(
+                expired = swept.expired,
+                over_capacity = swept.over_capacity,
+                "clippo dropped entries that had fallen outside its retention limits"
+            );
+        }
+        // Through `commit` like every other mutation, so the cache cannot be
+        // left holding entries the sweep has just deleted.
+        self.commit(state, !swept.is_empty()).await;
+        Ok(())
+    }
+
     /// Run a mutation, then reload the cache and announce the change.
     ///
     /// `changed` says whether anything actually happened: a `Delete` of an id
@@ -258,32 +285,30 @@ impl ClippoBackend for Daemon {
         Ok(state.cache.search(query, limit as usize))
     }
 
-    /// Move an entry back to the front of the history.
+    /// Put an entry back on the clipboard — **not implemented yet**, and it
+    /// says so.
     ///
-    /// **The clipboard itself is not touched yet.** Offering a stored entry
-    /// back to the compositor needs `clippo-wayland`'s source half and the
-    /// self-echo guard that goes with it, which is the next milestone; M1a
-    /// implemented watching only. Everything on the store side of `Copy` is
-    /// here, and each call says plainly in the journal what it did and did not
-    /// do, because a `Copy` that silently pasted the previous clipboard would
-    /// be worse than one that says so.
+    /// Offering a stored entry back to the compositor needs `clippo-wayland`'s
+    /// source half and the self-echo guard that goes with it, which is the next
+    /// milestone; M1a implemented watching only. Until that lands, the honest
+    /// answer is an error: a caller that got `Ok(())` would paste whatever was
+    /// on the clipboard before and have nothing to tell them why — and
+    /// `clippo copy 2` followed by Ctrl-V is precisely the ROADMAP check a user
+    /// would run.
+    ///
+    /// The store half is not done either. Moving the entry to the front records
+    /// a use that did not happen, so a `busctl` poke would silently reorder the
+    /// real history; the `touch` belongs with the paste, in the same call that
+    /// earns it.
     async fn copy(&self, id: i64) -> fdo::Result<()> {
-        let id = EntryId::new(id);
-        let mut state = self.state.lock().await;
-        let touched = state
-            .store
-            .touch(id, Timestamp::now())
-            .map_err(|error| failed("copy", error))?;
-        if !touched {
-            return Err(no_such_entry(id));
-        }
-        self.commit(state, true).await;
         warn!(
-            id = id.get(),
-            "Copy moved this entry to the front of the history but did not put it on the \
-             clipboard: the copy-back offer path is not implemented yet"
+            id,
+            "Copy did nothing: putting an entry back on the clipboard is not implemented yet"
         );
-        Ok(())
+        Err(fdo::Error::NotSupported(format!(
+            "clippo cannot put entry {id} back on the clipboard yet: the copy-back offer path is \
+             not implemented. The history is unchanged"
+        )))
     }
 
     async fn delete(&self, id: i64) -> fdo::Result<()> {
@@ -685,14 +710,12 @@ mod tests {
         assert_eq!(fixture.daemon.reveal(summary.id).await.unwrap(), whole);
     }
 
+    /// `Copy` is absent from this list on purpose: it refuses every id, known
+    /// or not, until it can actually paste one.
     #[tokio::test]
     async fn an_unknown_id_is_an_argument_error_on_every_member_that_takes_one() {
         let fixture = Fixture::new();
         let missing = 4_242;
-        assert!(matches!(
-            fixture.daemon.copy(missing).await,
-            Err(fdo::Error::InvalidArgs(_))
-        ));
         assert!(matches!(
             fixture.daemon.delete(missing).await,
             Err(fdo::Error::InvalidArgs(_))
@@ -762,15 +785,61 @@ mod tests {
         assert_eq!(fixture.emitted(), 0);
     }
 
+    /// `Copy` cannot paste yet, so it must not report a success it did not
+    /// have — and must not reorder the history to record a use that never
+    /// happened. Both halves land together, next milestone.
     #[tokio::test]
-    async fn copy_moves_an_entry_to_the_front_of_the_history() {
+    async fn copy_refuses_rather_than_reporting_a_paste_that_did_not_happen() {
         let fixture = Fixture::new();
         fixture.capture(&["first", "second"]).await;
-        assert_eq!(fixture.previews().await, ["second", "first"]);
-
         let oldest = fixture.daemon.search("first", 1).await.unwrap()[0].id;
-        fixture.daemon.copy(oldest).await.expect("copy");
-        assert_eq!(fixture.previews().await, ["first", "second"]);
-        assert_eq!(fixture.emitted(), 3);
+
+        assert!(matches!(
+            fixture.daemon.copy(oldest).await,
+            Err(fdo::Error::NotSupported(_))
+        ));
+        assert_eq!(
+            fixture.previews().await,
+            ["second", "first"],
+            "the history is untouched"
+        );
+        assert_eq!(fixture.emitted(), 2, "two captures and nothing else");
+    }
+
+    /// The startup sweep goes through the same commit path as every other
+    /// mutation, so what it evicts leaves search as well as the database.
+    #[tokio::test]
+    async fn the_startup_retention_sweep_reloads_the_cache_and_announces_itself() {
+        let fixture = Fixture::new();
+        fixture.capture(&["first", "second", "third"]).await;
+        let before = fixture.emitted();
+
+        fixture
+            .daemon
+            .state
+            .lock()
+            .await
+            .store
+            .set_retention(Retention {
+                max_entries: 1,
+                max_age: None,
+            });
+        fixture
+            .daemon
+            .sweep_retention(Timestamp::from_unix_millis(2_000))
+            .await
+            .expect("the sweep should run");
+
+        assert_eq!(fixture.previews().await, ["third"]);
+        assert!(fixture.daemon.search("first", 10).await.unwrap().is_empty());
+        assert_eq!(fixture.emitted(), before + 1);
+
+        // A sweep that dropped nothing is not a change, so it wakes nobody.
+        fixture
+            .daemon
+            .sweep_retention(Timestamp::from_unix_millis(2_001))
+            .await
+            .expect("the second sweep should run");
+        assert_eq!(fixture.emitted(), before + 1);
     }
 }

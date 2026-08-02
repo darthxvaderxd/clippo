@@ -37,6 +37,10 @@ pub trait Clippo {
 
     /// Put this entry back on the clipboard and move it to the front of the
     /// history.
+    ///
+    /// Today's `clippod` cannot do this yet and answers `NotSupported` with a
+    /// message saying so; the history is left alone. A frontend should show
+    /// that error rather than treat the paste as done.
     fn copy(&self, id: i64) -> zbus::Result<()>;
 
     /// Remove one entry, pinned or not.

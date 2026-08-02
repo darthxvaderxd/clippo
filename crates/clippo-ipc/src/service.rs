@@ -32,6 +32,11 @@ pub trait ClippoBackend: Send + Sync + 'static {
     async fn search(&self, query: &str, limit: u32) -> fdo::Result<Vec<EntrySummary>>;
 
     /// Put this entry back on the clipboard and move it to the front.
+    ///
+    /// An implementation that cannot yet offer to the compositor —
+    /// `clippod` until the source half of `clippo-wayland` lands — returns
+    /// [`fdo::Error::NotSupported`] and changes nothing, rather than doing the
+    /// store half and letting a caller believe it pasted.
     async fn copy(&self, id: i64) -> fdo::Result<()>;
 
     /// Remove one entry, pinned or not.

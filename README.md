@@ -10,7 +10,7 @@ pasting the real value.
 
 > **Status:** M3. Capture, encrypted storage and the daemon are in: `clippod` records every copy
 > and serves `com.nilfactor.Clippo` on the session bus. Still to come — putting an entry back on
-> the clipboard (`Copy` moves it to the front of the history but does not paste yet), masking of
+> the clipboard (`Copy` answers "not implemented yet" and leaves the history alone), masking of
 > suspected secrets, the CLI and the applet. See the roadmap for what lands when.
 
 ## ⚠️ Build and run from a host terminal, not RustRover's Flatpak

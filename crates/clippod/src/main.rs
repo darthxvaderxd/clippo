@@ -17,14 +17,20 @@
 //!
 //! # The shape of a run
 //!
-//! 1. Read the config, get the database key, open the store and sweep whatever
-//!    went stale while the daemon was not running.
+//! 1. Read the config, get the database key and open the store.
 //! 2. Load every preview into memory — [`cache`], where search happens.
 //! 3. Connect to the **session** bus, export the object, *then* take the
 //!    well-known name. In that order, so there is no instant in which the name
 //!    exists and the object behind it does not.
-//! 4. Start the Wayland watcher on its own thread and record what it captures.
-//! 5. Run until SIGTERM or Ctrl-C.
+//! 4. Sweep whatever went stale while the daemon was not running.
+//! 5. Start the Wayland watcher on its own thread and record what it captures.
+//! 6. Run until SIGTERM or Ctrl-C.
+//!
+//! Nothing before step 3 changes an entry: opening the store creates a schema
+//! or converts an old file's vacuum mode, and step 2 only reads. That is what
+//! makes a second `clippod` harmless — it exits at the name request without
+//! having deleted a row from the database the first one is serving out of,
+//! which the first one's cache would not notice until the next copy.
 //!
 //! # Two threads, one runtime
 //!
@@ -37,11 +43,11 @@
 //!
 //! # What is not here yet
 //!
-//! `Copy(id)` moves an entry to the front of the history but does not put it
-//! back on the clipboard: offering a stored entry to the compositor needs
-//! `clippo-wayland`'s source half and the self-echo guard that goes with it,
-//! which is the next milestone. Each call says so in the journal rather than
-//! reporting a success that did not happen. Masking is M4 — until then
+//! `Copy(id)` does not put an entry back on the clipboard: offering a stored
+//! entry to the compositor needs `clippo-wayland`'s source half and the
+//! self-echo guard that goes with it, which is the next milestone. It returns
+//! an error saying so rather than reporting a success that did not happen, and
+//! leaves the history alone until it can. Masking is M4 — until then
 //! `sensitive` is set from the password-manager MIME hint and previews go out as
 //! stored; see [`preview`], which is the one function that changes.
 //!
@@ -120,7 +126,7 @@ async fn run(logging: &str) -> anyhow::Result<()> {
         .context("clippo could not get the key to its history database")?;
     info!(source = %key_source, "clippo has its database key");
 
-    let mut store = Store::open_default(&database_key)
+    let store = Store::open_default(&database_key)
         .context("clippo could not open its history database")?
         .with_config(&config);
     // The key has done its job; the connection holds what it needs. Dropping it
@@ -128,20 +134,6 @@ async fn run(logging: &str) -> anyhow::Result<()> {
     // the entire lifetime of a daemon that runs for weeks.
     drop(database_key);
     info!(path = %store.path().display(), "clippo opened its history database");
-
-    // Retention normally runs after each copy. A daemon nobody has copied
-    // anything into since Friday has not swept, so entries can pass the age
-    // limit while it idles — this is the pass that covers the gap.
-    let swept = store
-        .enforce_retention(Timestamp::now())
-        .context("clippo could not apply its retention limits")?;
-    if !swept.is_empty() {
-        info!(
-            expired = swept.expired,
-            over_capacity = swept.over_capacity,
-            "clippo dropped entries that had fallen outside its retention limits"
-        );
-    }
 
     let connection = Connection::session().await.context(
         "clippo could not connect to the session bus. clippod is a session service: it needs \
@@ -162,8 +154,18 @@ async fn run(logging: &str) -> anyhow::Result<()> {
     acquire_name(&connection).await?;
     info!(name = BUS_NAME, path = OBJECT_PATH, "clippo is serving");
 
+    // The first write of the run, and deliberately the first thing after the
+    // name: a second clippod is refused above, so it exits without having
+    // deleted rows from a database the running daemon is serving out of. Its
+    // cache would not learn about that until somebody copied something, so it
+    // would go on listing entries that no longer exist.
+    daemon
+        .sweep_retention(Timestamp::now())
+        .await
+        .context("clippo could not apply its retention limits")?;
+
     // Only now start capturing. A second clippod must die at the name request,
-    // before it has watched a clipboard or written a row.
+    // before it has watched a clipboard or changed a row.
     let (watcher, mut selections) = clippo_wayland::watch(watch_config(&config))
         .context("clippo could not watch the clipboard")?;
     info!(
