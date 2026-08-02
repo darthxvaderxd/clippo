@@ -153,6 +153,10 @@ impl Selection {
     ///
     /// Advertising the marker is the signal, so this answers yes even when the
     /// marker flavor itself was dropped.
+    ///
+    /// Scanning `flavors` as well is belt and braces: the watcher only ever
+    /// fetches what was advertised, so the two lists cannot diverge here — but
+    /// a `Selection` built by hand elsewhere could omit `advertised`.
     pub fn has_password_manager_hint(&self) -> bool {
         self.advertised
             .iter()

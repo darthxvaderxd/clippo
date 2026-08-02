@@ -98,7 +98,8 @@ Reading a block:
   the size cap says so and names the cap; it is never silently missing.
 - A **`⚠ x-kde-passwordManagerHint present`** line means the source tagged the copy as a
   credential. That flavor's *presence* is the signal, so it gets called out rather than left to
-  be spotted in the advertised list.
+  be spotted in the advertised list. The warning is all it is — the flavors themselves are
+  still printed in full, marker included.
 
 Useful flags:
 
@@ -114,8 +115,10 @@ stdout, so `clippo-watch > capture.log` keeps them separate.
 If it exits saying no data-control manager bound, check `$WAYLAND_DISPLAY` — that is the
 Flatpak socket problem above, and the error prints the value it actually saw.
 
-Note that previews are real clipboard contents: anything you copy while this is running ends up
-in your scrollback.
+**Nothing is redacted.** Previews are real clipboard contents — passwords and tokens included,
+since masking them would hide exactly what this tool exists to show. Anything you copy while it
+is running ends up in your scrollback, and in `capture.log` if you redirect it. `--help` says
+the same thing.
 
 ## Layout
 

@@ -13,7 +13,7 @@
 //! if a block needs a fact this binary cannot see, that fact belongs on
 //! [`Selection`], not in a second copy of the client.
 
-use std::io;
+use std::io::{self, Write};
 
 use clap::Parser;
 use clippo_wayland::{
@@ -33,7 +33,12 @@ const DEFAULT_PREVIEW_CHARS: usize = 72;
     long_about = "Print every clipboard selection and its flavors.\n\n\
                   Run this from a host terminal (cosmic-term), not from a \
                   Flatpak: the proxied Wayland socket filters out the \
-                  data-control protocol this depends on."
+                  data-control protocol this depends on.\n\n\
+                  NOTHING IS REDACTED. Text flavors are printed as they were \
+                  copied, including passwords and tokens — masking them would \
+                  hide exactly what this tool exists to show. Anything you copy \
+                  while it runs ends up in your scrollback, and in the file if \
+                  you redirect it."
 )]
 struct Args {
     /// Also watch the middle-click primary selection.
@@ -78,13 +83,15 @@ fn main() {
         }
     };
 
-    println!(
-        "clippo-watch: bound {} on WAYLAND_DISPLAY={}",
+    // `writeln!` rather than `println!`: under `clippo-watch | head` stdout can
+    // already be gone, and a diagnostic tool should not die of a panic on the
+    // way out. The read loop below notices the same failure and stops cleanly.
+    let _ = writeln!(
+        io::stdout(),
+        "clippo-watch: bound {} on WAYLAND_DISPLAY={}\n              \
+         per-flavor cap {} B, primary capture {}. Copy something; Ctrl-C to stop.",
         watcher.protocol(),
-        wayland_display()
-    );
-    println!(
-        "              per-flavor cap {} B, primary capture {}. Copy something; Ctrl-C to stop.",
+        wayland_display(),
         args.max_bytes,
         if args.primary { "on" } else { "off" }
     );
@@ -126,8 +133,13 @@ fn report_failure(error: &clippo_wayland::Error) {
     );
 }
 
+/// The socket we actually saw. Exported-but-empty reads as unset rather than as
+/// nothing at all, so the line is never ambiguous about what it found.
 fn wayland_display() -> String {
-    std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "<unset>".to_owned())
+    std::env::var("WAYLAND_DISPLAY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "<unset>".to_owned())
 }
 
 /// One block per selection: what was offered, what came back, and what did not.
@@ -214,20 +226,26 @@ fn mime_width<'a>(mimes: impl Iterator<Item = &'a str>) -> usize {
 
 /// What to show for a flavor's contents.
 ///
-/// Only text is previewed. A PNG written raw to a terminal is at best noise and
-/// at worst a pile of escape sequences the terminal obeys, so binary flavors
-/// report their size and nothing else.
+/// Text is previewed verbatim — this tool redacts nothing, because hiding
+/// clipboard contents is the one thing it must not do. A PNG written raw to a
+/// terminal is at best noise and at worst a pile of escape sequences the
+/// terminal obeys, so binary flavors report their size and nothing else.
 fn render(flavor: &Flavor, preview_chars: usize) -> String {
-    if clippo_wayland::is_password_manager_hint(&flavor.mime) {
-        format!(
-            "<marker, {} bytes — its presence is the signal>",
-            flavor.data.len()
-        )
-    } else if is_text(&flavor.mime) {
+    if is_previewable(&flavor.mime) {
         preview(&flavor.data, preview_chars)
     } else {
         format!("<binary, {} bytes, not printed>", flavor.data.len())
     }
+}
+
+/// Which flavors are shown rather than counted.
+///
+/// `text/*`, plus the password-manager marker: its payload is short text
+/// (conventionally the fixed string `secret`) and is printed like anything
+/// else. The `⚠` line above the table is what makes its *presence* visible —
+/// that is the signal, and it does not depend on hiding the bytes.
+fn is_previewable(mime: &str) -> bool {
+    is_text(mime) || clippo_wayland::is_password_manager_hint(mime)
 }
 
 fn is_text(mime: &str) -> bool {
@@ -253,7 +271,9 @@ fn preview(data: &[u8], max_chars: usize) -> String {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             // Anything else the terminal would act on rather than show.
-            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c if c.is_control() || is_invisible_or_reordering(c) => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32))
+            }
             c => out.push(c),
         }
     }
@@ -263,6 +283,26 @@ fn preview(data: &[u8], max_chars: usize) -> String {
     } else {
         format!("\"{out}\"")
     }
+}
+
+/// Characters `char::is_control` misses that a terminal still acts on.
+///
+/// `is_control` is category Cc only. The bidi overrides and isolates are Cf,
+/// and a copied string containing one visually reorders the rest of the line —
+/// the size column, and every flavor printed after it. Same hazard as the ESC
+/// case above, so it is escaped the same way. The zero-width characters are
+/// here because "invisible in a preview" defeats the point of the preview.
+fn is_invisible_or_reordering(c: char) -> bool {
+    matches!(c,
+        '\u{00ad}'              // soft hyphen
+        | '\u{061c}'            // arabic letter mark
+        | '\u{180e}'            // mongolian vowel separator
+        | '\u{200b}'..='\u{200f}' // zero-width space … RTL mark
+        | '\u{202a}'..='\u{202e}' // bidi embeddings and overrides
+        | '\u{2060}'..='\u{206f}' // word joiner, isolates, deprecated formatting
+        | '\u{feff}'            // zero-width no-break space / BOM
+        | '\u{fff9}'..='\u{fffb}' // interlinear annotation
+    )
 }
 
 #[cfg(test)]
@@ -312,6 +352,18 @@ mod tests {
         assert!(!escaped.contains('\x1b'));
     }
 
+    /// `char::is_control` is category Cc only. A right-to-left override is Cf,
+    /// and left raw it reorders the columns printed after the preview.
+    #[test]
+    fn bidi_and_zero_width_characters_are_escaped_too() {
+        assert_eq!(preview("a\u{202e}b".as_bytes(), 72), "\"a\\u{202e}b\"");
+        assert_eq!(preview("a\u{2066}b".as_bytes(), 72), "\"a\\u{2066}b\"");
+        assert_eq!(preview("a\u{200b}b".as_bytes(), 72), "\"a\\u{200b}b\"");
+        assert_eq!(preview("a\u{feff}b".as_bytes(), 72), "\"a\\u{feff}b\"");
+        // Ordinary non-ASCII text is left readable.
+        assert_eq!(preview("naïve → café".as_bytes(), 72), "\"naïve → café\"");
+    }
+
     #[test]
     fn quotes_and_backslashes_are_escaped() {
         assert_eq!(preview(br#"say "hi"\ok"#, 72), r#""say \"hi\"\\ok""#);
@@ -342,11 +394,14 @@ mod tests {
         );
     }
 
+    /// Nothing is redacted, the marker included — the `⚠` line is what makes its
+    /// presence visible, not the withholding of its payload.
     #[test]
-    fn the_password_marker_is_never_previewed() {
-        let rendered = render(&flavor(PASSWORD_MANAGER_HINT_MIME, b"secret"), 72);
-        assert!(!rendered.contains("secret"), "{rendered}");
-        assert!(rendered.contains("presence is the signal"), "{rendered}");
+    fn the_password_marker_payload_is_shown_like_any_other_flavor() {
+        assert_eq!(
+            render(&flavor(PASSWORD_MANAGER_HINT_MIME, b"secret"), 72),
+            "\"secret\""
+        );
     }
 
     #[test]
@@ -445,8 +500,10 @@ mod tests {
             )),
             "{rendered}"
         );
-        // The marker's payload is not the signal and is never echoed.
-        assert!(!rendered.contains("secret"), "{rendered}");
+        // The warning is the signal; the payloads either side of it are still
+        // printed in full, because this tool redacts nothing.
+        assert!(rendered.contains("\"hunter2\""), "{rendered}");
+        assert!(rendered.contains("\"secret\""), "{rendered}");
     }
 
     #[test]
