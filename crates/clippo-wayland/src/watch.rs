@@ -17,9 +17,9 @@ use wayland_client::backend::ObjectId;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::{Connection, EventQueue};
 
-use crate::flavor::{DropReason, PendingSelection, Push};
+use crate::flavor::{PendingSelection, Push};
 use crate::protocol::{DataControlSink, Device, Manager, Offer};
-use crate::{mime, Error, Selection, SelectionKind, WatchConfig};
+use crate::{mime, DropReason, Error, Selection, SelectionKind, WatchConfig};
 
 /// How much we take off a pipe per `read`. Bounded so that a flavor cannot
 /// overshoot its cap by more than one chunk before we notice.
@@ -279,10 +279,11 @@ impl DataControlSink for WatchState {
                 advertised = advertised.len(),
                 "selection has no flavor clippo can use"
             );
-            offer.destroy();
-            return;
+            // Still emitted, with nothing but the advertised list: "the
+            // clipboard changed and clippo kept none of it" is a fact worth
+            // reporting, and `clippo-watch` exists to report it.
         }
-        self.start_reads(kind, offer, wanted);
+        self.start_reads(kind, offer, advertised, wanted);
     }
 
     fn device_finished(&mut self) {
@@ -294,12 +295,21 @@ impl DataControlSink for WatchState {
 
 impl WatchState {
     /// Open one pipe per interesting flavor and drive them all from the loop.
-    fn start_reads(&mut self, kind: SelectionKind, offer: Offer, wanted: Vec<String>) {
+    ///
+    /// `wanted` may be empty, in which case the selection completes immediately
+    /// and is emitted carrying only `advertised`.
+    fn start_reads(
+        &mut self,
+        kind: SelectionKind,
+        offer: Offer,
+        advertised: Vec<String>,
+        wanted: Vec<String>,
+    ) {
         self.generation += 1;
         let generation = self.generation;
         let cap = self.config.max_flavor_bytes;
 
-        let mut selection = PendingSelection::new(generation, kind);
+        let mut selection = PendingSelection::new(generation, kind, advertised);
         let mut read_tokens = HashMap::with_capacity(wanted.len());
 
         for mime in wanted {
@@ -315,19 +325,24 @@ impl WatchState {
             }
         }
 
-        let timeout_token = self
-            .handle
-            .insert_source(
-                Timer::from_duration(self.config.flavor_read_timeout),
-                move |_instant, _, state| {
-                    state.on_read_timeout(generation);
-                    TimeoutAction::Drop
-                },
-            )
-            .map_err(|error| {
-                warn!(error = %error.error, "could not arm the flavor read timeout");
-            })
-            .ok();
+        // Nothing left open means nothing to time out; arming the timer anyway
+        // would only make the emit below immediately tear it down again.
+        let timeout_token = if selection.is_complete() {
+            None
+        } else {
+            self.handle
+                .insert_source(
+                    Timer::from_duration(self.config.flavor_read_timeout),
+                    move |_instant, _, state| {
+                        state.on_read_timeout(generation);
+                        TimeoutAction::Drop
+                    },
+                )
+                .map_err(|error| {
+                    warn!(error = %error.error, "could not arm the flavor read timeout");
+                })
+                .ok()
+        };
 
         trace!(
             ?kind,
@@ -442,20 +457,16 @@ impl WatchState {
             return;
         };
         self.clear_sources(&mut pending);
-
-        for (mime, reason) in pending.selection.dropped() {
-            warn!(%mime, %reason, "dropped a flavor");
-        }
         pending.offer.destroy();
 
-        let kind = pending.selection.kind();
-        let Some(selection) = pending.selection.into_selection() else {
-            debug!(?kind, "selection produced no usable flavors");
-            return;
-        };
+        let selection = pending.selection.into_selection();
+        for dropped in &selection.dropped {
+            warn!(mime = %dropped.mime, reason = %dropped.reason, "dropped a flavor");
+        }
         trace!(
-            ?kind,
+            kind = ?selection.kind,
             flavors = selection.flavors.len(),
+            dropped = selection.dropped.len(),
             "captured a selection"
         );
 

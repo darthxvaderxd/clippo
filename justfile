@@ -28,8 +28,9 @@ run-applet:
     cargo run -p clippo-applet
 
 # Debug watcher from M1: print every selection and its flavors.
-watch:
-    cargo run -p clippo-wayland --bin clippo-watch
+# Takes the binary's flags: `just watch --max-bytes 1024`
+watch *ARGS:
+    cargo run -p clippo-wayland --bin clippo-watch -- {{ARGS}}
 
 test:
     cargo test --workspace

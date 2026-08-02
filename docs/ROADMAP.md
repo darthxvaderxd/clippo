@@ -20,8 +20,20 @@ flavors.
 This comes first deliberately: the data-control client is the one component where protocol
 surprises can invalidate the design, so it should fail early if it's going to fail.
 
+- [x] Bind a data-control manager, preferring `ext_data_control_v1` and falling back to
+      `zwlr_data_control_v1`, and report which one bound.
+- [x] Fail with a message naming both protocols and the live `$WAYLAND_DISPLAY` when neither
+      binds, so the Flatpak-socket cause is diagnosable from the output alone.
+- [x] Watch the seat's selection, collect each offer's advertised MIME types, and receive every
+      interesting flavor into one atomic `Selection`.
+- [x] Cap each flavor and drop rather than truncate what exceeds it, carrying the reason
+      through to the caller instead of dropping it silently.
+- [x] `clippo-watch` prints one block per selection: advertised types, which were fetched with
+      their byte sizes and a preview, which were dropped and why, and which were skipped.
+
 > **Gate:** run `clippo-watch` from a host terminal, copy text / an image / a file, and see all
-> flavors printed for each.
+> flavors printed for each. This is [verification 1](#1-protocol-availability) below, and it is
+> manual — there is no compositor in CI.
 
 ### M2 — storage
 
@@ -64,11 +76,19 @@ echo $WAYLAND_DISPLAY
 
 ### 1. Protocol availability
 
-Run `cargo run -p clippo-wayland --bin clippo-watch` from `cosmic-term`. Copy plain text,
-formatted text from a browser, a file in `cosmic-files`, and a screenshot. Each should print
-its full flavor list.
+Run `cargo run -p clippo-wayland --bin clippo-watch` from `cosmic-term`. It prints which
+protocol it bound, then one block per copy. Each should print its full flavor list:
 
-If it reports no data-control manager, you are on the Flatpak-proxied socket.
+- [ ] Plain text from `cosmic-term` — `text/plain;charset=utf-8` and `text/plain`.
+- [ ] Formatted text from a browser — `text/html` alongside the plain-text flavors.
+- [ ] A file selected in `cosmic-files` — `text/uri-list`.
+- [ ] A screenshot — `image/png`, reported as binary with its size rather than dumped.
+- [ ] A password copied from KeePassXC — the `x-kde-passwordManagerHint` line appears.
+- [ ] `--max-bytes 1024`, then copy a screenshot — `image/png` is listed under `dropped:`
+      naming the cap, not silently missing.
+
+If it reports no data-control manager, you are on the Flatpak-proxied socket; the error names
+both protocols and prints the `$WAYLAND_DISPLAY` it saw.
 
 ### 2. Round trip
 

@@ -4,7 +4,7 @@
 //! Nothing here touches Wayland or file descriptors, which is what makes the
 //! interesting half of the capture path testable without a compositor.
 
-use crate::{Flavor, Selection, SelectionKind};
+use crate::{DropReason, DroppedFlavor, Flavor, Selection, SelectionKind};
 
 /// What the caller should do after handing bytes to a flavor buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,30 +15,6 @@ pub(crate) enum Push {
     OverCap,
     /// The slot was already resolved; the bytes went nowhere.
     Closed,
-}
-
-/// Why a flavor did not make it into the finished selection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DropReason {
-    /// The source produced more than the configured per-flavor cap.
-    OverCap { cap: usize },
-    /// Reading the pipe failed.
-    Io(String),
-    /// The source never closed its end of the pipe in time.
-    Stalled,
-    /// The read could not be started at all.
-    Setup(String),
-}
-
-impl std::fmt::Display for DropReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OverCap { cap } => write!(f, "exceeded the {cap} byte per-flavor cap"),
-            Self::Io(e) => write!(f, "read failed: {e}"),
-            Self::Stalled => write!(f, "source never closed the pipe"),
-            Self::Setup(e) => write!(f, "read could not be started: {e}"),
-        }
-    }
 }
 
 /// One flavor being read, with a hard ceiling on how much it may accumulate.
@@ -123,15 +99,19 @@ enum Slot {
 pub(crate) struct PendingSelection {
     generation: u64,
     kind: SelectionKind,
+    /// Every MIME type the offer advertised, kept so the finished selection can
+    /// report what was on offer and not just what came back.
+    advertised: Vec<String>,
     slots: Vec<Slot>,
     open: usize,
 }
 
 impl PendingSelection {
-    pub(crate) fn new(generation: u64, kind: SelectionKind) -> Self {
+    pub(crate) fn new(generation: u64, kind: SelectionKind, advertised: Vec<String>) -> Self {
         Self {
             generation,
             kind,
+            advertised,
             slots: Vec::new(),
             open: 0,
         }
@@ -139,10 +119,6 @@ impl PendingSelection {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation
-    }
-
-    pub(crate) fn kind(&self) -> SelectionKind {
-        self.kind
     }
 
     /// Reserve a slot for a flavor whose read is about to start.
@@ -204,37 +180,29 @@ impl PendingSelection {
         self.open == 0
     }
 
-    /// Flavors that will not appear in the finished selection, with the reason.
-    pub(crate) fn dropped(&self) -> Vec<(&str, &DropReason)> {
-        self.slots
-            .iter()
-            .filter_map(|slot| match slot {
-                Slot::Dropped { mime, reason } => Some((mime.as_str(), reason)),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// Consume the bookkeeping into the selection it collected.
     ///
-    /// `None` when nothing survived — an empty selection is not worth a message.
-    pub(crate) fn into_selection(self) -> Option<Selection> {
+    /// A selection with nothing left is still produced. It carries what was
+    /// advertised and why each flavor went missing, which is what makes a
+    /// failed capture diagnosable instead of invisible; callers that only want
+    /// storable content check [`Selection::is_empty`].
+    pub(crate) fn into_selection(self) -> Selection {
         debug_assert!(self.is_complete(), "selection emitted while still reading");
-        let flavors: Vec<Flavor> = self
-            .slots
-            .into_iter()
-            .filter_map(|slot| match slot {
-                Slot::Done(flavor) => Some(flavor),
-                _ => None,
-            })
-            .collect();
-        if flavors.is_empty() {
-            None
-        } else {
-            Some(Selection {
-                kind: self.kind,
-                flavors,
-            })
+        let mut flavors = Vec::new();
+        let mut dropped = Vec::new();
+        for slot in self.slots {
+            match slot {
+                Slot::Done(flavor) => flavors.push(flavor),
+                Slot::Dropped { mime, reason } => dropped.push(DroppedFlavor { mime, reason }),
+                // Unreachable once complete; discarding beats panicking here.
+                Slot::Reading(_) => {}
+            }
+        }
+        Selection {
+            kind: self.kind,
+            advertised: self.advertised,
+            flavors,
+            dropped,
         }
     }
 
@@ -268,7 +236,16 @@ mod tests {
     const CAP: usize = 16;
 
     fn pending() -> PendingSelection {
-        PendingSelection::new(1, SelectionKind::Clipboard)
+        PendingSelection::new(1, SelectionKind::Clipboard, Vec::new())
+    }
+
+    /// The drop list of a finished selection, as `(mime, reason)` pairs.
+    fn drops(selection: &Selection) -> Vec<(&str, &DropReason)> {
+        selection
+            .dropped
+            .iter()
+            .map(|dropped| (dropped.mime.as_str(), &dropped.reason))
+            .collect()
     }
 
     #[test]
@@ -329,7 +306,13 @@ mod tests {
 
     #[test]
     fn all_flavors_arrive_in_one_selection_in_offer_order() {
-        let mut pending = pending();
+        let mut pending = PendingSelection::new(
+            1,
+            SelectionKind::Clipboard,
+            ["text/plain;charset=utf-8", "text/plain", "TIMESTAMP"]
+                .map(String::from)
+                .to_vec(),
+        );
         let utf8 = pending.expect_flavor("text/plain;charset=utf-8".into(), CAP);
         let plain = pending.expect_flavor("text/plain".into(), CAP);
         // Interleaved, as independent readers would deliver them.
@@ -338,11 +321,13 @@ mod tests {
         pending.finish(plain);
         pending.finish(utf8);
 
-        let selection = pending.into_selection().expect("two flavors survived");
+        let selection = pending.into_selection();
         assert_eq!(selection.kind, SelectionKind::Clipboard);
         let mimes: Vec<&str> = selection.flavors.iter().map(|f| f.mime.as_str()).collect();
         assert_eq!(mimes, ["text/plain;charset=utf-8", "text/plain"]);
         assert_eq!(selection.flavor("text/plain").unwrap().data, b"hi");
+        // What the source offered survives the capture, fetched or not.
+        assert_eq!(selection.skipped(), ["TIMESTAMP"]);
     }
 
     #[test]
@@ -357,23 +342,33 @@ mod tests {
 
         // Blowing the cap resolves the flavor on the spot.
         assert!(pending.is_complete());
-        assert_eq!(
-            pending.dropped(),
-            vec![("image/png", &DropReason::OverCap { cap: CAP })]
-        );
 
-        let selection = pending.into_selection().expect("the text flavor survived");
+        let selection = pending.into_selection();
         assert_eq!(selection.flavors.len(), 1);
         assert_eq!(selection.flavors[0].mime, "text/plain");
+        assert_eq!(
+            drops(&selection),
+            vec![("image/png", &DropReason::OverCap { cap: CAP })]
+        );
     }
 
+    /// Nothing survived, but *why* nothing survived is the whole point of the
+    /// message — `clippo-watch` has no other way to report it.
     #[test]
-    fn a_selection_with_nothing_left_is_not_emitted() {
-        let mut pending = pending();
+    fn a_selection_with_nothing_left_still_reports_what_it_lost() {
+        let mut pending =
+            PendingSelection::new(1, SelectionKind::Clipboard, vec!["image/png".to_owned()]);
         let image = pending.expect_flavor("image/png".into(), CAP);
         pending.drop_flavor(image, DropReason::Io("broken pipe".into()));
         assert!(pending.is_complete());
-        assert!(pending.into_selection().is_none());
+
+        let selection = pending.into_selection();
+        assert!(selection.is_empty());
+        assert_eq!(selection.advertised, ["image/png"]);
+        assert_eq!(
+            drops(&selection),
+            vec![("image/png", &DropReason::Io("broken pipe".into()))]
+        );
     }
 
     #[test]
@@ -386,14 +381,14 @@ mod tests {
 
         assert_eq!(pending.abandon_open(DropReason::Stalled), 1);
         assert!(pending.is_complete());
-        assert_eq!(
-            pending.dropped(),
-            vec![("text/uri-list", &DropReason::Stalled)]
-        );
 
-        let selection = pending.into_selection().expect("the finished flavor stays");
+        let selection = pending.into_selection();
         assert_eq!(selection.flavors.len(), 1);
         assert_eq!(selection.flavors[0].data, b"done");
+        assert_eq!(
+            drops(&selection),
+            vec![("text/uri-list", &DropReason::Stalled)]
+        );
     }
 
     #[test]
@@ -410,7 +405,7 @@ mod tests {
 
         pending.finish(html);
         assert!(pending.is_complete());
-        assert_eq!(pending.into_selection().unwrap().flavors.len(), 2);
+        assert_eq!(pending.into_selection().flavors.len(), 2);
     }
 
     #[test]

@@ -16,6 +16,15 @@ path = "src/lib.rs"
 [[bin]]
 name = "clippo-watch"
 path = "src/bin/clippo-watch.rs"
+required-features = ["watch-bin"]
+
+[features]
+default = ["watch-bin"]
+# The `clippo-watch` debug binary, and the argument-parsing and log-formatting
+# crates only it needs. On by default so `cargo run --bin clippo-watch` just
+# works; `clippod` can take this crate with `default-features = false` at M3
+# rather than inheriting a second CLI parser and log formatter.
+watch-bin = ["dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
 wayland-client = { workspace = true }
@@ -27,3 +36,6 @@ rustix = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+
+clap = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }

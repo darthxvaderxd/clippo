@@ -74,17 +74,68 @@ impl fmt::Debug for Flavor {
     }
 }
 
+/// Why a flavor the source advertised did not make it into the selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropReason {
+    /// The source produced more than the configured per-flavor cap.
+    OverCap {
+        /// The cap, in bytes, that rejected it.
+        cap: usize,
+    },
+    /// Reading the pipe failed.
+    Io(String),
+    /// The source never closed its end of the pipe in time.
+    Stalled,
+    /// The read could not be started at all.
+    Setup(String),
+}
+
+impl fmt::Display for DropReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OverCap { cap } => write!(f, "exceeded the {cap} byte per-flavor cap"),
+            Self::Io(e) => write!(f, "read failed: {e}"),
+            Self::Stalled => write!(f, "source never closed the pipe"),
+            Self::Setup(e) => write!(f, "read could not be started: {e}"),
+        }
+    }
+}
+
+/// A flavor clippo asked for but does not have.
+///
+/// Carried alongside the surviving flavors rather than dropped on the floor: a
+/// missing flavor is a fact about the selection, and silently omitting it makes
+/// "why did nothing get stored?" unanswerable from the outside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedFlavor {
+    /// The MIME type as the source advertised it.
+    pub mime: String,
+    /// What went wrong.
+    pub reason: DropReason,
+}
+
 /// Every interesting flavor of a single copy, captured together.
 ///
 /// The watcher emits one of these per selection. It never emits a message per
 /// flavor: a half-captured selection is worse than none, because downstream
 /// would store an entry that pastes back incompletely.
+///
+/// A selection with no surviving [`flavors`](Self::flavors) is still emitted —
+/// it carries what was advertised and what was dropped, which is the only
+/// record of a copy clippo could not keep. Callers that only want storable
+/// content check [`Selection::is_empty`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct Selection {
     /// Which clipboard this came from.
     pub kind: SelectionKind,
-    /// The flavors, in the order the source advertised them.
+    /// Every MIME type the offer advertised, in the order it advertised them,
+    /// including the ones clippo never asked for.
+    pub advertised: Vec<String>,
+    /// The flavors that were read in full, in the order the source advertised
+    /// them.
     pub flavors: Vec<Flavor>,
+    /// The flavors clippo asked for and did not get.
+    pub dropped: Vec<DroppedFlavor>,
 }
 
 impl Selection {
@@ -93,11 +144,36 @@ impl Selection {
         self.flavors.iter().find(|flavor| flavor.mime == mime)
     }
 
+    /// Whether nothing survived capture, leaving only the diagnostics.
+    pub fn is_empty(&self) -> bool {
+        self.flavors.is_empty()
+    }
+
     /// Whether the source tagged this selection as a password-manager copy.
+    ///
+    /// Advertising the marker is the signal, so this answers yes even when the
+    /// marker flavor itself was dropped.
+    ///
+    /// Scanning `flavors` as well is belt and braces: the watcher only ever
+    /// fetches what was advertised, so the two lists cannot diverge here — but
+    /// a `Selection` built by hand elsewhere could omit `advertised`.
     pub fn has_password_manager_hint(&self) -> bool {
-        self.flavors
+        self.advertised
             .iter()
-            .any(|flavor| mime::is_password_manager_hint(&flavor.mime))
+            .chain(self.flavors.iter().map(|flavor| &flavor.mime))
+            .any(|mime| mime::is_password_manager_hint(mime))
+    }
+
+    /// Advertised MIME types clippo never asked for, deduplicated, in the order
+    /// the source advertised them.
+    pub fn skipped(&self) -> Vec<&str> {
+        let mut skipped: Vec<&str> = Vec::new();
+        for mime in &self.advertised {
+            if !mime::is_interesting(mime) && !skipped.contains(&mime.as_str()) {
+                skipped.push(mime);
+            }
+        }
+        skipped
     }
 }
 
@@ -105,7 +181,9 @@ impl fmt::Debug for Selection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Selection")
             .field("kind", &self.kind)
+            .field("advertised", &self.advertised)
             .field("flavors", &self.flavors)
+            .field("dropped", &self.dropped)
             .finish()
     }
 }
@@ -238,6 +316,10 @@ mod tests {
     fn a_selection_exposes_its_flavors_and_the_password_hint() {
         let selection = Selection {
             kind: SelectionKind::Clipboard,
+            advertised: vec![
+                "text/plain".to_owned(),
+                PASSWORD_MANAGER_HINT_MIME.to_owned(),
+            ],
             flavors: vec![
                 Flavor {
                     mime: "text/plain".to_owned(),
@@ -248,10 +330,60 @@ mod tests {
                     data: b"secret".to_vec(),
                 },
             ],
+            dropped: Vec::new(),
         };
         assert_eq!(selection.flavor("text/plain").unwrap().data, b"s3cret");
         assert!(selection.flavor("text/html").is_none());
         assert!(selection.has_password_manager_hint());
+        assert!(!selection.is_empty());
         assert!(!format!("{selection:?}").contains("s3cret"));
+    }
+
+    /// The marker's *presence* is the signal, so it still counts when the
+    /// marker flavor itself never made it back.
+    #[test]
+    fn the_password_hint_counts_even_when_its_flavor_was_dropped() {
+        let selection = Selection {
+            kind: SelectionKind::Clipboard,
+            advertised: vec![PASSWORD_MANAGER_HINT_MIME.to_owned()],
+            flavors: Vec::new(),
+            dropped: vec![DroppedFlavor {
+                mime: PASSWORD_MANAGER_HINT_MIME.to_owned(),
+                reason: DropReason::Stalled,
+            }],
+        };
+        assert!(selection.has_password_manager_hint());
+        assert!(selection.is_empty());
+    }
+
+    #[test]
+    fn skipped_lists_uninteresting_advertised_flavors_once_in_order() {
+        let selection = Selection {
+            kind: SelectionKind::Clipboard,
+            advertised: [
+                "TIMESTAMP",
+                "text/plain",
+                "TARGETS",
+                "TIMESTAMP",
+                "text/rtf",
+            ]
+            .map(String::from)
+            .to_vec(),
+            flavors: Vec::new(),
+            dropped: Vec::new(),
+        };
+        assert_eq!(
+            selection.skipped(),
+            ["TIMESTAMP", "TARGETS", "text/rtf"],
+            "fetchable flavors are not 'skipped', and repeats are listed once"
+        );
+    }
+
+    #[test]
+    fn the_over_cap_reason_names_the_cap_that_rejected_the_flavor() {
+        assert_eq!(
+            DropReason::OverCap { cap: 1024 }.to_string(),
+            "exceeded the 1024 byte per-flavor cap"
+        );
     }
 }
