@@ -14,4 +14,13 @@ name = "clippo"
 path = "src/main.rs"
 
 [dependencies]
+clap = { workspace = true }
+clippo-core = { workspace = true }
 clippo-ipc = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# The blocking half of zbus, deliberately: the CLI makes one or two calls and
+# exits, so an async runtime here would be a dependency and a nested-executor
+# footgun in exchange for nothing. `clippo-ipc` generates both proxies from the
+# same declarations, so this is the same interface the daemon serves.
+zbus = { workspace = true }

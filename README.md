@@ -8,10 +8,11 @@ pasting the real value.
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, components, and the decisions on record.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — build order (M0–M6) and how each stage is verified.
 
-> **Status:** M3. Capture, encrypted storage and the daemon are in: `clippod` records every copy
-> and serves `com.nilfactor.Clippo` on the session bus. Still to come — putting an entry back on
-> the clipboard (`Copy` answers "not implemented yet" and leaves the history alone), masking of
-> suspected secrets, the CLI and the applet. See the roadmap for what lands when.
+> **Status:** M3. Capture, encrypted storage, the daemon and the `clippo` CLI are in: `clippod`
+> records every copy and serves `com.nilfactor.Clippo` on the session bus, and the CLI reaches
+> all of it from a terminal. Still to come — putting an entry back on the clipboard (`clippo
+> copy` reports that the daemon cannot do it yet, and the history is left alone), masking of
+> suspected secrets, and the applet. See the roadmap for what lands when.
 
 ## ⚠️ Build and run from a host terminal, not RustRover's Flatpak
 
@@ -58,17 +59,11 @@ From a host terminal, for the reason above. It reads the config, opens the encry
 takes the name `com.nilfactor.Clippo` on the **session** bus and starts recording. A second
 `clippod` exits non-zero saying the name is taken rather than running as a silent duplicate.
 
-There is no CLI yet, so poke it with `busctl` in the meantime:
+Talk to it with the `clippo` CLI below, or poke the interface directly with `busctl`:
 
 ```sh
 busctl --user introspect com.nilfactor.Clippo /com/nilfactor/Clippo com.nilfactor.Clippo
-busctl --user call com.nilfactor.Clippo /com/nilfactor/Clippo com.nilfactor.Clippo List uu 10 0
-busctl --user call com.nilfactor.Clippo /com/nilfactor/Clippo com.nilfactor.Clippo Search su "todo" 5
-busctl --user call com.nilfactor.Clippo /com/nilfactor/Clippo com.nilfactor.Clippo SetPaused b true
 ```
-
-`List` and `Search` return previews; `Reveal x <id>` is the only member that returns a whole
-stored value. **Until M4 lands, a preview is not masked** — a copied password shows as itself.
 
 Logging is `tracing`. Under systemd it goes to the journal with real priorities
 (`journalctl --user -u clippod -f`); run by hand it goes to stderr. `CLIPPO_LOG` sets the
@@ -77,6 +72,97 @@ verbosity, falling back to `RUST_LOG`, defaulting to `info`:
 ```sh
 CLIPPO_LOG=clippod=debug,clippo_wayland=debug just run-daemon
 ```
+
+## The CLI
+
+`clippo` is the client, and every subcommand is one call to the running daemon — it never
+opens the history database itself. With `clippod` running:
+
+```sh
+cargo run -p clippo-cli -- list      # or `just run-cli list`, or the built ./target/debug/clippo
+```
+
+| Command | What it does |
+|---|---|
+| `clippo list [-n N] [--offset N] [--json]` | The history, most recently used first. Defaults to 20 entries; `-n 0` is all of them. |
+| `clippo search QUERY [-n N] [--json]` | Fuzzy-match the previews, best match first. |
+| `clippo copy ID` | Put that entry back on the clipboard. |
+| `clippo pin ID` / `clippo pin ID --off` | Pin or unpin. A pinned entry is exempt from retention and from `clear`. |
+| `clippo rm ID...` | Delete entries, pinned or not. |
+| `clippo clear [--yes] [--include-pinned]` | Delete the whole history. Asks first. |
+| `clippo pause on` / `off` / *(nothing)* | Stop recording, resume recording, or print `paused` / `recording`. |
+| `clippo reveal ID` | Print an entry's whole value to stdout. |
+
+`clippo <command> --help` has the detail. Two conventions worth knowing:
+
+- **stdout is data, stderr is talk.** The table, `--json` and a revealed value go to stdout;
+  confirmations and errors go to stderr. `clippo reveal 2 > key.pem` writes the value and
+  nothing else, and a failure is still visible in the terminal.
+- **Errors exit non-zero.** Including a `clear` you answered `n` to.
+
+### Naming an entry
+
+The `ID` column is a number you can shorten. An id that exists is always itself — `12` is entry
+12 even when 120 and 127 exist — and otherwise any unambiguous *start* of an id works, so
+`clippo copy 14` finds entry 142. A prefix that could mean several entries is refused with the
+list of candidates rather than guessing:
+
+```
+$ clippo copy 1
+clippo: `1` could mean any of these 3 entries — type more of the id:
+   12  hunter2 second line
+  120  a long preview that goes on and on and …
+  127  image/png, 2.0 KB
+```
+
+`clippo rm` takes several ids at once. They are all resolved before anything is deleted, so one
+bad reference fails the command rather than half of it, and two references to the same entry —
+`clippo rm 1 12` where `1` can only mean 12 — delete it once.
+
+### Reading a list
+
+```
+$ clippo list
+ ID  AGE  KIND   FL  PREVIEW
+  3   6s  text   ..  hello from cosmic-term
+ 12   1m  text   .s  hunter2 second line
+120   3h  html   p.  a long preview that goes on and on and on and on and on and on …
+127   4d  image  ..  image/png, 2.0 KB
+```
+
+`AGE` is since the entry was last used. `FL` is two flags: `p` when the entry is pinned, `s`
+when clippo suspects a password or a token. The preview is cut to fit the column — `--json`
+carries the daemon's whole preview, its timestamps as Unix milliseconds, and every other field
+under the same name, which is what to script against.
+
+### Terminal safety
+
+A preview is whatever somebody copied, which includes escape sequences and right-to-left
+overrides — printed raw, those repaint a terminal or reorder a row so that it shows one entry's
+text next to another's id. So the table is flattened to one line and escaped first:
+`\u{1b}[31m` is shown, not obeyed.
+
+`--json` keeps the daemon's whole preview, newlines and all, because a script wants the value
+rather than a column's rendering of it — but it is still safe to look at. The characters that
+matter come out as `\uXXXX`, which is JSON's own spelling for them, so what a script decodes is
+exactly what was stored and only the display changes.
+
+`clippo reveal` is the deliberate exception. It exists to be redirected or piped, and a value
+that came back altered would be the wrong value — so it prints exactly what was stored, with no
+trailing newline added. Its `--help` says so. Redirect it when you do not know what the entry
+holds.
+
+### When the daemon is not running
+
+Every subcommand fails with the same line rather than a raw D-Bus error:
+
+```
+$ clippo list
+clippo: clippod is not running — nothing owns com.nilfactor.Clippo on the session bus. Start it
+with `systemctl --user start clippod`, or run it in a host terminal with `cargo run -p clippod`
+```
+
+(The systemd unit itself arrives with packaging in M6; until then, `just run-daemon`.)
 
 ## Debugging capture
 
