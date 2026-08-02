@@ -58,13 +58,29 @@ below.
 
 ## Installing
 
+Four steps, none of them needing root, in a host terminal rather than a Flatpak — see the
+warning at the top of this file. Installing from the wrong one installs perfectly well and
+then captures nothing.
+
 ```sh
-just install
-systemctl --user enable --now clippod
+just install                              # 1. build and place the files
+systemctl --user enable --now clippod     # 2. start recording, now and on every login
 ```
 
-That is the whole of it, and it needs no root. `just install` does a release build and then
-puts everything in the XDG user locations:
+3. **Add clippo to the panel** — **Settings → Desktop → Panel → Configure panel applets**.
+4. **Bind a shortcut**, if you want one — **Settings → Keyboard → Shortcuts → Custom
+   shortcuts**, the command `clippo show` and the key `Super+V`.
+
+Only the first two are `just`'s to do; the last two are COSMIC settings, and the sections
+below say why each is a manual step. Steps 3 and 4 are optional in the sense that `clippo
+list` and `clippo copy` work without them — but `Super+V` needs *both*, because `clippo show`
+asks the panel applet to open, and a shortcut with no applet to talk to fails every time you
+press it.
+
+When all four are done, `clippo list` shows what you have copied, `Super+V` opens the picker,
+and `systemctl --user status clippod` says `active (running)`.
+
+`just install` does a release build and then puts everything in the XDG user locations:
 
 | What | Where |
 |---|---|
@@ -90,12 +106,15 @@ down with it. `install` deliberately does *not* enable it for you — starting a
 then owns your clipboard is not something to do to somebody as a side effect of copying
 files.
 
-Then add clippo to the panel: **Settings → Desktop → Panel → Configure panel applets**. The
-`.desktop` file's `X-CosmicApplet=true` is what puts it in that list.
+Adding clippo to the panel is **Settings → Desktop → Panel → Configure panel applets**, and
+what puts it in that list is the `.desktop` file's `X-CosmicApplet=true`. It is a manual step
+because a panel is somebody's own arrangement — [The applet](#the-applet) is what you get, and
+what it does with the keyboard once it is open.
 
-Everything above still has to happen in a host terminal rather than a Flatpak — see the
-warning at the top of this file. Installing from the wrong one installs perfectly well and
-then captures nothing.
+The `Super+V` shortcut is manual for a different reason: COSMIC owns global shortcuts and
+clippo does not register one for itself. [Global shortcut](#global-shortcut) has the GUI route
+above written out, the RON file to edit instead, and the two things that most often make a
+binding do nothing.
 
 ### Installing somewhere else
 
