@@ -46,3 +46,45 @@ jobs:
       # skips, and a skipped test that reports a pass is worse than no test.
       - name: cargo test
         run: dbus-run-session -- cargo test --workspace
+
+  # Separate job because it needs neither Rust nor the build: `res/` is data,
+  # and nothing in `cargo test` looks at it. Without this, a typo in the
+  # `.desktop` file is only found by installing on the target host and
+  # wondering why clippo is missing from the panel applet list.
+  resources:
+    name: desktop + appstream + icons
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            desktop-file-utils \
+            appstream \
+            libxml2-utils
+
+      - name: Validate the applet .desktop entry
+        run: desktop-file-validate res/com.nilfactor.Clippo.desktop
+
+      - name: Validate the AppStream metainfo
+        run: appstreamcli validate res/com.nilfactor.Clippo.metainfo.xml
+
+      # `X-CosmicApplet=true` is what puts clippo in COSMIC's panel-applet
+      # list. desktop-file-validate has no opinion about it — an X- key is
+      # valid whatever it says — so losing it would pass every check above and
+      # only show up as clippo silently not being offered on the panel.
+      - name: X-CosmicApplet is still set
+        run: grep -qx 'X-CosmicApplet=true' res/com.nilfactor.Clippo.desktop
+
+      - name: Icons are well-formed SVG
+        run: xmllint --noout res/icons/hicolor/*/apps/*.svg
+
+      # The unit is not run here — there is no COSMIC session and no systemd
+      # user manager on a runner — but the two directives clippo depends on
+      # can at least be asserted to still be in it.
+      - name: The unit still says what it has to say
+        run: |
+          grep -qx 'WantedBy=cosmic-session.target' res/clippod.service
+          grep -qx 'Restart=on-failure' res/clippod.service

@@ -32,7 +32,7 @@ use cosmic::app::{Core, Task};
 use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
 use cosmic::iced::window::Id;
 use cosmic::iced::{Event, Subscription};
-use cosmic::Element;
+use cosmic::{widget, Element};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -44,10 +44,17 @@ use crate::view;
 
 /// The panel icon.
 ///
-/// `edit-paste-symbolic` rather than a clippo-specific icon because M5 ships no
-/// icon theme — M6 does. A name every icon theme has is better than a missing
-/// glyph in the panel.
-const PANEL_ICON: &str = "edit-paste-symbolic";
+/// M6 ships this one, at `res/icons/hicolor/symbolic/apps/`, and `just install`
+/// puts it in the icon theme.
+const PANEL_ICON: &str = "com.nilfactor.Clippo-symbolic";
+
+/// What to draw when clippo's own icon is not in the theme.
+///
+/// Which is the ordinary case for a build run straight out of the repo: the
+/// applet is perfectly usable without `just install`, and a missing glyph in
+/// the panel would be the first thing anyone doing that saw. `edit-paste` is a
+/// freedesktop standard name, so every icon theme has one.
+const PANEL_ICON_FALLBACK: &str = "edit-paste-symbolic";
 
 /// What the UI reacts to.
 #[derive(Debug, Clone)]
@@ -438,9 +445,20 @@ impl cosmic::Application for Clippo {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        // Spelled out rather than `applet.icon_button(PANEL_ICON)`, which is
+        // otherwise exactly this, because that helper takes a name and so
+        // cannot carry a fallback. Everything else here — symbolic, and the
+        // panel's suggested size — is what it does.
+        let handle = widget::icon::from_name(PANEL_ICON)
+            .symbolic(true)
+            .size(self.core.applet.suggested_size(true).0)
+            .fallback(Some(widget::icon::IconFallback::Names(vec![
+                PANEL_ICON_FALLBACK.into(),
+            ])));
+
         self.core
             .applet
-            .icon_button(PANEL_ICON)
+            .icon_button_from_handle(handle.into())
             .on_press(Message::IconPressed)
             .into()
     }

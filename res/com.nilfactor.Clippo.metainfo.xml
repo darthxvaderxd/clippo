@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 the clippo authors -->
+<component type="desktop-application">
+  <id>com.nilfactor.Clippo</id>
+
+  <name>Clippo</name>
+  <summary>Clipboard history for COSMIC that never shows a password in full</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+
+  <description>
+    <p>
+      Clippo is a clipboard-history manager built natively for the COSMIC desktop, which
+      ships none of its own. A background daemon records every copy; a panel applet and a
+      command-line client read the same history over D-Bus.
+    </p>
+    <p>
+      It is built around the thing most clipboard managers get wrong. A clipboard history is
+      a list of the last few hundred things you copied, and some of them were passwords, so
+      clippo encrypts its history at rest and never renders a suspected secret in full.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>History encrypted at rest with SQLCipher, keyed from the Secret Service</li>
+      <li>Suspected passwords and API tokens shown masked, while still pasting in full</li>
+      <li>A keyboard-first panel picker with fuzzy search, bindable to a global shortcut</li>
+      <li>Text, HTML, file lists and images, each stored with every flavour it was copied in</li>
+      <li>Pinned entries, exempt from retention and from clearing the history</li>
+      <li>A complete command-line client, so every feature is scriptable</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">com.nilfactor.Clippo.desktop</launchable>
+
+  <url type="homepage">https://github.com/darthxvaderxd/clippo</url>
+  <url type="bugtracker">https://github.com/darthxvaderxd/clippo/issues</url>
+  <url type="vcs-browser">https://github.com/darthxvaderxd/clippo</url>
+
+  <developer_name>nilfactor</developer_name>
+
+  <categories>
+    <category>Utility</category>
+  </categories>
+
+  <keywords>
+    <keyword>clipboard</keyword>
+    <keyword>history</keyword>
+    <keyword>paste</keyword>
+    <keyword>COSMIC</keyword>
+  </keywords>
+
+  <provides>
+    <binary>clippod</binary>
+    <binary>clippo</binary>
+    <binary>clippo-applet</binary>
+  </provides>
+
+  <!-- Nothing in clippo is age-restricted; the element is required to be
+       explicit about that rather than silent. -->
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.0" date="2026-08-02">
+      <description>
+        <p>
+          First release: capture, encrypted storage, the daemon and its D-Bus interface, the
+          command-line client, secret detection and masking, and the panel applet.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>

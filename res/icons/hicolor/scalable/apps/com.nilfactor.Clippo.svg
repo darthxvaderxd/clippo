@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  clippo application icon.
+
+  The same clipboard as the symbolic panel icon, in colour, for the places that
+  show an application rather than a tray glyph: COSMIC's panel-applet list and
+  any AppStream software centre reading the metainfo beside this file.
+
+  The bottom row is bullets rather than a bar. That is the one thing clippo does
+  that other clipboard managers do not — a suspected password is shown masked —
+  so it is the thing the icon says.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="board" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5b8def"/>
+      <stop offset="1" stop-color="#2f5fbf"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Board. -->
+  <rect x="18" y="18" width="92" height="104" rx="14" fill="url(#board)"/>
+  <!-- Paper. -->
+  <rect x="30" y="38" width="68" height="72" rx="8" fill="#f6f8fc"/>
+  <!-- Clamp, over the top edge of the board. -->
+  <rect x="42" y="6" width="44" height="28" rx="10" fill="#25457f"/>
+  <rect x="52" y="13" width="24" height="7" rx="3.5" fill="#8fb2f2"/>
+
+  <!-- Two ordinary entries. -->
+  <rect x="42" y="52" width="44" height="8" rx="4" fill="#c3d0e4"/>
+  <rect x="42" y="70" width="32" height="8" rx="4" fill="#c3d0e4"/>
+
+  <!-- A masked one. -->
+  <g fill="#f0a04b">
+    <circle cx="46" cy="92" r="4"/>
+    <circle cx="58" cy="92" r="4"/>
+    <circle cx="70" cy="92" r="4"/>
+    <circle cx="82" cy="92" r="4"/>
+  </g>
+</svg>

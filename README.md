@@ -8,30 +8,33 @@ pasting the real value.
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, components, and the decisions on record.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — build order (M0–M6) and how each stage is verified.
 
-> **Status:** M5 complete. Capture, encrypted storage, the daemon, the `clippo` CLI, the
-> copy-back path, secret masking and the panel applet are in: `clippod` records every copy,
-> serves `com.nilfactor.Clippo` on the session bus, `clippo copy <id>` puts an entry back on
-> the clipboard for any application to paste, a suspected password or token shows as
-> `ab••••••••yz` rather than in full — see [Secrets](#secrets) — and
-> [the applet](#the-applet) is a keyboard-driven picker in the COSMIC panel. Still to come —
-> packaging: the systemd unit, the `.desktop` file and `just install`. See the roadmap for
-> what lands when.
+> **Status:** M6 complete — all milestones are in. `clippod` records every copy and serves
+> `com.nilfactor.Clippo` on the session bus, `clippo copy <id>` puts an entry back on the
+> clipboard for any application to paste, a suspected password or token shows as
+> `ab••••••••yz` rather than in full — see [Secrets](#secrets) — [the applet](#the-applet) is
+> a keyboard-driven picker in the COSMIC panel, and [`just install`](#installing) puts the
+> lot in place with a systemd user unit. What is left is the manual verification that needs a
+> real COSMIC session; the roadmap says which boxes those are.
 
 ## ⚠️ Build and run from a host terminal, not RustRover's Flatpak
 
-RustRover runs in a Flatpak sandbox where `WAYLAND_DISPLAY=wayland-1` resolves to Flatpak's
-proxied socket, which **filters out privileged protocols including data-control**. Launched
-from RustRover's terminal or run configurations, `clippod` will find no clipboard-manager
-protocol at all.
+**This is the single most likely thing to cost you an afternoon.** RustRover runs in a Flatpak
+sandbox where `WAYLAND_DISPLAY=wayland-1` resolves to Flatpak's proxied socket, which
+**filters out privileged protocols including data-control**. Launched from RustRover's
+terminal or run configurations, `clippod` finds no clipboard-manager protocol at all — and
+the failure mode is not an error you go looking for, it is capture silently doing nothing.
 
-Use a host terminal (`cosmic-term`), and check the socket first — it must print `wayland-0`:
+Use a host terminal (`cosmic-term`), and check the socket before anything else:
 
 ```sh
-echo $WAYLAND_DISPLAY
+echo $WAYLAND_DISPLAY   # must print wayland-0, not wayland-1
 ```
 
-Whenever capture "silently stops working", check this before anything else. Details in
-[DESIGN.md](docs/DESIGN.md), "Environment constraints".
+If it says `wayland-1`, you are on the proxied socket and nothing below will work. Whenever
+capture "silently stops working", check this first. `clippod` and `clippo-watch` both name
+both protocols and print the `$WAYLAND_DISPLAY` they actually saw when they cannot bind, so
+the cause is diagnosable from the output alone. Details in [DESIGN.md](docs/DESIGN.md),
+"Environment constraints".
 
 ## Building
 
@@ -49,8 +52,99 @@ just test      # cargo test --workspace
 just check     # fmt + clippy + test, exactly what CI runs
 ```
 
-`just` itself is optional — every recipe is a one-line `cargo` invocation you can run
-directly. `just install` / `just uninstall` are stubs until M6 (packaging).
+`just` itself is optional for development — every recipe there is a one-line `cargo`
+invocation you can run directly. `install` and `uninstall` are the two that do real work; see
+below.
+
+## Installing
+
+```sh
+just install
+systemctl --user enable --now clippod
+```
+
+That is the whole of it, and it needs no root. `just install` does a release build and then
+puts everything in the XDG user locations:
+
+| What | Where |
+|---|---|
+| `clippod`, `clippo`, `clippo-applet` | `~/.local/bin` |
+| systemd **user** unit | `~/.config/systemd/user/clippod.service` |
+| applet `.desktop` | `~/.local/share/applications` |
+| AppStream metainfo | `~/.local/share/metainfo` |
+| icons | `~/.local/share/icons/hicolor/{scalable,symbolic}/apps` |
+
+`~/.local/bin` has to be on your `PATH` for `clippo` to be typeable — most shells on Pop!\_OS
+add it already, and `command -v clippo` after installing tells you.
+
+`systemctl --user enable --now clippod` starts the daemon and starts it again on every login:
+the unit is `WantedBy=cosmic-session.target`, so it comes up with the COSMIC session and goes
+down with it. `install` deliberately does *not* enable it for you — starting a daemon that
+then owns your clipboard is not something to do to somebody as a side effect of copying
+files.
+
+Then add clippo to the panel: **Settings → Desktop → Panel → Configure panel applets**. The
+`.desktop` file's `X-CosmicApplet=true` is what puts it in that list.
+
+Everything above still has to happen in a host terminal rather than a Flatpak — see the
+warning at the top of this file. Installing from the wrong one installs perfectly well and
+then captures nothing.
+
+### Installing somewhere else
+
+```sh
+just prefix=/usr/local install        # or: PREFIX=/usr/local just install
+just prefix=/usr destdir=pkg install  # staged, for building a distro package
+```
+
+A prefix moves everything to the FHS layout under it — `$prefix/bin`, `$prefix/share/…`,
+`$prefix/lib/systemd/user` — and `install` rewrites the unit's `ExecStart` to match. The unit
+stays a *user* unit whichever prefix you use: `clippod` needs the session's Wayland socket,
+its session bus and its keyring, and a system service has none of those.
+
+`destdir` prepends a staging root and touches nothing outside it — no cache refresh, no
+`systemctl`, since on a packaged install those belong to the installing machine.
+
+The assignment goes *before* the recipe name. That is `just`'s own grammar: `just install
+prefix=/usr/local` is read as a request for a recipe named `prefix=/usr/local` and fails, so
+use one of the two forms above.
+
+### Uninstalling
+
+```sh
+just uninstall
+```
+
+It stops and disables the unit first, then removes the binaries, the unit, the `.desktop`,
+the metainfo and the icons, and refreshes the caches. Both recipes are idempotent: installing
+twice overwrites, and `uninstall` on a machine with nothing installed succeeds quietly.
+
+**It does not touch your clipboard history.** Uninstalling a program is not a reason to throw
+away what it was keeping for you, so the history and its key are left exactly where they are:
+
+| What | Where |
+|---|---|
+| the encrypted history | `~/.local/share/clippo/history.db` |
+| the key, normally | your keyring, as *clippo clipboard history database key* |
+| the key, if there was no keyring on first run | `~/.local/share/clippo/key`, mode `0600` |
+
+To delete those too, ask for it by name — this is the only recipe in the project that
+destroys anything, and it confirms before it does:
+
+```sh
+just purge-data
+```
+
+That removes `~/.local/share/clippo` and prints how to clear the keyring entry, which is
+separate and stays until you remove it in **Passwords and Keys** or with:
+
+```sh
+secret-tool clear xdg:schema com.nilfactor.Clippo.DatabaseKey \
+                  application clippo purpose history-database-key
+```
+
+Deleting `~/.local/share/clippo` by hand does exactly the same thing; there is nothing else
+to clean up.
 
 ## Running the daemon
 
@@ -85,7 +179,7 @@ Ctrl-C it, `systemctl --user stop clippod`, it crashes — whatever it had put t
 gone, and the next Ctrl+V pastes nothing.
 
 This is standard Wayland behaviour and every clipboard manager on it works the same way. It is
-not a clippo bug and there is no fix, only a mitigation: the systemd unit at M6 carries
+not a clippo bug and there is no fix, only a mitigation: the systemd unit carries
 `Restart=on-failure`, so a crash costs one clipboard's worth of content rather than the rest of
 the session. Anything copied *by another application* is unaffected — that application owns its
 own selection, and clippo's history of it is on disk either way.
@@ -187,7 +281,8 @@ clippo: clippod is not running — nothing owns com.nilfactor.Clippo on the sess
 with `systemctl --user start clippod`, or run it in a host terminal with `cargo run -p clippod`
 ```
 
-(The systemd unit itself arrives with packaging in M6; until then, `just run-daemon`.)
+`systemctl --user start clippod` is the answer once you have [installed](#installing); from a
+working copy, `just run-daemon`.
 
 ## The applet
 
@@ -196,13 +291,19 @@ state of its own — every row came from the daemon's `Search`, and every action
 call on the same D-Bus members `clippo` uses, so there is no second code path to disagree with
 the first.
 
+Normally `cosmic-panel` starts it, and adding it to the panel is COSMIC **Settings → Desktop →
+Panel → Configure panel applets**. What puts clippo in that list is the `.desktop` file
+`just install` writes, and specifically its `X-CosmicApplet=true` — without it clippo is not
+offered there whatever else is installed.
+
+To run it by hand from a working copy instead, without installing:
+
 ```sh
 cargo run -p clippo-applet          # or `just run-applet`
 ```
 
-Normally `cosmic-panel` starts it, and adding it to the panel is COSMIC Settings → Desktop →
-Panel → Configure panel applets. The `.desktop` file that puts clippo in that list arrives
-with packaging in M6; until then, run it by hand from a host terminal.
+Uninstalled, the panel icon falls back to the theme's `edit-paste-symbolic`, because clippo's
+own icon is only in the icon theme once `just install` has put it there.
 
 ### Keyboard
 
@@ -292,8 +393,9 @@ which is RON — a map from a binding to an action:
 
 If the file already exists it already has that outer `{ … }`, so add the one entry inside it
 rather than replacing the file — every custom shortcut you have lives in there. The change is
-picked up without a restart. `clippo` has to be on `PATH` for `Spawn` to find it; before `just
-install` exists (M6), use the absolute path to the built binary.
+picked up without a restart. `clippo` has to be on `PATH` for `Spawn` to find it, which
+[installing](#installing) arranges as long as `~/.local/bin` is on yours; from an
+uninstalled working copy, use the absolute path to the built binary instead.
 
 Two things worth knowing about this path:
 
@@ -475,6 +577,9 @@ the same thing.
 | `clippod` | the daemon |
 | `clippo-cli` | the `clippo` CLI |
 | `clippo-applet` | libcosmic panel applet |
+
+Everything `just install` places lives in `res/`: the systemd user unit, the applet
+`.desktop`, the AppStream metainfo and the two icons.
 
 ## License
 
