@@ -8,8 +8,9 @@ pasting the real value.
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, components, and the decisions on record.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — build order (M0–M6) and how each stage is verified.
 
-> **Status:** M0. The workspace, lint config, `justfile` and CI exist; every crate is still
-> a placeholder. See the roadmap for what lands when.
+> **Status:** M1. The data-control client captures selections and `clippo-watch` prints them;
+> storage, the daemon, the CLI and the applet are still placeholders. See the roadmap for what
+> lands when.
 
 ## ⚠️ Build and run from a host terminal, not RustRover's Flatpak
 
@@ -45,6 +46,76 @@ just check     # fmt + clippy + test, exactly what CI runs
 
 `just` itself is optional — every recipe is a one-line `cargo` invocation you can run
 directly. `just install` / `just uninstall` are stubs until M6 (packaging).
+
+## Debugging capture
+
+`clippo-watch` prints every clipboard selection the compositor hands us and every flavor of it.
+It is the fastest way to answer "why did clippo not pick that up?", and the only way to see the
+data-control protocol working, since no CI runner has a compositor to test against.
+
+```sh
+cargo run -p clippo-wayland --bin clippo-watch     # or: just watch
+```
+
+Copy something, and each selection prints a block:
+
+```
+clippo-watch: bound ext_data_control_v1 on WAYLAND_DISPLAY=wayland-0
+              per-flavor cap 8388608 B, primary capture off. Copy something; Ctrl-C to stop.
+
+── selection #1  clipboard  (ext_data_control_v1)
+   advertised: text/plain;charset=utf-8, text/html, TIMESTAMP, TARGETS
+   fetched:
+     text/plain;charset=utf-8        22 B  "hello from cosmic-term"
+     text/html                       51 B  "<meta charset=\"utf-8\"><p>hello from cosmic-term</p>"
+   skipped (uninteresting): TIMESTAMP, TARGETS
+
+── selection #2  clipboard  (ext_data_control_v1)
+   advertised: image/png, TIMESTAMP
+   fetched:
+     image/png    184320 B  <binary, 184320 bytes, not printed>
+   skipped (uninteresting): TIMESTAMP
+```
+
+A copy that got nothing back still prints, because "the clipboard changed and clippo kept none
+of it" is the case you most need to see:
+
+```
+── selection #3  clipboard  (ext_data_control_v1)
+   advertised: image/png, TIMESTAMP
+   fetched: <nothing>
+   dropped:
+     image/png  exceeded the 1024 byte per-flavor cap
+   skipped (uninteresting): TIMESTAMP
+```
+
+Reading a block:
+
+- **advertised** is everything the source offered. **fetched** is the subset clippo wants (the
+  list in DESIGN.md), each with its size and — for text — an escaped preview with newlines
+  shown as `\n`. Binary flavors report their size and are never written to the terminal.
+- **dropped** lists flavors clippo asked for and did not get, with the reason. A flavor over
+  the size cap says so and names the cap; it is never silently missing.
+- A **`⚠ x-kde-passwordManagerHint present`** line means the source tagged the copy as a
+  credential. That flavor's *presence* is the signal, so it gets called out rather than left to
+  be spotted in the advertised list.
+
+Useful flags:
+
+| Flag | Why |
+|---|---|
+| `--max-bytes 1024` | Exercise the drop path — copy a screenshot and watch `image/png` get rejected by the cap. |
+| `--primary` | Also watch the middle-click primary selection, which is off by default. |
+| `--preview 200` | Longer text previews. |
+
+`RUST_LOG=clippo_wayland=trace` adds the library's own tracing on stderr; the blocks stay on
+stdout, so `clippo-watch > capture.log` keeps them separate.
+
+If it exits saying no data-control manager bound, check `$WAYLAND_DISPLAY` — that is the
+Flatpak socket problem above, and the error prints the value it actually saw.
+
+Note that previews are real clipboard contents: anything you copy while this is running ends up
+in your scrollback.
 
 ## Layout
 
