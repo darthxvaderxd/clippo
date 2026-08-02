@@ -8,11 +8,11 @@ pasting the real value.
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, components, and the decisions on record.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — build order (M0–M6) and how each stage is verified.
 
-> **Status:** M3. Capture, encrypted storage, the daemon and the `clippo` CLI are in: `clippod`
-> records every copy and serves `com.nilfactor.Clippo` on the session bus, and the CLI reaches
-> all of it from a terminal. Still to come — putting an entry back on the clipboard (`clippo
-> copy` reports that the daemon cannot do it yet, and the history is left alone), masking of
-> suspected secrets, and the applet. See the roadmap for what lands when.
+> **Status:** M3 complete. Capture, encrypted storage, the daemon, the `clippo` CLI and the
+> copy-back path are in: `clippod` records every copy, serves `com.nilfactor.Clippo` on the
+> session bus, and `clippo copy <id>` puts an entry back on the clipboard for any application
+> to paste. Still to come — masking of suspected secrets, and the applet. See the roadmap for
+> what lands when.
 
 ## ⚠️ Build and run from a host terminal, not RustRover's Flatpak
 
@@ -73,6 +73,26 @@ verbosity, falling back to `RUST_LOG`, defaulting to `info`:
 CLIPPO_LOG=clippod=debug,clippo_wayland=debug just run-daemon
 ```
 
+### Killing the daemon empties the clipboard
+
+After `clippo copy 2`, **`clippod` is the clipboard.** Wayland has no clipboard of its own that
+outlives whoever put something on it: the daemon owns the selection, and the bytes are written
+out of its memory down a pipe every time an application pastes. So if `clippod` stops — you
+Ctrl-C it, `systemctl --user stop clippod`, it crashes — whatever it had put there is simply
+gone, and the next Ctrl+V pastes nothing.
+
+This is standard Wayland behaviour and every clipboard manager on it works the same way. It is
+not a clippo bug and there is no fix, only a mitigation: the systemd unit at M6 carries
+`Restart=on-failure`, so a crash costs one clipboard's worth of content rather than the rest of
+the session. Anything copied *by another application* is unaffected — that application owns its
+own selection, and clippo's history of it is on disk either way.
+
+The corollary is that clippo hears its own copy-back: taking the selection makes the compositor
+announce it to every clipboard manager, clippo included. A guard keyed on the entry's hash
+keeps that one capture out of the history, so `clippo copy 2` moves entry 2 to the front once
+rather than twice — and copying that same text again by hand afterwards still registers
+normally.
+
 ## The CLI
 
 `clippo` is the client, and every subcommand is one call to the running daemon — it never
@@ -86,7 +106,7 @@ cargo run -p clippo-cli -- list      # or `just run-cli list`, or the built ./ta
 |---|---|
 | `clippo list [-n N] [--offset N] [--json]` | The history, most recently used first. Defaults to 20 entries; `-n 0` is all of them. |
 | `clippo search QUERY [-n N] [--json]` | Fuzzy-match the previews, best match first. |
-| `clippo copy ID` | Put that entry back on the clipboard. |
+| `clippo copy ID` | Put that entry back on the clipboard, and move it to the front of the history. Needs `clippod` to stay running — see above. |
 | `clippo pin ID` / `clippo pin ID --off` | Pin or unpin. A pinned entry is exempt from retention and from `clear`. |
 | `clippo rm ID...` | Delete entries, pinned or not. |
 | `clippo clear [--yes] [--include-pinned]` | Delete the whole history. Asks first. |

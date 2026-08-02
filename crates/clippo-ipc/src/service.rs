@@ -33,10 +33,14 @@ pub trait ClippoBackend: Send + Sync + 'static {
 
     /// Put this entry back on the clipboard and move it to the front.
     ///
-    /// An implementation that cannot yet offer to the compositor —
-    /// `clippod` until the source half of `clippo-wayland` lands — returns
-    /// [`fdo::Error::NotSupported`] and changes nothing, rather than doing the
-    /// store half and letting a caller believe it pasted.
+    /// The two halves go together: an implementation that could not hand the
+    /// flavors to the compositor must not do the store half either, because a
+    /// reordered history is a record of a paste that did not happen.
+    ///
+    /// Note that an implementation also *watches* the clipboard, and so hears
+    /// its own copy-back come back round as a fresh selection. Keeping that out
+    /// of the history is its problem to solve; `clippod` guards on the entry
+    /// hash.
     async fn copy(&self, id: i64) -> fdo::Result<()>;
 
     /// Remove one entry, pinned or not.

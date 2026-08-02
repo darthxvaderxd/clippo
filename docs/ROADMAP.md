@@ -52,8 +52,10 @@ self-echo guard.
 - [x] `clippo list|search|copy|pin|rm|clear|pause|reveal`, each one proxy call, with a short
       typeable id, a terminal-safe table, `--json`, and one clear message when the daemon is
       not running.
-- [ ] The copy-back offer path and the self-echo guard. Until it lands `Copy` refuses, saying
-      so, and leaves the history alone rather than reporting a paste that did not happen.
+- [x] The copy-back offer path and the self-echo guard. `Copy` owns a data-control source
+      advertising every stored flavor except the derived thumbnail, answers each paste on a
+      non-blocking fd, and bumps the entry. The guard is armed for one capture, so the
+      copy-back does not re-enter the history and a deliberate re-copy still does.
 
 > **Gate:** `clippo list` and `clippo copy <id>` work end to end, and pasting into another app
 > yields the right content. This is [verification 2](#2-round-trip) below, and it is manual —
@@ -110,11 +112,14 @@ With `clippod` running in one host terminal and `clippo` in another:
 - [ ] Copy the same text twice → still one entry, and its `AGE` column resets rather than a
       second row appearing.
 - [ ] `clippo reveal 2 | wc -c` counts the whole value, with no newline added.
-- [ ] Stop `clippod` → every subcommand says clippod is not running and exits non-zero.
+- [ ] Stop `clippod` → every subcommand says clippod is not running and exits non-zero, **and
+      the clipboard is empty**: the daemon was the selection owner. Expected Wayland behaviour,
+      documented in the README.
 
-The second box needs the copy-back offer path, which is the unchecked M3 item above: until
-that lands `clippo copy 2` reports that the daemon cannot do it yet, which is the honest
-answer but not a pass.
+Every box here is manual and stays unchecked in the repository — there is no compositor in this
+environment or in CI, so nobody can tick them from a test run. The copy-back path they exercise
+is implemented as of M3c; what is automated of it is the self-echo integration test in
+`clippod` (verification 7 below), against an in-process stand-in for the compositor.
 
 ### 3. Encryption
 
@@ -151,6 +156,12 @@ unpinned remain.
   `dbus-run-session -- cargo test --workspace` (what `just test` and CI run)
 - `clippo-cli` — argument parsing, id resolution, and the table, JSON and escaping against
   fixture `EntrySummary` values
+- `clippod` — the **self-echo loop**, which DESIGN.md's risk table asks for by name. `Copy`
+  goes to a fake clipboard, what it was handed comes back as a capture, and the test asserts
+  both directions: the copy-back adds no second entry, and copying the same content by hand
+  afterwards still bumps the existing one.
 
-The Wayland and UI layers stay manual, and so does the CLI's live round trip against a running
-daemon — that is verification 2 above.
+The Wayland protocol and UI layers stay manual, and so does the CLI's live round trip against a
+running daemon — that is verification 2 above. What the automated tests cover of the offer half
+is everything either side of the protocol: the flavor list, the thumbnail exclusion, the
+non-blocking write against a real pipe, and the guard.

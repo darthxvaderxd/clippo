@@ -23,7 +23,8 @@
 //!    well-known name. In that order, so there is no instant in which the name
 //!    exists and the object behind it does not.
 //! 4. Sweep whatever went stale while the daemon was not running.
-//! 5. Start the Wayland watcher on its own thread and record what it captures.
+//! 5. Start the Wayland watcher on its own thread, hand the daemon the
+//!    clipboard handle it serves `Copy` from, and record what it captures.
 //! 6. Run until SIGTERM or Ctrl-C.
 //!
 //! Nothing before step 3 changes an entry: opening the store creates a schema
@@ -41,15 +42,24 @@
 //! tokio are two event loops, and folding one into the other means driving a
 //! Wayland connection from a work-stealing executor for no gain.
 //!
+//! # The daemon owns the clipboard
+//!
+//! `Copy(id)` does not hand an entry to some system clipboard and walk away —
+//! Wayland has no such thing. It makes *this process* the owner of the
+//! selection, and every paste is answered by writing the bytes down a pipe from
+//! here. **So the clipboard empties when `clippod` exits.** That is the
+//! protocol working as designed, not a clippo bug; `Restart=on-failure` in the
+//! M6 unit narrows the window and the README says so plainly, because a user
+//! who did not know would report it.
+//!
+//! It also means clippo hears its own copy-back come back round as a capture —
+//! see [`echo`], the guard that keeps it out of the history.
+//!
 //! # What is not here yet
 //!
-//! `Copy(id)` does not put an entry back on the clipboard: offering a stored
-//! entry to the compositor needs `clippo-wayland`'s source half and the
-//! self-echo guard that goes with it, which is the next milestone. It returns
-//! an error saying so rather than reporting a success that did not happen, and
-//! leaves the history alone until it can. Masking is M4 — until then
-//! `sensitive` is set from the password-manager MIME hint and previews go out as
-//! stored; see [`preview`], which is the one function that changes.
+//! Masking is M4 — until then `sensitive` is set from the password-manager MIME
+//! hint and previews go out as stored; see [`preview`], which is the one
+//! function that changes.
 //!
 //! # Running it
 //!
@@ -59,6 +69,7 @@
 
 mod cache;
 mod daemon;
+mod echo;
 mod logging;
 mod preview;
 
@@ -69,7 +80,7 @@ use anyhow::Context;
 use clippo_core::{Config, Timestamp};
 use clippo_ipc::{ClippoInterface, BUS_NAME, OBJECT_PATH};
 use clippo_store::{key, Store};
-use clippo_wayland::WatchConfig;
+use clippo_wayland::{WatchConfig, WatchEvent};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn};
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
@@ -166,18 +177,24 @@ async fn run(logging: &str) -> anyhow::Result<()> {
 
     // Only now start capturing. A second clippod must die at the name request,
     // before it has watched a clipboard or changed a row.
-    let (watcher, mut selections) = clippo_wayland::watch(watch_config(&config))
+    let (watcher, mut events) = clippo_wayland::watch(watch_config(&config))
         .context("clippo could not watch the clipboard")?;
     info!(
         protocol = watcher.protocol(),
         "clippo is watching the clipboard"
     );
+    // `Copy` works from here on. Before this the object is exported but there
+    // is no compositor connection behind it, and it says so.
+    daemon.connect_clipboard(Arc::new(watcher.clipboard()));
 
     let capture = tokio::spawn({
         let daemon = Arc::clone(&daemon);
         async move {
-            while let Some(selection) = selections.recv().await {
-                daemon.capture(selection).await;
+            while let Some(event) = events.recv().await {
+                match event {
+                    WatchEvent::Captured(selection) => daemon.capture(selection).await,
+                    WatchEvent::SelectionLost => daemon.selection_lost().await,
+                }
             }
         }
     });
