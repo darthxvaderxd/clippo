@@ -8,6 +8,8 @@
 //! which tells a user who has never heard of D-Bus activation nothing they can
 //! act on. [`CliError::from_call`] detects that one case by its D-Bus error
 //! name and replaces it with a sentence naming the service and how to start it.
+//! Which names mean that is [`clippo_ipc::is_service_absent`]'s to say — the
+//! applet has to tell the same two apart, and one list they share cannot drift.
 //!
 //! Every other bus error keeps the daemon's own message — those are written for
 //! a user already (`clippo cannot put entry 2 back on the clipboard yet…`) and
@@ -16,19 +18,7 @@
 
 use std::io;
 
-use zbus::DBusError as _;
-
 use crate::ids::ResolveError;
-
-/// The D-Bus error names that mean "there is no daemon".
-///
-/// `ServiceUnknown` is what a call to an unowned, non-activatable name gets;
-/// `NameHasNoOwner` is what the bus says when asked about the name directly.
-/// Both mean the same thing to a user.
-const NO_DAEMON: [&str; 2] = [
-    "org.freedesktop.DBus.Error.ServiceUnknown",
-    "org.freedesktop.DBus.Error.NameHasNoOwner",
-];
 
 /// Anything that stops a subcommand finishing. Printed with a `clippo: ` prefix
 /// on stderr; the process then exits non-zero.
@@ -41,6 +31,15 @@ pub enum CliError {
         bus = clippo_ipc::BUS_NAME
     )]
     DaemonNotRunning,
+
+    #[error(
+        "the clippo applet is not running — nothing owns {bus} on the session bus. `clippo \
+         show` asks the panel applet to open its picker, so it needs the applet, not just the \
+         daemon: add clippo to the panel in COSMIC Settings → Desktop → Panel → Configure \
+         panel applets",
+        bus = clippo_ipc::APPLET_BUS_NAME
+    )]
+    AppletNotRunning,
 
     #[error(
         "could not reach the session bus, which is where clippod serves ({0}). A desktop \
@@ -83,8 +82,25 @@ impl CliError {
     /// `member` is the interface member that failed, so a message that came
     /// back without a description still says which call it belongs to.
     pub fn from_call(member: &'static str, error: zbus::Error) -> Self {
-        if error_name(&error).is_some_and(|name| NO_DAEMON.contains(&name.as_str())) {
+        if clippo_ipc::is_service_absent(&error) {
             return CliError::DaemonNotRunning;
+        }
+        CliError::Call {
+            member,
+            message: describe(&error),
+        }
+    }
+
+    /// The same, for the applet's interface rather than the daemon's.
+    ///
+    /// Separate from [`from_call`][Self::from_call] because the two absences
+    /// have different fixes: starting `clippod` will not put the applet on the
+    /// panel, and a user told to do the wrong one of those will not get their
+    /// popup. The bus reports both the same way, so telling them apart is a
+    /// matter of knowing which name was being called.
+    pub fn from_applet_call(member: &'static str, error: zbus::Error) -> Self {
+        if clippo_ipc::is_service_absent(&error) {
+            return CliError::AppletNotRunning;
         }
         CliError::Call {
             member,
@@ -95,15 +111,6 @@ impl CliError {
     /// Failing to connect at all: no bus, rather than no daemon on it.
     pub fn from_connect(error: zbus::Error) -> Self {
         CliError::NoSessionBus(error)
-    }
-}
-
-/// The D-Bus error name of a failed call, when it has one.
-fn error_name(error: &zbus::Error) -> Option<String> {
-    match error {
-        zbus::Error::MethodError(name, _, _) => Some(name.as_str().to_owned()),
-        zbus::Error::FDO(error) => Some(error.name().as_str().to_owned()),
-        _ => None,
     }
 }
 
@@ -183,20 +190,5 @@ mod tests {
         let error = CliError::from_call("List", zbus::Error::InvalidReply);
         assert!(matches!(error, CliError::Call { .. }), "{error:?}");
         assert!(error.to_string().contains("List"), "{error}");
-    }
-
-    #[test]
-    fn the_no_daemon_names_are_the_ones_the_bus_actually_sends() {
-        // `fdo::Error` derives its names from its variants; pinning the
-        // strings here means a typo in NO_DAEMON fails a test rather than
-        // quietly leaving the raw zbus text in front of a user.
-        assert_eq!(
-            fdo::Error::ServiceUnknown(String::new()).name().as_str(),
-            NO_DAEMON[0]
-        );
-        assert_eq!(
-            fdo::Error::NameHasNoOwner(String::new()).name().as_str(),
-            NO_DAEMON[1]
-        );
     }
 }

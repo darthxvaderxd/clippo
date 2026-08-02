@@ -28,8 +28,23 @@
 //! | `Pin` | `(id, bool)` |
 //! | `Clear` | `(include_pinned)` |
 //! | `Reveal` | `(id) -> String` |
+//! | `Thumbnail` | `(id) -> Vec<u8>` |
 //! | `SetPaused` / `Paused` | `(bool)` / `-> bool` |
 //! | `HistoryChanged` | signal |
+//!
+//! `Thumbnail` is the one member DESIGN.md's table does not list, added at M5.
+//! Its absence was a gap rather than a decision: the design has capture derive
+//! and store a thumbnail expressly "so the applet never decodes full-size
+//! images", and without a member to fetch one the applet could only have got
+//! there through the full-size blob — the thing the thumbnail exists to avoid.
+//! It returns derived bytes, not stored content, so it does not widen what
+//! [`Reveal`][ClippoBackend::reveal] is the sole route for.
+//!
+//! # The other direction
+//!
+//! [`AppletInterface`] and [`ClippoAppletProxy`] are a second, much smaller
+//! interface that the *applet* serves and `clippo show` calls. See
+//! [`applet`](crate::applet) for why it is a separate bus name.
 //!
 //! # Previews and full values
 //!
@@ -52,12 +67,17 @@
 //! # }
 //! ```
 
+mod applet;
 mod proxy;
 mod service;
 
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
 
+pub use applet::{
+    AppletFrontend, AppletInterface, ClippoAppletProxy, ClippoAppletProxyBlocking, APPLET_BUS_NAME,
+    APPLET_INTERFACE_NAME, APPLET_OBJECT_PATH,
+};
 pub use proxy::{ClippoProxy, ClippoProxyBlocking};
 pub use service::{emitter, ClippoBackend, ClippoInterface};
 
@@ -73,6 +93,47 @@ pub const OBJECT_PATH: &str = "/com/nilfactor/Clippo";
 /// incidentally the same string: one names a process on the bus, the other
 /// names a set of members.
 pub const INTERFACE_NAME: &str = "com.nilfactor.Clippo";
+
+/// The D-Bus error names that mean "nobody is serving that name".
+///
+/// `ServiceUnknown` is what a call to an unowned, non-activatable name gets;
+/// `NameHasNoOwner` is what the bus says when asked about the name directly.
+/// Both mean the same thing to a caller.
+const ABSENT_SERVICE: [&str; 2] = [
+    "org.freedesktop.DBus.Error.ServiceUnknown",
+    "org.freedesktop.DBus.Error.NameHasNoOwner",
+];
+
+/// Whether a failed call means "nothing is serving this name" rather than "the
+/// service said no".
+///
+/// Here rather than in each caller because both frontends have to tell those
+/// apart and both would otherwise carry their own copy of the two names: the
+/// CLI turns one into `clippod is not running` and the applet into its explicit
+/// no-daemon state, and a name added in one copy and not the other is a
+/// frontend that reports a dead daemon as a refusal. This crate already exists
+/// to hold the one definition both sides share.
+pub fn is_service_absent(error: &zbus::Error) -> bool {
+    error_name(error).is_some_and(|name| ABSENT_SERVICE.contains(&name.as_str()))
+}
+
+/// The D-Bus error name of a failed call, when it has one.
+///
+/// Not every [`zbus::Error`] is an error *reply* — a transport failure has no
+/// name at all — which is why this is an `Option` rather than a string that
+/// would sometimes be empty.
+///
+/// Private: [`is_service_absent`] is the question both frontends actually ask,
+/// and a name on its own is not a decision anybody outside this module makes.
+fn error_name(error: &zbus::Error) -> Option<String> {
+    use zbus::DBusError as _;
+
+    match error {
+        zbus::Error::MethodError(name, _, _) => Some(name.as_str().to_owned()),
+        zbus::Error::FDO(error) => Some(error.name().as_str().to_owned()),
+        _ => None,
+    }
+}
 
 /// One history entry as the frontends see it: enough to draw a row, and no
 /// clipboard content beyond the preview.
@@ -151,5 +212,49 @@ mod tests {
         let rendered = format!("{summary:?}");
         assert!(!rendered.contains("data"), "{rendered}");
         assert!(!rendered.contains("hash"), "{rendered}");
+    }
+
+    #[test]
+    fn an_absent_service_is_told_apart_from_a_refusal() {
+        let absent = zbus::Error::FDO(Box::new(zbus::fdo::Error::ServiceUnknown(String::new())));
+        assert!(is_service_absent(&absent));
+
+        let unowned = zbus::Error::FDO(Box::new(zbus::fdo::Error::NameHasNoOwner(String::new())));
+        assert!(is_service_absent(&unowned));
+
+        let refused = zbus::Error::FDO(Box::new(zbus::fdo::Error::InvalidArgs(
+            "no entry 9".to_owned(),
+        )));
+        assert!(!is_service_absent(&refused));
+    }
+
+    /// Hand-written strings drift; asserting them against what zbus itself
+    /// produces means a typo in [`ABSENT_SERVICE`] fails here rather than
+    /// silently turning a dead daemon into "the daemon refused".
+    #[test]
+    fn the_absent_service_names_are_the_ones_zbus_produces() {
+        use zbus::DBusError as _;
+
+        assert_eq!(
+            zbus::fdo::Error::ServiceUnknown(String::new())
+                .name()
+                .as_str(),
+            ABSENT_SERVICE[0]
+        );
+        assert_eq!(
+            zbus::fdo::Error::NameHasNoOwner(String::new())
+                .name()
+                .as_str(),
+            ABSENT_SERVICE[1]
+        );
+    }
+
+    /// A transport failure is not an error reply and has no name; treating one
+    /// as an absent service would blank the applet's list over a hiccup.
+    #[test]
+    fn an_error_without_a_name_is_not_an_absent_service() {
+        let broken = zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::other("boom")));
+        assert_eq!(error_name(&broken), None);
+        assert!(!is_service_absent(&broken));
     }
 }

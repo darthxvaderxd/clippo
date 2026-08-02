@@ -528,6 +528,50 @@ impl ClippoBackend for Daemon {
         })
     }
 
+    /// The stored thumbnail, or a reason there is not one.
+    ///
+    /// Read straight out of the flavors — nothing is decoded or scaled here.
+    /// The whole point of the derived `image/png;clippo-thumb` row is that
+    /// drawing an image row costs one blob read, so generating a missing
+    /// thumbnail on demand would quietly reintroduce the full-size decode this
+    /// member exists to avoid. An image stored without one is reported as such
+    /// and the frontend draws a placeholder.
+    ///
+    /// "One blob read" is why this goes through
+    /// [`Store::entry`][clippo_store::Store::entry] and
+    /// [`Store::thumbnail`][clippo_store::Store::thumbnail] rather than
+    /// `Store::get`. `get` returns every flavor, so it reads and decrypts the
+    /// full-size PNG in order to hand back the small one beside it — the decode
+    /// would still be avoided, the read and the SQLCipher decrypt would not,
+    /// and the claim above would be false for exactly the entries it is about.
+    async fn thumbnail(&self, id: i64) -> fdo::Result<Vec<u8>> {
+        let id = EntryId::new(id);
+        let state = self.state.lock().await;
+        let entry = state
+            .store
+            .entry(id)
+            .map_err(|error| failed("thumbnail", error))?
+            .ok_or_else(|| no_such_entry(id))?;
+
+        if entry.kind != EntryKind::Image {
+            return Err(fdo::Error::NotSupported(format!(
+                "entry {id} is {}, which has no thumbnail",
+                entry.kind
+            )));
+        }
+
+        state
+            .store
+            .thumbnail(id)
+            .map_err(|error| failed("thumbnail", error))?
+            .ok_or_else(|| {
+                fdo::Error::NotSupported(format!(
+                    "entry {id} is an image stored without a thumbnail; \
+                     it was too large or could not be decoded at capture"
+                ))
+            })
+    }
+
     async fn set_paused(&self, paused: bool) -> fdo::Result<()> {
         // `swap` rather than a load and a store: two frontends toggling at once
         // must not both decide they were the one that changed it.
@@ -1318,6 +1362,68 @@ mod tests {
             "every stored flavor except the one clippo derived for itself"
         );
         assert_eq!(offered[0].data, full_size, "and it is the full-size image");
+    }
+
+    /// What the applet draws an image row from, and what it must cost. The
+    /// member returns the derived thumbnail and not the full-size PNG beside
+    /// it — the whole reason a thumbnail is stored at capture.
+    #[tokio::test]
+    async fn the_thumbnail_member_returns_the_derived_png_and_not_the_full_size_one() {
+        let fixture = Fixture::new();
+        let full_size = png(400, 300);
+        fixture
+            .daemon
+            .capture_at(image_selection(full_size.clone()), fixture.tick())
+            .await;
+        let id = fixture.daemon.list(1, 0).await.unwrap()[0].id;
+
+        let thumb = fixture.daemon.thumbnail(id).await.expect("an image row");
+
+        assert_ne!(thumb, full_size, "not the image the user copied");
+        assert!(thumb.len() < full_size.len());
+        let stored = {
+            let state = fixture.daemon.state.lock().await;
+            state.store.get(EntryId::new(id)).unwrap().unwrap()
+        };
+        assert_eq!(
+            thumb,
+            stored
+                .flavors
+                .iter()
+                .find(|flavor| flavor.mime == THUMBNAIL_MIME)
+                .expect("the store derived one")
+                .data,
+            "exactly the stored thumbnail flavor"
+        );
+    }
+
+    /// The two refusals, which the applet tells apart from a sick daemon: an
+    /// entry that has no thumbnail to give, and an id that is not there.
+    #[tokio::test]
+    async fn asking_for_a_thumbnail_that_does_not_exist_is_refused_not_faked() {
+        let fixture = Fixture::new();
+        fixture.capture(&["just some text"]).await;
+        let id = fixture.daemon.list(1, 0).await.unwrap()[0].id;
+
+        let refused = fixture
+            .daemon
+            .thumbnail(id)
+            .await
+            .expect_err("text has no thumbnail");
+        assert!(
+            matches!(refused, fdo::Error::NotSupported(_)),
+            "{refused:?}"
+        );
+
+        let missing = fixture
+            .daemon
+            .thumbnail(9_999)
+            .await
+            .expect_err("there is no such entry");
+        assert!(
+            matches!(missing, fdo::Error::InvalidArgs(_)),
+            "{missing:?}, so a frontend can tell it from a daemon fault"
+        );
     }
 
     /// DESIGN.md's risk table: *"**Self-echo loop** — a wrong hash guard

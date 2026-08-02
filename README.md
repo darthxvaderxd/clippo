@@ -8,12 +8,14 @@ pasting the real value.
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, components, and the decisions on record.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — build order (M0–M6) and how each stage is verified.
 
-> **Status:** M4 complete. Capture, encrypted storage, the daemon, the `clippo` CLI, the
-> copy-back path and secret masking are in: `clippod` records every copy, serves
-> `com.nilfactor.Clippo` on the session bus, `clippo copy <id>` puts an entry back on the
-> clipboard for any application to paste, and a suspected password or token shows as
-> `ab••••••••yz` rather than in full — see [Secrets](#secrets). Still to come — the applet.
-> See the roadmap for what lands when.
+> **Status:** M5 complete. Capture, encrypted storage, the daemon, the `clippo` CLI, the
+> copy-back path, secret masking and the panel applet are in: `clippod` records every copy,
+> serves `com.nilfactor.Clippo` on the session bus, `clippo copy <id>` puts an entry back on
+> the clipboard for any application to paste, a suspected password or token shows as
+> `ab••••••••yz` rather than in full — see [Secrets](#secrets) — and
+> [the applet](#the-applet) is a keyboard-driven picker in the COSMIC panel. Still to come —
+> packaging: the systemd unit, the `.desktop` file and `just install`. See the roadmap for
+> what lands when.
 
 ## ⚠️ Build and run from a host terminal, not RustRover's Flatpak
 
@@ -113,6 +115,7 @@ cargo run -p clippo-cli -- list      # or `just run-cli list`, or the built ./ta
 | `clippo clear [--yes] [--include-pinned]` | Delete the whole history. Asks first. |
 | `clippo pause on` / `off` / *(nothing)* | Stop recording, resume recording, or print `paused` / `recording`. |
 | `clippo reveal ID` | Print an entry's whole value to stdout. |
+| `clippo show` | Open the panel applet's picker, or close it if it is already open. The one subcommand that talks to the applet rather than to `clippod` — see [The applet](#the-applet). |
 
 `clippo <command> --help` has the detail. Two conventions worth knowing:
 
@@ -185,6 +188,121 @@ with `systemctl --user start clippod`, or run it in a host terminal with `cargo 
 ```
 
 (The systemd unit itself arrives with packaging in M6; until then, `just run-daemon`.)
+
+## The applet
+
+A panel icon that opens a picker over the same history the CLI reads. It owns no clipboard
+state of its own — every row came from the daemon's `Search`, and every action it takes is a
+call on the same D-Bus members `clippo` uses, so there is no second code path to disagree with
+the first.
+
+```sh
+cargo run -p clippo-applet          # or `just run-applet`
+```
+
+Normally `cosmic-panel` starts it, and adding it to the panel is COSMIC Settings → Desktop →
+Panel → Configure panel applets. The `.desktop` file that puts clippo in that list arrives
+with packaging in M6; until then, run it by hand from a host terminal.
+
+### Keyboard
+
+The picker is keyboard-first: the search field takes focus the moment it opens, so you can
+start typing immediately, and nothing below needs the mouse.
+
+| Key | What it does |
+|---|---|
+| *(type)* | Filter. This is the daemon's `Search`, so the applet and `clippo search` rank a query identically. |
+| `↑` / `↓` | Move the highlight. It stops at the ends rather than wrapping. |
+| `Enter` | Copy the highlighted entry and close. The picker gets out of the way because you are about to paste. |
+| `Delete` | Remove the highlighted entry. No confirmation — this is one row of a rolling history, and `clippo clear` is the destructive one. |
+| `Ctrl+P` | Pin or unpin. A pinned entry is exempt from retention and from `clear`. |
+| `Ctrl+R` | Show the highlighted entry's stored value in place, up to a bound. This is how a masked row is read — see below. |
+| `Escape` | Close without doing anything. |
+
+The highlight follows the *entry*, not the row number. That matters because the list changes
+while you are looking at it: a copy made in another window arrives at the top and shifts every
+row below it, and an index-based highlight would quietly move to a different entry between you
+reading a row and pressing `Enter`.
+
+### Masked rows, and revealing one
+
+A row the daemon flagged as sensitive shows `ab••••••••yz` and a small lock badge. The badge is
+the part that makes the mask legible — bullets on their own could be a value that genuinely
+looks like that.
+
+`Ctrl+R` calls `Reveal(id)` for that one row and shows the answer in place. It is **never
+cached**: the applet answers with it only while that same row is still highlighted, so moving
+the selection stops it being drawn, and it is dropped when the popup closes — whether you
+closed it or clicked away. The value is held zeroized from the moment it arrives, so dropping
+it wipes the memory rather than leaving the secret in a freed buffer for a core dump to pick
+up — with one honest gap: the buffer zbus deserialises the reply into is not clippo's to wipe.
+
+The revealed value is wrapped rather than cut at the width of the list, but it is bounded — the
+first 2 000 characters over at most 12 lines, with an `…` when there was more. That is far more
+than any value the mask exists for: nothing longer than 128 characters is flagged on entropy in
+the first place. The cap is there because `Reveal` returns the whole stored value, the binding
+works on any row rather than only a masked one, and a megabyte of pasted text would otherwise
+draw a row hundreds of screens tall. Use `clippo reveal <id>` to see a long value whole.
+
+Copying a masked row still copies the **real** value. Masking is display-only everywhere in
+clippo; see [Secrets](#secrets).
+
+### Live updates, and when the daemon is not running
+
+The applet subscribes to the daemon's `HistoryChanged` and never polls. Copy something in
+another window with the picker open and it appears at the top; `clippo rm <id>` in a terminal
+removes that row from under you.
+
+With the picker *closed* the applet listens and does nothing else. The signal fires on every
+copy you make all day, and re-reading a list nobody is looking at would cost the daemon a
+ranked search — and a thumbnail fetch for every screenshot — for no visible benefit. Opening
+the picker refreshes it, so what you see is always current.
+
+If `clippod` is not running the picker says so, with the command to start it. It deliberately
+does *not* show an empty list, which would read as "your clipboard history is gone". It
+reconnects on its own when the daemon comes back — a restarted `clippod` is answered again
+with nothing reopened and no keypress.
+
+### Global shortcut
+
+clippo does not register a global shortcut for itself, because COSMIC owns those. Binding one
+is a one-time manual step, and it runs `clippo show` — which asks the applet to open its
+picker, or to close it if it is already open.
+
+The supported route is the GUI: **COSMIC Settings → Keyboard → Shortcuts → Custom shortcuts**,
+add a shortcut with the command `clippo show` and the key `Super+V`.
+
+To do it by hand instead, the shortcuts config is a cosmic-config directory. Add the binding to
+
+```
+~/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1/custom
+```
+
+which is RON — a map from a binding to an action:
+
+```ron
+{
+    (
+        modifiers: [Super],
+        key: "v",
+        description: Some("clippo — clipboard history"),
+    ): Spawn("clippo show"),
+}
+```
+
+If the file already exists it already has that outer `{ … }`, so add the one entry inside it
+rather than replacing the file — every custom shortcut you have lives in there. The change is
+picked up without a restart. `clippo` has to be on `PATH` for `Spawn` to find it; before `just
+install` exists (M6), use the absolute path to the built binary.
+
+Two things worth knowing about this path:
+
+- `clippo show` needs the **applet**, not just the daemon. A running `clippod` is not enough,
+  and the error says so and names the panel setting.
+- A picker opened by a global shortcut has no input serial to hand the compositor, so it gets
+  no `xdg_popup` grab. Whether it takes keyboard focus anyway is cosmic-comp's call — it is
+  the one part of this that could not be settled by reading libcosmic, and it is on the
+  [verification list](docs/ROADMAP.md#6-restart-resilience).
 
 ## Secrets
 

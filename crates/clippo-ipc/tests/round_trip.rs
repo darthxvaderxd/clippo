@@ -96,6 +96,13 @@ impl ClippoBackend for Recorder {
         Ok("the whole value".to_owned())
     }
 
+    async fn thumbnail(&self, id: i64) -> fdo::Result<Vec<u8>> {
+        self.record(format!("thumbnail({id})"));
+        // Not a real PNG: this test is about the wire, and `ay` carrying bytes
+        // through unchanged is the only claim it can make about them.
+        Ok(vec![0x89, b'P', b'N', b'G', 0x00, 0xff])
+    }
+
     async fn set_paused(&self, paused: bool) -> fdo::Result<()> {
         self.record(format!("set_paused({paused})"));
         self.paused.store(paused, Ordering::Relaxed);
@@ -163,6 +170,15 @@ async fn every_member_carries_its_arguments_and_its_answer_across_the_bus() {
     clippo.clear(false).await.expect("Clear");
     assert_eq!(clippo.reveal(3).await.expect("Reveal"), "the whole value");
 
+    // `ay` is the one member with a non-trivial body type, and a byte array is
+    // exactly where D-Bus marshalling is easiest to get subtly wrong — a high
+    // bit dropped here would show up as a corrupt thumbnail in the applet and
+    // nowhere else.
+    assert_eq!(
+        clippo.thumbnail(9).await.expect("Thumbnail"),
+        vec![0x89, b'P', b'N', b'G', 0x00, 0xff]
+    );
+
     clippo.set_paused(true).await.expect("SetPaused");
     assert!(clippo.paused().await.expect("Paused"));
 
@@ -183,6 +199,7 @@ async fn every_member_carries_its_arguments_and_its_answer_across_the_bus() {
             "pin(2, true)",
             "clear(false)",
             "reveal(3)",
+            "thumbnail(9)",
             "set_paused(true)",
             "paused()",
             "delete(4)",

@@ -11,7 +11,7 @@
 //! hand back — because that tagging is the only thing this layer adds. The
 //! commands themselves live in [`crate::run`].
 
-use clippo_ipc::{ClippoProxyBlocking, EntrySummary};
+use clippo_ipc::{ClippoAppletProxyBlocking, ClippoProxyBlocking, EntrySummary};
 use zbus::blocking::Connection;
 
 use crate::error::CliError;
@@ -20,6 +20,7 @@ use crate::ids;
 /// A connection to `com.nilfactor.Clippo` on the session bus.
 pub struct Client {
     proxy: ClippoProxyBlocking<'static>,
+    connection: Connection,
 }
 
 impl Client {
@@ -32,7 +33,22 @@ impl Client {
     pub fn connect() -> Result<Self, CliError> {
         let connection = Connection::session().map_err(CliError::from_connect)?;
         let proxy = ClippoProxyBlocking::new(&connection).map_err(CliError::from_connect)?;
-        Ok(Self { proxy })
+        Ok(Self { proxy, connection })
+    }
+
+    /// `Toggle()` on the *applet's* interface, not the daemon's.
+    ///
+    /// The one call in this file that goes somewhere other than `clippod`, and
+    /// the proxy is built here rather than in [`connect`][Self::connect]
+    /// because every other subcommand would pay for it without using it. It
+    /// shares the connection: one process needs one bus connection, whichever
+    /// names it happens to talk to.
+    pub fn toggle_applet(&self) -> Result<(), CliError> {
+        let applet = ClippoAppletProxyBlocking::new(&self.connection)
+            .map_err(|error| CliError::from_applet_call("Toggle", error))?;
+        applet
+            .toggle()
+            .map_err(|error| CliError::from_applet_call("Toggle", error))
     }
 
     /// `List(limit, offset)`. A limit of 0 means the whole history.

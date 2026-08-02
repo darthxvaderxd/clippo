@@ -62,6 +62,17 @@ pub trait ClippoBackend: Send + Sync + 'static {
     /// for a sensitive entry before it reaches the database.
     async fn reveal(&self, id: i64) -> fdo::Result<String>;
 
+    /// The stored PNG thumbnail of an image entry.
+    ///
+    /// Unlike [`reveal`][Self::reveal] this is not a full value: the thumbnail
+    /// is a downscale capture derived and stored precisely so that a frontend
+    /// drawing a list never has to ask for the image itself.
+    ///
+    /// `NotSupported` for a non-image entry, and for an image stored without a
+    /// thumbnail — capture skips one it could not generate rather than refusing
+    /// the entry, so this failing is a normal thing for a frontend to handle.
+    async fn thumbnail(&self, id: i64) -> fdo::Result<Vec<u8>>;
+
     /// Stop or resume recording new copies.
     async fn set_paused(&self, paused: bool) -> fdo::Result<()>;
 
@@ -122,6 +133,11 @@ impl ClippoInterface {
     /// `Reveal(id) -> String`.
     async fn reveal(&self, id: i64) -> fdo::Result<String> {
         self.backend.reveal(id).await
+    }
+
+    /// `Thumbnail(id) -> Vec<u8>`.
+    async fn thumbnail(&self, id: i64) -> fdo::Result<Vec<u8>> {
+        self.backend.thumbnail(id).await
     }
 
     /// `SetPaused(bool)`.

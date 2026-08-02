@@ -62,6 +62,19 @@ pub trait Clippo {
     /// cache the result.
     fn reveal(&self, id: i64) -> zbus::Result<String>;
 
+    /// The stored PNG thumbnail of an image entry.
+    ///
+    /// The bytes of the `image/png;clippo-thumb` flavor, which capture derived
+    /// once and stored beside the image. A list that wanted to draw image rows
+    /// would otherwise have to pull the full-size blob across the bus and
+    /// decode it per row, which is exactly what storing a thumbnail was for.
+    ///
+    /// Errors with `NotSupported` for an entry that is not an image, and for an
+    /// image whose thumbnail could not be generated at capture — an oversized
+    /// or corrupt picture is stored without one, so a frontend must be able to
+    /// draw a row for an image it has no thumbnail for.
+    fn thumbnail(&self, id: i64) -> zbus::Result<Vec<u8>>;
+
     /// Stop or resume recording new copies. Reads keep working either way.
     fn set_paused(&self, paused: bool) -> zbus::Result<()>;
 

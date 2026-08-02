@@ -428,16 +428,72 @@ impl Store {
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
-    /// One entry with all of its flavors, or `None` if there is no such id.
-    pub fn get(&self, id: EntryId) -> Result<Option<StoredEntry>, StoreError> {
-        let entry = match self.conn.query_row(
+    /// One entry's row, without any of its flavors.
+    ///
+    /// The cheap half of [`get`](Self::get), for callers that need the kind or
+    /// the flags and not the content. Everything a blob costs — reading the
+    /// overflow pages, decrypting them, copying them into a `Vec` — is skipped,
+    /// which for a screenshot is the difference between a few hundred bytes and
+    /// a few megabytes.
+    pub fn entry(&self, id: EntryId) -> Result<Option<Entry>, StoreError> {
+        match self.conn.query_row(
             &format!("SELECT {ENTRY_COLUMNS} FROM entries WHERE id = ?1"),
             [id.get()],
             entry_from_row,
         ) {
-            Ok(entry) => entry,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Ok(entry) => Ok(Some(entry)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// The stored thumbnail for one entry, reading no other flavor.
+    ///
+    /// `None` when the entry has no thumbnail — it is not an image, or it was
+    /// stored without one because it was too large or could not be decoded.
+    ///
+    /// Two statements rather than one, and neither of them selects `data` for a
+    /// flavor it is not going to return. That is the whole point: a thumbnail
+    /// sits in the same table as the full-size PNG it was derived from, so
+    /// reaching it through [`get`](Self::get) would read and decrypt the
+    /// megabytes beside it in order to hand back the kilobytes — quietly
+    /// undoing what the derived thumbnail exists to save. The first statement
+    /// asks only for MIME types, which are small and stored ahead of `data` in
+    /// the row, so it never touches the blob's overflow pages.
+    ///
+    /// The MIME is matched with [`is_thumbnail`][crate::is_thumbnail] rather
+    /// than by SQL equality so that a thumbnail carried in with a different
+    /// spelling of the same type is still found; the second statement then asks
+    /// for that exact stored spelling.
+    pub fn thumbnail(&self, id: EntryId) -> Result<Option<Vec<u8>>, StoreError> {
+        let mut mimes = self
+            .conn
+            .prepare("SELECT mime FROM flavors WHERE entry_id = ?1 ORDER BY rowid")?;
+        let stored_as = mimes
+            .query_map([id.get()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find(|mime| images::is_thumbnail(mime));
+
+        let Some(stored_as) = stored_as else {
+            return Ok(None);
+        };
+
+        match self.conn.query_row(
+            "SELECT data FROM flavors WHERE entry_id = ?1 AND mime = ?2",
+            params![id.get(), stored_as],
+            |row| row.get(0),
+        ) {
+            Ok(data) => Ok(Some(data)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// One entry with all of its flavors, or `None` if there is no such id.
+    pub fn get(&self, id: EntryId) -> Result<Option<StoredEntry>, StoreError> {
+        let Some(entry) = self.entry(id)? else {
+            return Ok(None);
         };
 
         let mut statement = self
@@ -732,6 +788,86 @@ mod tests {
     /// The stored flavor with this MIME type, if the entry has one.
     fn stored_flavor<'a>(stored: &'a StoredEntry, mime: &str) -> Option<&'a Flavor> {
         stored.flavors.iter().find(|flavor| flavor.mime == mime)
+    }
+
+    /// The targeted read `Thumbnail` uses. It has to give back exactly what
+    /// `get` would have found, without the read and decrypt of the full-size
+    /// blob that makes `get` the wrong tool for drawing a list.
+    #[test]
+    fn the_thumbnail_read_returns_the_derived_png_and_not_the_full_size_one() {
+        let temp = Temp::new();
+        let mut store = temp.open();
+
+        let new = screenshot(1_000, 800, 400);
+        let original = new.flavors[0].data.clone();
+        let id = store.insert(&new).unwrap().id();
+
+        let thumb = store
+            .thumbnail(id)
+            .unwrap()
+            .expect("an image entry carries a thumbnail flavor");
+
+        let stored = store.get(id).unwrap().unwrap();
+        assert_eq!(
+            thumb,
+            stored_flavor(&stored, images::THUMBNAIL_MIME).unwrap().data,
+            "the same bytes `get` would have found"
+        );
+        assert_ne!(thumb, original, "and not the full-size image beside it");
+        assert!(thumb.len() < original.len());
+    }
+
+    #[test]
+    fn there_is_no_thumbnail_for_text_or_for_an_entry_that_is_not_there() {
+        let temp = Temp::new();
+        let mut store = temp.open();
+
+        let id = store.insert(&text(1_000, "hello")).unwrap().id();
+
+        assert_eq!(store.thumbnail(id).unwrap(), None);
+        assert_eq!(store.thumbnail(EntryId::new(9_999)).unwrap(), None);
+    }
+
+    /// The cheap half of `get`, for callers that want the kind or the flags.
+    #[test]
+    fn reading_one_entrys_row_gives_the_same_row_get_would() {
+        let temp = Temp::new();
+        let mut store = temp.open();
+
+        let id = store.insert(&screenshot(1_000, 40, 40)).unwrap().id();
+
+        let entry = store.entry(id).unwrap().expect("the entry is there");
+        assert_eq!(entry, store.get(id).unwrap().unwrap().entry);
+        assert_eq!(entry.kind, EntryKind::Image);
+
+        assert_eq!(store.entry(EntryId::new(9_999)).unwrap(), None);
+    }
+
+    /// Not a property of this module so much as of SQLite, and it is pinned
+    /// here because a frontend caching anything against an id depends on
+    /// knowing it: `entries.id` is an `INTEGER PRIMARY KEY` *without*
+    /// `AUTOINCREMENT`, so a freed id is handed straight back out. The applet's
+    /// thumbnail cache is keyed on `(id, created_at)` for exactly this, and if
+    /// this test ever starts failing that key can be simplified.
+    #[test]
+    fn a_deleted_entrys_id_is_reissued_to_the_next_insert() {
+        let temp = Temp::new();
+        let mut store = temp.open();
+
+        let first = store.insert(&text(1_000, "first")).unwrap().id();
+        let second = store.insert(&text(2_000, "second")).unwrap().id();
+        assert_ne!(first, second);
+
+        assert!(store.delete(second).unwrap());
+        let reissued = store.insert(&text(3_000, "third")).unwrap().id();
+        assert_eq!(
+            reissued, second,
+            "the newest id came straight back for a different entry"
+        );
+
+        store.clear(true).unwrap();
+        let after_clear = store.insert(&text(4_000, "fourth")).unwrap().id();
+        assert_eq!(after_clear, first, "and a clear restarts at the beginning");
     }
 
     #[test]

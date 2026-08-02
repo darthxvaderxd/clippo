@@ -5,6 +5,11 @@
 //! produces a value, [`crate::run`] acts on it — so the whole surface is
 //! testable without a daemon.
 //!
+//! `show` (M5) is the one subcommand that is not a member of that interface: it
+//! calls `Toggle` on the *applet*, and is the command a user binds `Super+V`
+//! to. It is listed here rather than in a second binary because a key binding
+//! naming `clippo` is one thing to install and one thing to document.
+//!
 //! # stdout is data, stderr is talk
 //!
 //! Every subcommand keeps stdout for the thing a script would read: the table,
@@ -217,6 +222,29 @@ An image entry has no text to print and is refused.")]
         #[arg(value_name = "ID")]
         id: String,
     },
+
+    /// Open the panel applet's picker (or close it, if it is already open).
+    #[command(
+        long_about = "Ask the clippo panel applet to open its picker, or to close it if \
+it is already open.
+
+This is the command to bind a key to. clippo does not register a global \
+shortcut for itself — COSMIC owns those — so binding `Super+V` is a one-time \
+manual edit of
+
+  ~/.config/cosmic/com.system76.CosmicSettings.Shortcuts
+
+The exact snippet is in the README's \"Global shortcut\" section.
+
+Unlike every other subcommand this one talks to the applet rather than to \
+clippod, so it needs clippo to be on the panel. A running daemon is not \
+enough, and the error says so.
+
+It returns as soon as the applet has the request, which is before any surface \
+is on screen — the compositor decides that part, and there is nothing useful \
+to wait for."
+    )]
+    Show,
 }
 
 /// The argument to `clippo pause`, naming the state of the *pause* rather than
@@ -260,7 +288,7 @@ mod tests {
     #[test]
     fn every_subcommand_design_names_exists() {
         for name in [
-            "list", "search", "copy", "pin", "rm", "clear", "pause", "reveal",
+            "list", "search", "copy", "pin", "rm", "clear", "pause", "reveal", "show",
         ] {
             assert!(
                 Cli::command()
