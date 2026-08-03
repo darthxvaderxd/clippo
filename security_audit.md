@@ -15,6 +15,14 @@ path; the image-decoding and key-management certifications now state which decod
 crate they actually cover; and `clippo reveal`'s unescaped output has moved from a clause inside
 a clean certification to a note of its own. F1–F4 are otherwise unchanged.
 
+Third revision: F5's fix previously suggested that `clippod` request its name with
+`AllowReplacement | ReplaceExisting` so a restarting daemon could take the name back. **That was
+wrong and the correction is in F5's third fix step** — `ReplaceExisting` only succeeds against an
+owner that itself set `AllowReplacement`, which an impostor will not, so the change would have
+bought nothing against the attacker while letting any peer take the name from a live daemon in
+one call. The step now says what is true instead: name-request flags are not a lever here at all.
+Findings and severities are unchanged.
+
 ---
 
 ## Scope and method
@@ -227,16 +235,42 @@ It is the mirror image of F1: F1 is "any peer can call `clippod`", this is "any 
    be, or can drive, the real `clippod` binary". That is a speed bump, not a boundary, and it is
    worth having only because it is a handful of lines. It is the same helper F1 needs, pointed the
    other way — one function, two call sites, which is the argument for doing both at once.
-3. **Close the queue-and-wait step.** `clippod` cannot stop a peer queueing, but it can make the
-   window smaller: `AllowReplacement | ReplaceExisting` on its own request means a restarting
-   `clippod` takes the name back from whoever holds it rather than exiting — which inverts the
-   outcome of step 3 above. Note the trade-off, because it is real: that also makes the name
-   stealable from a *running* daemon by any peer that asks with `ReplaceExisting`, which is
-   precisely what the current flags prevent. I would not change this without deciding which of
-   the two an operator would rather have; the honest answer may be "neither, document it".
+2. **Make the frontends say so, loudly.** The reason the chain above ends with "the applet
+   reconnects and looks normal" is that reconnection is silent. `watch_daemon_name`
+   (`bus.rs:330-368`) treats a new owner as good news. Pair it with step 1: when the owner check
+   fails, the picker should show that it is refusing to talk to whoever holds the name, and
+   `clippo` should exit with that message rather than a generic call failure. A `failed` unit and
+   a journal line are not evidence the user will look at; the picker is.
+3. **Do not reach for the name-request flags. They cannot evict a squatter, and changing them
+   makes this finding worse.** This is worth stating explicitly because it is the obvious-looking
+   fix and it is a trap. `ReplaceExisting` succeeds only when the *current* owner requested
+   `AllowReplacement` — zbus 5.18.0's own documentation is unambiguous
+   (`src/fdo/dbus.rs:31-33`: "If `AllowReplacement` is not specified by application A, or
+   `ReplaceExisting` is not specified by application B, then application B will not replace
+   application A as the owner"; `ReplaceExisting`'s own doc at `:35-38` says the same from the
+   other side, and `RequestNameReply::PrimaryOwner` at `:54-57` is documented as requiring both
+   halves). The impostor chooses its own flags and has no reason to set `AllowReplacement`; it
+   does not need it, because queue-and-wait requires only the *absence* of `DoNotQueue`. So a
+   restarting `clippod` asking with `AllowReplacement | ReplaceExisting` would still get
+   `Exists`, still hit the same `taken()` arm (`main.rs:307`), and still exit — step 3 of *Taking
+   the name* plays out identically. What the change would buy the attacker, on the other hand, is
+   substantial: `AllowReplacement` on `clippod` lets any session-bus peer take the name from a
+   **live, healthy** daemon with a single `RequestName(ReplaceExisting)` call. That deletes this
+   finding's own precondition — no crash needed, no F2 needed, no waiting — and turns a Medium
+   finding into an unconditional one-call takeover.
+
+   Dropping `DoNotQueue` so `clippod` queues instead of exiting is the only flag-level change
+   that recovers ownership at all, and it reintroduces exactly the hazard `acquire_name`'s doc
+   comment (`main.rs:284-288`) says the flag exists to prevent: a queued `clippod` watches the
+   clipboard and writes to the database while owning nothing. Bus policy is no help either —
+   `<deny own="…"/>` can only discriminate by uid, and every peer on a session bus is the same
+   uid, the same reason the uid check in step 1 is vacuous. **There is no configuration-level
+   defence here.** Steps 1 and 2 are the whole of the available mitigation, which is itself the
+   argument for doing them.
 4. **Say it in DESIGN.md's risk table**, alongside F1's entry. An operator reading the current
    table learns that peers are trusted *with* the history. They should also learn that a peer can
-   *be* the history.
+   *be* the history — and, per the previous step, that the name flags are not the lever they
+   look like.
 
 ---
 
@@ -484,7 +518,7 @@ The versions clippo asks for directly are current: `openssl-src 300.6.1+3.6.3`, 
 advisory.
 
 **That list is not the whole tree, and saying so is the point of this section.** `cargo tree -d`
-reports 58 crate names present at more than one version, most of them the ordinary consequence of
+reports 59 crate names present at more than one version, most of them the ordinary consequence of
 depending on libcosmic from a git revision (two `bitflags`, four `hashbrown`, three `getrandom`,
 three `linux-raw-sys`, and `iced_core`/`cosmic-config` twice each from two spellings of the same
 git source — churn, not exposure). Three duplicates are on paths
@@ -553,8 +587,10 @@ together: they are the same missing question — *which peer is on the other end
 connection* — asked once about callers and once about the daemon they call. F5's first fix step
 is the cheaper of the two and I would take it regardless; beyond that the choice is a product one
 about whether `Paste` and `Reveal` should be reachable by anything that can open a session bus
-connection, and whether `clippod` should fight for its name or exit politely. That decision is a
-human's, not mine.
+connection. That decision is a human's, not mine. What is *not* a decision, and is the thing I
+would most want a reader to take from F5, is that there is no flag or policy setting that fixes
+it: `clippod` cannot fight for its name, because `ReplaceExisting` only works against an owner
+that consented to be replaced, and consenting is strictly worse. See F5's third fix step.
 
 One area is explicitly **not covered**: `oo7` and the `zbus 4.4.0` beneath it, which is the code
 that moves the database key between the daemon and the keyring. See *Dependency posture*.
