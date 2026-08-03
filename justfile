@@ -44,11 +44,24 @@ test:
 fmt:
     cargo fmt --all
 
-# Everything CI runs, in the same order.
+# The build half of what CI runs, in the same order.
+#
+# CI runs one more thing — `just deny` — which is left out of here because it
+# needs a tool that is not part of a Rust install and a network round trip to
+# the advisory database, neither of which belongs in the command you run before
+# every commit.
 check:
     cargo fmt --check
     cargo clippy --workspace --all-targets -- -D warnings
     dbus-run-session -- cargo test --workspace
+
+# The dependency tree against the RustSec advisory database. See deny.toml.
+#
+# Needs `cargo install --locked cargo-deny` (or the binary from its releases)
+# and network access; it reads Cargo.lock rather than building anything, so it
+# does not need the workspace to compile.
+deny:
+    cargo deny check advisories
 
 clean:
     cargo clean

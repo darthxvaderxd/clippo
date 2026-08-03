@@ -1,0 +1,58 @@
+# cargo-deny: the dependency judgement, kept continuous.
+#
+# `security_audit.md` checked the tree by hand at one revision and found no
+# crate at a version carrying an open advisory. That answer went stale the
+# moment it was written — both because the tree moves and because the advisory
+# database does. CI runs `cargo deny check advisories` on every push so the
+# answer is produced by a tool with a current database rather than by reading
+# the manifests.
+#
+# **Scope: advisories only.** `bans`, `licenses` and `sources` are deliberately
+# not run. `cargo tree -d` reports 59 crate names at more than one version,
+# almost all of them the ordinary consequence of depending on libcosmic from a
+# git revision, so a `bans` check would be a wall of noise nobody could act on;
+# licences are a real question but a different one, and answering it badly is
+# worse than not answering it here. Adding either later means widening the CI
+# command, not rewriting this file.
+#
+# **How an accepted advisory is recorded.** By id, in `ignore` below, with a
+# sentence saying why. Never by loosening a check: an advisory that has been
+# looked at and accepted is a decision worth reading, and a check turned off is
+# a decision nobody can see.
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+# Every unmaintained crate in the tree, not only the ones clippo names itself.
+# The three currently accepted are listed below; a fourth arriving is something
+# to look at rather than something to swallow.
+unmaintained = "all"
+
+# A yank is usually actionable — bump the lock — but it can also land with
+# nothing to move to, and a yank made for a security reason arrives as an
+# advisory as well, which is denied above. Visible in the log, not a red build.
+yanked = "warn"
+
+ignore = [
+    # All three below are libcosmic's rendering stack, reached only by
+    # `clippo-applet`: the daemon that holds the clipboard history does not
+    # link any of them. Each is "no safe upgrade is available" — the fix is a
+    # libcosmic release that moves off them, which is not something this
+    # repository can do — and each is *unmaintained*, not a vulnerability.
+    # They are accepted so that a genuine advisory is not lost in a job that
+    # was already red.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser is unmaintained; reached through libcosmic -> cosmic-text/fontdb/resvg. Font parsing for theme and icon assets shipped with the desktop, never clipboard bytes: INTERESTING_MIMES has no SVG or font entry, so clippo neither stores nor hands on either. clippo-applet only." },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz is unmaintained; reached through libcosmic -> usvg -> resvg, and it is the same SVG rasterisation path as ttf-parser above. clippo-applet only." },
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained (a proc-macro, archived by its author); reached through libcosmic -> wgpu-hal -> metal, which is the macOS backend and is not even compiled on the Linux target clippo builds for. clippo-applet only." },
+
+    # Nothing here yet, and this is the one to expect:
+    #
+    # `rusqlite 0.32.1` / `libsqlite3-sys 0.30.1` pin the vendored SQLCipher
+    # build, which trails upstream SQLite by some distance. That is maintenance
+    # rather than a finding — clippo never executes caller-supplied SQL, every
+    # statement in `clippo-store` is parameterised, and it never opens a
+    # database it did not itself write, so nothing untrusted reaches the SQL
+    # parser. If an advisory does land on that pair, the reasoning above is
+    # what would go in an `ignore` entry here; a *parser* advisory reachable
+    # from a file clippo opens is the case that would not qualify.
+]
