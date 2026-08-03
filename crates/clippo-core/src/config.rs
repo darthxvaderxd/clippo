@@ -548,7 +548,10 @@ mask_suffix = 2
 
     #[test]
     fn a_missing_file_yields_defaults_and_is_not_an_error() {
-        let missing = std::env::temp_dir().join("clippo-does-not-exist-4c1f/config.toml");
+        // An empty private directory, so "missing" is a fact about the path
+        // rather than a bet that nobody else in /tmp picked the same name.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join(paths::CONFIG_FILE_NAME);
         assert!(!missing.exists());
         assert_eq!(Config::load_from(&missing).unwrap(), Config::default());
     }
@@ -779,14 +782,14 @@ mask_suffix = 2
     fn a_real_file_on_disk_loads_through_the_same_rules() {
         // The file path, not just the text: `load_from` is what `load` calls
         // once `paths` has told it where to look.
-        let dir = std::env::temp_dir().join(format!("clippo-config-{}", std::process::id()));
-        let file = dir.join(paths::CONFIG_FILE_NAME);
-        std::fs::create_dir_all(&dir).unwrap();
+        // A fresh private directory, not a name another local account could
+        // have pre-created as a symlink for us to write through. The guard
+        // removes it on drop, including when an assertion below panics.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(paths::CONFIG_FILE_NAME);
 
         std::fs::write(&file, "max_entries = 7\n[secrets]\nentropy_rule = false\n").unwrap();
         let config = Config::load_from(&file).unwrap();
-
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(config.max_entries, 7);
         assert!(!config.secrets.entropy_rule);
@@ -796,12 +799,13 @@ mask_suffix = 2
     #[test]
     fn an_unreadable_file_is_an_error_naming_the_path() {
         // A directory where a file should be: readable path, unreadable file.
-        let dir = std::env::temp_dir();
-        let error = match Config::load_from(&dir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let error = match Config::load_from(path) {
             Err(error @ ConfigError::Read { .. }) => error.to_string(),
             other => panic!("expected a read error, got {other:?}"),
         };
-        assert!(error.contains(&dir.display().to_string()), "{error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
     }
 
     #[test]
