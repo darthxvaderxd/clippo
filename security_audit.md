@@ -8,19 +8,28 @@ Revision audited: `574472c` on `harness/sam-worker/2026-08-03-04-59-48-clippo-se
 This is an audit of the repository as it stands, not a review of a diff. Nothing here has been
 fixed; each finding says precisely enough for someone else to fix it.
 
+Second revision, after review. What changed: **F5** is new — the mirror of F1, and the reason F2
+is more than a denial of service; *Dependency posture* now works from `cargo tree -d` rather than
+from the manifests, which is what surfaced the `zbus 4.4.0` beneath `oo7` on the daemon's link
+path; the image-decoding and key-management certifications now state which decoder and which
+crate they actually cover; and `clippo reveal`'s unescaped output has moved from a clause inside
+a clean certification to a note of its own. F1–F4 are otherwise unchanged.
+
 ---
 
 ## Scope and method
 
 Every source file in `crates/` was read, plus `res/clippod.service`, `.github/workflows/ci.yml`,
-the `justfile`'s install/uninstall recipes, `Cargo.toml` and `Cargo.lock`. The approach was to
-trace values from untrusted inputs to sinks rather than to grep for patterns. The untrusted
-inputs clippo actually has are:
+the `justfile`'s install/uninstall recipes, `Cargo.toml` and `Cargo.lock`; `cargo tree -d` and
+`cargo tree -i` were run to establish which versions of a duplicated crate are on which
+binary's link path. The approach was to trace values from untrusted inputs to sinks rather than
+to grep for patterns. The untrusted inputs clippo actually has are:
 
 | Input | Who controls it | Where it enters |
 |---|---|---|
 | Selection MIME types and blob bytes | any Wayland client on the seat | `clippo-wayland::watch` |
 | D-Bus method arguments | any peer on the session bus | `clippo-ipc::service` |
+| D-Bus method *replies* | whoever owns `com.nilfactor.Clippo` | `clippo-applet::bus`, `clippo-cli::client` |
 | `~/.config/clippo/config.toml` | the user | `clippo-core::config` |
 | `history.db`, `key` | whoever can write the data directory | `clippo-store` |
 | CLI arguments | the user | `clippo-cli` |
@@ -34,7 +43,9 @@ and no path or URL built from clipboard content anywhere in the workspace — `g
 The codebase is unusually careful. Masking, display escaping, key handling, echo suppression and
 blob lifetime are all reasoned about in comments *and* pinned by tests, and I found no defect in
 any of them. The findings below are concentrated in one place the design has not reasoned about
-— **who is allowed to call the daemon** — plus one input-handling bug on the capture path.
+— **peer identity on the session bus**, in both directions: who is allowed to call the daemon
+(F1) and who the frontends are willing to accept *as* the daemon (F5) — plus one input-handling
+bug on the capture path.
 
 ---
 
@@ -115,17 +126,131 @@ I would not recommend inventing a bespoke authentication scheme here. The genuin
 answer for a clipboard manager on Wayland is compositor-mediated access (a portal), which does
 not exist for this yet; documenting the gap is the honest interim step.
 
+See **F5**, which is the same gap read in the other direction and is placed next because the two
+share a fix.
+
+---
+
+### F5 — Nothing verifies who owns `com.nilfactor.Clippo`, so a peer that takes the name becomes the history: every search keystroke, and every row the user is shown
+
+*(Numbered out of order deliberately: F5 was found after F2–F4 but belongs beside F1, and
+renumbering would break references from the previous revision of this document.)*
+
+**Severity: Medium.** Reachable by any peer on the session bus with no authentication and no
+user interaction, but it must first take a name the daemon normally holds — the "Taking the
+name" section below is what makes that cheap rather than a coin-flip at login.
+**Confidence: the code paths are confirmed, traced end to end (name request, both frontends'
+lack of an owner check, the search-per-keystroke route). The queue-and-wait acquisition below is
+standard D-Bus name-ownership behaviour applied to this unit file and this flag set, reasoned
+rather than executed against a live bus — see the caveat where it is stated.**
+
+**The path.** `acquire_name` (`crates/clippod/src/main.rs:289-311`) requests the name with
+`RequestNameFlags::DoNotQueue` and nothing else. That flag set is right for the problem it was
+written for — the module comment says so, and it is the reason a second `clippod` exits loudly
+instead of writing to the same database — and the absence of `AllowReplacement` means a *running*
+`clippod` cannot have the name taken from it. What is missing is the other half: neither frontend
+ever asks who answered.
+
+- The applet resolves `BUS_NAME` and calls (`crates/clippo-applet/src/bus.rs:381-430`). The only
+  owner-related code in the workspace is presence-checking — `watch_daemon_name` (`:330-350`) and
+  `daemon_is_running` (`:369-374`) — both of which ask *whether* the name has an owner, never
+  *which* peer owns it.
+- The CLI is the same: `Client::connect` (`crates/clippo-cli/src/client.rs:33-37`) builds a proxy
+  on the well-known name and, as its own doc comment notes, sends nothing until the first call.
+- `grep` for `GetConnectionCredentials`, `GetNameOwner` or `get_connection_unix_process_id` across
+  the workspace returns nothing.
+
+**Taking the name.** The impostor does not have to win a race at login, which is what makes this
+worth writing down:
+
+1. It calls `RequestName` *without* `DoNotQueue` and is put in the queue, owning nothing. This
+   costs it nothing and is invisible — `clippod` never enumerates queued owners.
+2. It waits for the current owner to drop the name; the queued peer becomes primary owner the
+   instant that happens. Any mid-session `clippod` exit will do — a crash, an OOM kill, a
+   `systemctl --user restart clippod`, or **F2 above**. (Logout is no use to the attacker:
+   `PartOf=cosmic-session.target` ends the whole session, so there is no user left to watch.)
+3. `clippod` restarts five seconds later (`RestartSec=5`), finds the name taken, and exits
+   non-zero with the "another process already owns…" message. `Restart=on-failure` retries;
+   `StartLimitBurst=20` over `StartLimitIntervalSec=300` means it gives up after about a hundred
+   seconds and stays `failed` for the rest of the session. The impostor then owns the name
+   uncontested and the real daemon is out of the way permanently. The user's evidence that
+   anything happened is a `failed` unit and a journal line — the applet reconnects and looks
+   normal.
+
+So F2 is not only a denial of service on its own terms — it is the trigger for this. That chain
+is the reason I would not treat F2's severity as purely availability.
+
+**What the impostor gets.** The applet reconnects as soon as `NameOwnerChanged` says the name has
+an owner again (`bus.rs:330-368`) and starts talking to it:
+
+- **Every character typed into the picker's search field.** `Message::QueryChanged` calls
+  `refresh()` on every keystroke and the applet sends the whole query to the daemon's `Search`
+  rather than filtering locally (`crates/clippo-applet/src/app.rs:447-454`, `bus.rs:387-393`).
+  The comment explains why — the applet and `clippo search` must rank identically, so only one of
+  them ranks — and the reasoning is sound; the consequence is that the search box is a keylogger
+  the moment the peer on the other end is hostile. Users search a clipboard history for the thing
+  they are about to paste, so the queries are not innocuous.
+- **Full control of what the user is shown.** `Search` replies are rendered as rows, `Reveal`
+  replies are displayed as the entry's value, and `Thumbnail` replies are displayed as its
+  picture. A user who opens the picker to retrieve a copied token sees rows the impostor wrote.
+- **`Toggle` as well, on the same terms.** `serve_toggle` (`bus.rs:307-327`) *warns and carries
+  on* when `com.nilfactor.ClippoApplet` is already taken — "another instance has it, and
+  `clippo show` will reach that one". The consequence is small (a toggle carries no data) but it
+  is the same missing check, and the comment shows the collision was considered as an
+  operational problem rather than as a security one.
+
+**What it does not get, stated so nobody over-reads this.** The impostor cannot type: keystroke
+synthesis needs `zwp_virtual_keyboard_v1`, and the applet does nothing locally when `Paste`
+returns — it neither writes the clipboard itself nor checks the reply (`bus.rs:400-403`). It
+cannot read the real history either; that is on disk under the user's key and a hostile *peer*
+has no more access to it than before. Whether it can put its own bytes on the clipboard depends
+on its own Wayland access, not on anything clippo gives it: a normal client on the seat can set a
+selection through `wl_data_device`, but the sandboxed app of F1's scenario — denied data-control
+— generally cannot. **The primitive here is display and input *capture*, not clipboard write.**
+It is the mirror image of F1: F1 is "any peer can call `clippod`", this is "any peer can *be*
+`clippod`", and the second needs no privileged Wayland protocol at all.
+
+**Fix.**
+
+1. **Have the frontends check the owner, and make the check the same shape as F1's.**
+   `fdo::DBusProxy::get_name_owner` gives the unique name behind `com.nilfactor.Clippo` and
+   `get_connection_credentials` on that returns the owner's pid; `/proc/<pid>/exe` compared
+   against the installed `clippod` path (plus the absence of `/.flatpak-info`) is the check with
+   any content in it. Run it at connect time and again on every `NameOwnerChanged` that brings the
+   name back, and refuse to send anything to an owner that fails it.
+
+   Be clear about what this is not: **a uid check is nearly vacuous here.** Every peer on a
+   session bus is the same uid by construction, so "is the owner my uid" is true for the impostor
+   too. And the pid check has the same weaknesses on this side as it does in F1's — pids are
+   reusable, and an allowlisted binary can be driven by whoever started it. This narrows the set
+   of processes that can impersonate the daemon from "anything on the bus" to "anything that can
+   be, or can drive, the real `clippod` binary". That is a speed bump, not a boundary, and it is
+   worth having only because it is a handful of lines. It is the same helper F1 needs, pointed the
+   other way — one function, two call sites, which is the argument for doing both at once.
+3. **Close the queue-and-wait step.** `clippod` cannot stop a peer queueing, but it can make the
+   window smaller: `AllowReplacement | ReplaceExisting` on its own request means a restarting
+   `clippod` takes the name back from whoever holds it rather than exiting — which inverts the
+   outcome of step 3 above. Note the trade-off, because it is real: that also makes the name
+   stealable from a *running* daemon by any peer that asks with `ReplaceExisting`, which is
+   precisely what the current flags prevent. I would not change this without deciding which of
+   the two an operator would rather have; the honest answer may be "neither, document it".
+4. **Say it in DESIGN.md's risk table**, alongside F1's entry. An operator reading the current
+   table learns that peers are trusted *with* the history. They should also learn that a peer can
+   *be* the history.
+
 ---
 
 ### F2 — One hostile selection can force an unbounded number of capped flavor reads, because dedup compares MIME strings exactly while the interest test does not
 
-**Severity: Low–Medium.** Denial of service only. Reachable by any Wayland client on the seat,
-with no authentication and no user interaction beyond the client setting a selection.
+**Severity: Low–Medium.** Denial of service in itself — but see F5, for which a daemon crash is
+the trigger, so an attacker who can reach both gets more than availability out of this one.
+Reachable by any Wayland client on the seat, with no authentication and no user interaction
+beyond the client setting a selection.
 **Confidence: the code defect is confirmed by reading; the peak-resource figures below are
 reasoned estimates, not measured.**
 
 **The path.** `is_interesting` normalises before comparing — it strips *all* ASCII whitespace and
-compares case-insensitively (`crates/clippo-wayland/src/mime.rs:40-45`, `:66-68`). The dedup in
+compares case-insensitively (`crates/clippo-wayland/src/mime.rs:40-45`, `:66-71`). The dedup in
 `interesting_flavors` compares the raw strings instead:
 
 ```rust
@@ -244,13 +369,16 @@ as a symlink — pids are a small, guessable space and the attacker can seed man
 have `cargo test` truncate and overwrite an arbitrary file writable by the user running the
 tests.
 
-**The right helper is already a dev-dependency and is used everywhere else in the repo.**
-`tempfile` is in `[workspace.dependencies]` and `key.rs`, `store.rs` and `daemon.rs` all use
-`tempfile::tempdir()`. This one test does not.
+**The right helper is already in the workspace and is used everywhere else in the repo.**
+`tempfile = "3"` is in `[workspace.dependencies]` (`Cargo.toml:93`) and `key.rs`, `store.rs` and
+`daemon.rs` all use `tempfile::tempdir()`. This one test does not.
 
-**Fix.** Replace with `tempfile::tempdir()`, as the neighbouring tests do; that also removes the
-`remove_dir_all` at the end, which currently leaks the directory whenever an assertion above it
-fails.
+**Fix.** Replace with `tempfile::tempdir()`, as the tests in the other crates do; that also
+removes the `remove_dir_all` at the end, which currently leaks the directory whenever an
+assertion above it fails. One wrinkle worth knowing before someone picks this up: it is not a
+pure call-site swap, because `crates/clippo-core/Cargo.toml` has **no `[dev-dependencies]`
+section at all** — the fix means adding one with `tempfile = { workspace = true }`, as
+`clippo-store` already has. Still a small change, but not a one-liner.
 
 ---
 
@@ -275,6 +403,16 @@ fails.
   (`crates/clippod/src/cache.rs:92-114`). Any peer that can do this can also call `Reveal`, so it
   buys an attacker nothing they do not already have; a length cap on `query` would still be
   cheap insurance.
+- **`clippo reveal` writes clipboard content to the terminal unescaped.** `run.rs:134-139` emits
+  the stored value byte for byte — "no trailing newline, no sanitising", as the comment says — so
+  a copied ANSI or OSC sequence reaches the terminal raw and can repaint it, retitle the window,
+  or on some terminals prime the input buffer. I am not filing this as a finding: it is the
+  documented purpose of the command, `clippo reveal --help` warns about escape sequences
+  explicitly (`cli.rs:85`), and `reveals_help_says_it_does_not_sanitize` (`cli.rs:448`) pins the
+  warning so it cannot be edited away unnoticed. That is the right treatment. It is recorded here
+  because it is the one place the escaping invariant is deliberately off, and a reader of the
+  "Terminal and UI injection" certification below should know where the exception is rather than
+  infer that there is none.
 - **The unsalted dedup hash is handled correctly.** It is deliberately kept out of
   `EntrySummary` and out of logs. Worth preserving as an invariant if the summary type ever
   grows a field.
@@ -289,6 +427,9 @@ Stated explicitly so the absence of findings here is a result rather than an omi
   wider-than-`0600` key file refused rather than used; `create_new` so a key file is never
   overwritten; and the rule-4 refusal that stops a fallback key file being minted underneath a
   database it cannot open. The reasoning in the module header is correct and the tests match it.
+  Scope: this covers clippo's *own* handling of the key. It does not cover `oo7 0.3.3`, the
+  Secret Service client that carries the key between `key.rs` and the keyring, or the
+  `zbus 4.4.0` it brings with it — see *Dependency posture*.
 - **Encryption at rest** — `PRAGMA key` is the first statement on the connection, the read that
   follows is what turns a wrong key into a named error, and
   `what_was_copied_is_not_in_the_file` (`store.rs:1474`) checks every file in the directory, not
@@ -301,15 +442,25 @@ Stated explicitly so the absence of findings here is a result rather than an omi
   *and* the Cf reordering/invisible ranges that `char::is_control` misses, counts output rather
   than input characters so escaping cannot widen a row, and is applied by the CLI table, the
   applet rows and `--json` (via `escape_invisible`, which is sound because JSON's syntax is
-  ASCII). `clippo reveal` is the one deliberate exception and says so in its `--help`.
+  ASCII). Every path that renders a value applies it; the single exception is `clippo reveal`,
+  which is deliberate and is described in the Notes above rather than certified here.
 - **Masking** — fixed-width bullet run so the mask does not leak length; grapheme-cluster
   counting so a combining accent or a ZWJ emoji is not cut in half; short values masked
   completely; `mask_prefix + mask_suffix` capped at 16 by the config loader; and masking applied
   *before storage*, so `List` and `Search` have no unmasked preview to return even in principle.
-- **Image decoding** — clipboard PNG/JPEG is decoded with `Limits::max_alloc` set to 256 MB
-  (`clippo-store/src/images.rs:54`), the format is guessed from the bytes rather than trusted from
-  the advertised MIME, and a decode failure stores the entry without a thumbnail rather than
-  refusing it.
+- **Image decoding *in the daemon*** — clipboard PNG/JPEG reaching `clippo-store` is decoded with
+  `Limits::max_alloc` set to 256 MB (`clippo-store/src/images.rs:54`), the format is guessed from
+  the bytes rather than trusted from the advertised MIME, and a decode failure stores the entry
+  without a thumbnail rather than refusing it. Scope of that certification, stated because the
+  tree contains two decoder pairs: this covers `image 0.25.10` → `png 0.18.1` / `zune-jpeg 0.5.15`,
+  which is the pair that sees clipboard bytes. It does **not** cover `png 0.17.16` /
+  `zune-jpeg 0.4.21` (see *Dependency posture*), and it does not cover the applet's own decode —
+  `Thumbnails::store` hands the bytes from a `Thumbnail` reply straight to
+  `cosmic::widget::image::Handle::from_bytes` (`clippo-applet/src/thumbs.rs:88`), where iced's
+  image pipeline decodes them under whatever limits *it* sets. clippo's 256 MB ceiling is applied
+  in `clippo-store` and does not travel with the bytes. Against a genuine `clippod` those bytes
+  are its own re-encoded 256-pixel PNG and this is uninteresting; under F5 they are attacker-chosen,
+  which is the case that makes it worth naming rather than assuming.
 - **Paste-path resource handling** — per-flavor size cap with the buffer released rather than
   truncated, per-selection read timeout, per-paste write timeout, a cap on outstanding pastes
   with oldest-first eviction, and non-blocking fds throughout so a receiver that stops reading
@@ -327,10 +478,51 @@ Stated explicitly so the absence of findings here is a result rather than an omi
 
 ## Dependency posture
 
-`Cargo.lock` is current across the board: `openssl-src 300.6.1+3.6.3`, `image 0.25.10`,
+The versions clippo asks for directly are current: `openssl-src 300.6.1+3.6.3`, `image 0.25.10`,
 `png 0.18.1`, `zune-jpeg 0.5.15`, `regex 1.13.1`, `tokio 1.53.1`, `zbus 5.18.0`,
 `wayland-client 0.31.15`. No crate in the tree is at a version I recognise as carrying an open
 advisory.
+
+**That list is not the whole tree, and saying so is the point of this section.** `cargo tree -d`
+reports 58 crate names present at more than one version, most of them the ordinary consequence of
+depending on libcosmic from a git revision (two `bitflags`, four `hashbrown`, three `getrandom`,
+three `linux-raw-sys`, and `iced_core`/`cosmic-config` twice each from two spellings of the same
+git source — churn, not exposure). Three duplicates are on paths
+this audit makes claims about, and an earlier revision of this document listed only the newer
+copy of each, which read as "the tree is current" when what was true was "the versions clippo
+names in its own manifests are current":
+
+| Crate | Older copy in the lock | Pulled in by | On whose link path |
+|---|---|---|---|
+| `zbus` (+ `zvariant 4.2.0`, `zbus_names 3.0.0`) | **4.4.0** | `oo7 0.3.3` | **`clippod`**, via `clippo-store` |
+| `png` | **0.17.16** | `tiny-skia 0.11.4` ← `iced_tiny_skia`, and `resvg 0.45.1` | `clippo-applet` only |
+| `zune-jpeg` (+ `zune-core 0.4.12`) | **0.4.21** | `resvg 0.45.1` | `clippo-applet` only |
+
+Each was confirmed with `cargo tree -i -p <crate>@<version>`.
+
+The `zbus 4.4.0` one deserves naming because of *what* pulls it in. `oo7` is an unconditional
+dependency of `clippo-store` (`crates/clippo-store/Cargo.toml:16`) and `clippo-store` is a
+dependency of `clippod` alone, so **the daemon links two major versions of zbus**: 5.18.0 for the
+interface it exports, 4.4.0 underneath the Secret Service client that carries the database key to
+and from the keyring. `oo7` is not otherwise mentioned in this document, including in the
+"Key management — found clean" paragraph, which audits `key.rs`'s handling of the key and not the
+library that transports it. `default-features = false` with `["tokio", "native_crypto", "tracing"]`
+(`Cargo.toml:63`) is a deliberate and sensible narrowing — the workspace comment explains it — but
+narrowing features is not the same as auditing the crate, and I did not audit `oo7` or
+`zbus 4.4.0`. Treat the key-transport path as *not covered* by this review rather than as cleared
+by it.
+
+The two older image decoders are the reverse case: worth listing, but not on a path clipboard
+content reaches. They arrive through libcosmic's SVG rasterisation stack (`resvg`/`tiny-skia`),
+which in this application renders theme and icon assets shipped with the desktop, not bytes from
+the clipboard — `INTERESTING_MIMES` (`clippo-wayland/src/mime.rs:24-32`) has no SVG entry, so
+clippo never stores or hands on an SVG. Clipboard PNG and JPEG go through `image 0.25.10` in the
+daemon and through iced's image pipeline in the applet, both of which use the 0.18/0.5 copies.
+They are recorded here because they are the oldest decoder versions present and because the
+previous revision's enumeration silently dropped them.
+
+`cargo tree -d` is the one command that surfaces all of this, and a future revision of this
+section should start from its output rather than from the manifests.
 
 One thing to keep an eye on rather than to act on now: `rusqlite 0.32.1` /
 `libsqlite3-sys 0.30.1` pins the vendored SQLCipher, which trails upstream SQLite by some
@@ -343,15 +535,26 @@ judgement continuous instead of a point-in-time one.
 
 ## Summary
 
+Ordered by severity; the numbering is discovery order.
+
 | # | Finding | Severity | Reachable by | Confidence |
 |---|---|---|---|---|
 | F1 | Unauthenticated D-Bus surface; `Paste` injects keystrokes, `Reveal` returns the whole history | Medium | any session-bus peer, incl. sandboxed apps | confirmed (code); sandbox escalation untested on a host |
+| F5 | No frontend checks who owns the daemon's name; an impostor sees every search keystroke and controls every row shown | Medium | any session-bus peer, after taking the name | confirmed (code); queue-and-wait acquisition reasoned, not executed |
 | F2 | Unbounded flavor count per selection — exact-string dedup vs. normalised interest test | Low–Medium | any Wayland client on the seat | confirmed; impact figures estimated |
 | F3 | Detection reads one flavor while the entry carries several | Low | anything that can set a multi-flavor selection | confirmed |
 | F4 | Test writes to a predictable `$TMPDIR` path | Low | local user on a shared build host | confirmed |
 
 F2 and F4 are small, self-contained changes and each has the correct helper already present in
-the tree (`mime::same`, `tempfile`). F3 is a contained change to one function. F1 is the one that
-needs a decision rather than a patch — the fix is partly documentation and partly a product
-choice about whether `Paste` and `Reveal` should be callable by anything that can reach the
-session bus. That decision is a human's, not mine.
+the tree (`mime::same`, `tempfile`). F3 is a contained change to one function.
+
+F1 and F5 are the two that need a decision rather than a patch, and they should be decided
+together: they are the same missing question — *which peer is on the other end of this
+connection* — asked once about callers and once about the daemon they call. F5's first fix step
+is the cheaper of the two and I would take it regardless; beyond that the choice is a product one
+about whether `Paste` and `Reveal` should be reachable by anything that can open a session bus
+connection, and whether `clippod` should fight for its name or exit politely. That decision is a
+human's, not mine.
+
+One area is explicitly **not covered**: `oo7` and the `zbus 4.4.0` beneath it, which is the code
+that moves the database key between the daemon and the keyring. See *Dependency posture*.
