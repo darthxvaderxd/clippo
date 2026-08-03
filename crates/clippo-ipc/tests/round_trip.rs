@@ -12,11 +12,13 @@
 //! `dbus-run-session`; without one, the test says why it did nothing rather
 //! than reporting a pass it did not earn.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use clippo_ipc::peer::{self, PeerPolicy};
 use clippo_ipc::{
     ClippoBackend, ClippoInterface, ClippoProxy, EntrySummary, BUS_NAME, OBJECT_PATH,
 };
@@ -121,11 +123,20 @@ impl ClippoBackend for Recorder {
 }
 
 /// Serve the interface, taking the well-known name the way `clippod` does.
+///
+/// With this test binary on the caller allowlist, because `Paste` checks its
+/// caller and a test process is not one of clippo's installed binaries. That is
+/// the *subject* of the tests further down; here it would only stop this one
+/// from reaching the wire, which is what it is about.
 async fn serve(backend: Arc<Recorder>) -> zbus::Result<Connection> {
+    let me = std::env::current_exe().expect("this test process has an exe");
     let connection = Connection::session().await?;
     connection
         .object_server()
-        .at(OBJECT_PATH, ClippoInterface::new(backend))
+        .at(
+            OBJECT_PATH,
+            ClippoInterface::with_policy(backend, PeerPolicy::from_paths([me])),
+        )
         .await?;
     let reply = connection
         .request_name_with_flags(BUS_NAME, RequestNameFlags::DoNotQueue.into())
@@ -215,6 +226,170 @@ async fn every_member_carries_its_arguments_and_its_answer_across_the_bus() {
             "delete(4)",
         ]
     );
+}
+
+/// Serve the interface at its path on a connection of its own, with a chosen
+/// caller policy, and hand back a proxy pointed at that connection's unique
+/// name.
+///
+/// Two connections rather than one, because the thing under test is the
+/// *sender* of the message: with one connection the header would name the
+/// server itself, which is not a case that happens and not the case that
+/// matters.
+async fn serve_for_caller(
+    backend: Arc<Recorder>,
+    callers: PeerPolicy,
+) -> zbus::Result<(Connection, ClippoProxy<'static>)> {
+    let server = Connection::session().await?;
+    server
+        .object_server()
+        .at(OBJECT_PATH, ClippoInterface::with_policy(backend, callers))
+        .await?;
+
+    let client = Connection::session().await?;
+    let proxy = ClippoProxy::builder(&client)
+        .destination(server.unique_name().expect("a unique name").to_owned())?
+        .build()
+        .await?;
+    Ok((server, proxy))
+}
+
+/// F1: `Paste` from a peer that is not one of clippo's binaries is refused
+/// before the backend hears about it.
+///
+/// The caller here is the test process — a real peer with a real pid and a real
+/// `/proc/<pid>/exe`, resolved by the daemon over a real bus from the message
+/// header. Nothing about the refusal is simulated except the contents of the
+/// allowlist.
+#[tokio::test]
+async fn paste_from_a_peer_that_is_not_a_clippo_binary_is_refused() {
+    if !has_session_bus() {
+        return;
+    }
+
+    let backend = Arc::new(Recorder::default());
+    let (_server, clippo) = serve_for_caller(
+        Arc::clone(&backend),
+        PeerPolicy::from_paths([PathBuf::from("/nonexistent/clippo")]),
+    )
+    .await
+    .expect("the interface should serve");
+
+    let refused = clippo.paste(1).await.expect_err("Paste should be refused");
+    assert!(
+        matches!(&refused, zbus::Error::MethodError(name, _, _) if name.contains("AccessDenied")),
+        "{refused:?}"
+    );
+
+    // The message names the exe it saw, which is what makes the journal line
+    // beside it actionable.
+    let described = format!("{refused:?}");
+    let me = std::env::current_exe().expect("an exe");
+    assert!(described.contains(&me.display().to_string()), "{described}");
+
+    assert_eq!(
+        backend.calls(),
+        Vec::<String>::new(),
+        "a refused Paste must not reach the backend at all — the point is that nothing was typed"
+    );
+}
+
+/// The other half, and the one that shows the refusal above is the allowlist
+/// rather than `Paste` being broken: the same caller, over the same bus,
+/// against a list its exe is on.
+#[tokio::test]
+async fn paste_from_an_allowlisted_peer_goes_through() {
+    if !has_session_bus() {
+        return;
+    }
+
+    let backend = Arc::new(Recorder::default());
+    let me = std::env::current_exe().expect("this test process has an exe");
+    let (_server, clippo) = serve_for_caller(Arc::clone(&backend), PeerPolicy::from_paths([me]))
+        .await
+        .expect("the interface should serve");
+
+    assert!(
+        clippo.paste(1).await.expect("Paste"),
+        "Paste answers a bool"
+    );
+    assert_eq!(backend.calls(), ["paste(1)"]);
+}
+
+/// `Paste` is the only member gated, deliberately — it is the only one whose
+/// effect leaves clippo's own data. Everything else answers a caller the
+/// allowlist would refuse, because refusing `List` would break the CLI without
+/// making anything safer: a peer that can read the history can read the
+/// database too.
+#[tokio::test]
+async fn the_caller_check_is_on_paste_and_nowhere_else() {
+    if !has_session_bus() {
+        return;
+    }
+
+    let backend = Arc::new(Recorder::default());
+    let (_server, clippo) = serve_for_caller(
+        Arc::clone(&backend),
+        PeerPolicy::from_paths([PathBuf::from("/nonexistent/clippo")]),
+    )
+    .await
+    .expect("the interface should serve");
+
+    clippo.list(1, 0).await.expect("List");
+    clippo.search("x", 1).await.expect("Search");
+    clippo.copy(1).await.expect("Copy");
+    clippo.reveal(1).await.expect("Reveal");
+    assert!(clippo.paste(1).await.is_err(), "only Paste is gated");
+
+    assert_eq!(
+        backend.calls(),
+        ["list(1, 0)", "search(\"x\", 1)", "copy(1)", "reveal(1)"]
+    );
+}
+
+/// F5, from the frontends' side: the helper both of them use, over a real bus,
+/// against a name this test really owns.
+#[tokio::test]
+async fn a_name_owner_that_is_not_a_clippo_binary_is_reported_as_untrusted() {
+    if !has_session_bus() {
+        return;
+    }
+
+    // A name of this test's own. Taking `com.nilfactor.Clippo` here would make
+    // whichever other test wanted it fail, since the whole suite shares one bus.
+    const SCRATCH: &str = "com.nilfactor.ClippoIpcOwnerTest";
+    let squatter = Connection::session().await.expect("a connection");
+    squatter
+        .request_name(SCRATCH)
+        .await
+        .expect("the scratch name");
+
+    let asking = Connection::session().await.expect("a connection");
+
+    let refused = peer::owner_of(&asking, SCRATCH, &PeerPolicy::from_paths([]))
+        .await
+        .expect("asking the bus should work");
+    assert!(matches!(refused, peer::Owner::Untrusted(_)), "{refused:?}");
+
+    // The same owner, on a list it is on.
+    let me = std::env::current_exe().expect("an exe");
+    let accepted = peer::owner_of(&asking, SCRATCH, &PeerPolicy::from_paths([me]))
+        .await
+        .expect("asking the bus should work");
+    match accepted {
+        peer::Owner::Trusted(found) => assert_eq!(found.pid, std::process::id()),
+        other => panic!("the owner is this process and it is on the list: {other:?}"),
+    }
+
+    // And nothing at all is a third answer, not a refusal.
+    let absent = peer::owner_of(
+        &asking,
+        "com.nilfactor.ClippoIpcNobodyOwnsThis",
+        &PeerPolicy::from_paths([]),
+    )
+    .await
+    .expect("asking about an unowned name is not an error");
+    assert!(matches!(absent, peer::Owner::Absent), "{absent:?}");
 }
 
 #[tokio::test]

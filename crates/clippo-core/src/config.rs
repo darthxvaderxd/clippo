@@ -11,6 +11,7 @@
 //! capture_primary = false
 //! auto_paste = true
 //! paste_shortcut = "Ctrl+V"
+//! allow_privileged_members = true
 //!
 //! [secrets]
 //! entropy_rule = true
@@ -77,6 +78,14 @@ pub const DEFAULT_PASTE_SHORTCUT: &str = "Ctrl+V";
 /// who would rather clippo never synthesised input — see [`Config::auto_paste`],
 /// which is a capability switch and not a preference about the applet.
 pub const DEFAULT_AUTO_PASTE: bool = true;
+
+/// Whether `Reveal` and `Paste` may be called over D-Bus at all. **On.**
+///
+/// On because turning it off costs the applet its `Ctrl+R` and its `Enter`, and
+/// most users are not running the sandboxed applications this is about. See
+/// [`Config::allow_privileged_members`] for what "privileged" means here and
+/// why the two members are one switch.
+pub const DEFAULT_ALLOW_PRIVILEGED_MEMBERS: bool = true;
 
 /// Whether the entropy heuristic runs. DESIGN.md, "Known risks": on, with an
 /// escape hatch.
@@ -164,6 +173,33 @@ pub struct Config {
     /// startup naming the key, rather than silently pasting nothing.
     pub paste_shortcut: Chord,
 
+    /// Whether `Reveal` and `Paste` may be called over D-Bus at all.
+    ///
+    /// Those two are the members that do more than list your own previews:
+    /// `Reveal` returns a whole stored value, mask or no mask, and `Paste`
+    /// types into whatever window has keyboard focus. **A session bus
+    /// authenticates nobody**, so every process running as you can call both —
+    /// including a sandboxed application that was denied the clipboard and
+    /// keystroke-synthesis Wayland protocols directly, and which gets them back
+    /// through clippo.
+    ///
+    /// With this off, both are refused with `AccessDenied` and nothing else
+    /// changes: the history is intact, `List` and `Search` still answer, and
+    /// `Copy` still puts an entry on the clipboard for you to paste yourself.
+    /// The visible cost is that the picker's `Ctrl+R` and `clippo reveal` stop
+    /// working, and `Enter` in the picker becomes a copy — the applet falls
+    /// back to `Copy` when its `Paste` is refused, so choosing an entry still
+    /// puts it on the clipboard and only the keystroke is lost.
+    ///
+    /// **The daemon enforces it**, not the frontends — a knob a hostile caller
+    /// could skip by not being the applet would not be one.
+    ///
+    /// This is a *different* switch from [`auto_paste`][Self::auto_paste],
+    /// which is about whether clippo may synthesise input at all and leaves
+    /// `Paste` succeeding as a copy. This one is about whether an unauthenticated
+    /// peer may ask, and refuses the call outright.
+    pub allow_privileged_members: bool,
+
     /// Secret detection and masking.
     pub secrets: SecretsConfig,
 }
@@ -183,6 +219,7 @@ impl Default for Config {
             paste_shortcut: DEFAULT_PASTE_SHORTCUT
                 .parse()
                 .expect("the default paste shortcut parses"),
+            allow_privileged_members: DEFAULT_ALLOW_PRIVILEGED_MEMBERS,
             secrets: SecretsConfig::default(),
         }
     }
@@ -334,6 +371,7 @@ struct RawConfig {
     capture_primary: Option<bool>,
     auto_paste: Option<bool>,
     paste_shortcut: Option<String>,
+    allow_privileged_members: Option<bool>,
     secrets: Option<Secrets>,
 }
 
@@ -411,6 +449,11 @@ impl RawConfig {
             })?,
         };
 
+        let allow_privileged_members = match self.allow_privileged_members {
+            None => DEFAULT_ALLOW_PRIVILEGED_MEMBERS,
+            Some(value) => value,
+        };
+
         let entropy_rule = match secrets.entropy_rule {
             None => DEFAULT_ENTROPY_RULE,
             Some(value) => value,
@@ -455,6 +498,7 @@ impl RawConfig {
             capture_primary,
             auto_paste,
             paste_shortcut,
+            allow_privileged_members,
             secrets: SecretsConfig {
                 entropy_rule,
                 mask_prefix,
@@ -483,7 +527,8 @@ impl fmt::Display for Config {
         write!(
             f,
             "max_entries={}, max_age_days={} ({}), max_image_bytes={}, capture_primary={}, \
-             auto_paste={}, paste_shortcut={}, entropy_rule={}, mask={}/{}",
+             auto_paste={}, paste_shortcut={}, allow_privileged_members={}, entropy_rule={}, \
+             mask={}/{}",
             self.max_entries,
             self.max_age_days,
             if self.max_age().is_some() {
@@ -495,6 +540,7 @@ impl fmt::Display for Config {
             self.capture_primary,
             self.auto_paste,
             self.paste_shortcut,
+            self.allow_privileged_members,
             self.secrets.entropy_rule,
             self.secrets.mask_prefix,
             self.secrets.mask_suffix,
@@ -620,6 +666,38 @@ mask_suffix = 2
     #[test]
     fn auto_paste_off_does_not_excuse_an_unpressable_shortcut() {
         assert!(parse("auto_paste = false\npaste_shortcut = \"Ctrl+F13\"\n").is_err());
+    }
+
+    /// The knob a user who runs sandboxed applications reaches for. On unless
+    /// they say otherwise, because turning it off costs the picker its reveal
+    /// and its Enter.
+    #[test]
+    fn the_privileged_members_are_available_unless_they_are_turned_off() {
+        assert!(parse("").unwrap().allow_privileged_members);
+        assert!(
+            parse("allow_privileged_members = true\n")
+                .unwrap()
+                .allow_privileged_members
+        );
+        assert!(
+            !parse("allow_privileged_members = false\n")
+                .unwrap()
+                .allow_privileged_members
+        );
+    }
+
+    /// The two switches are independent, and the daemon reads both: one is
+    /// about whether clippo may synthesise input, the other about whether an
+    /// unauthenticated peer may ask it to.
+    #[test]
+    fn the_two_paste_switches_do_not_shadow_each_other() {
+        let config = parse("auto_paste = true\nallow_privileged_members = false\n").unwrap();
+        assert!(config.auto_paste);
+        assert!(!config.allow_privileged_members);
+
+        let config = parse("auto_paste = false\nallow_privileged_members = true\n").unwrap();
+        assert!(!config.auto_paste);
+        assert!(config.allow_privileged_members);
     }
 
     #[test]

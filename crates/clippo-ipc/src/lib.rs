@@ -43,8 +43,10 @@
 //! # The other direction
 //!
 //! [`AppletInterface`] and [`ClippoAppletProxy`] are a second, much smaller
-//! interface that the *applet* serves and `clippo show` calls. See
-//! [`applet`](crate::applet) for why it is a separate bus name.
+//! interface that the *applet* serves and `clippo show` calls. It is on a name
+//! of its own, [`APPLET_BUS_NAME`], because two processes cannot own one name
+//! and the applet and the daemon are two processes; the `applet` module says
+//! the rest.
 //!
 //! # Previews and full values
 //!
@@ -55,6 +57,15 @@
 //! secrets masked, and it does so by changing the one function that builds a
 //! preview. If a full value could leave by any other route, M4 would be a
 //! redesign instead of an edit.
+//!
+//! # Who is on the other end
+//!
+//! A session bus authenticates nobody: every peer running as the user can call
+//! every member here, and every peer can equally take [`BUS_NAME`] the moment
+//! nothing owns it. [`peer`] is the one helper both directions use to narrow
+//! that — `clippod` points it at the caller of `Paste`, the frontends point it
+//! at the owner of the name — and its own docs are blunt about how far it goes,
+//! which is not far. Read them before relying on it for anything.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,6 +79,7 @@
 //! ```
 
 mod applet;
+pub mod peer;
 mod proxy;
 mod service;
 
@@ -78,6 +90,7 @@ pub use applet::{
     AppletFrontend, AppletInterface, ClippoAppletProxy, ClippoAppletProxyBlocking, APPLET_BUS_NAME,
     APPLET_INTERFACE_NAME, APPLET_OBJECT_PATH,
 };
+pub use peer::{Owner, Peer, PeerError, PeerPolicy};
 pub use proxy::{ClippoProxy, ClippoProxyBlocking};
 pub use service::{emitter, ClippoBackend, ClippoInterface};
 
@@ -117,14 +130,34 @@ pub fn is_service_absent(error: &zbus::Error) -> bool {
     error_name(error).is_some_and(|name| ABSENT_SERVICE.contains(&name.as_str()))
 }
 
+/// The name `clippod` refuses with when it will not do something at all, as
+/// opposed to trying and failing.
+const ACCESS_DENIED: &str = "org.freedesktop.DBus.Error.AccessDenied";
+
+/// Whether a failed call is the daemon declining on principle.
+///
+/// There are exactly two reasons clippo answers this way, and they are the two
+/// a frontend can do something about rather than only report: the user turned
+/// `allow_privileged_members` off, or the caller is not one of clippo's own
+/// binaries. Both mean the member will keep refusing, so retrying is pointless
+/// and the frontend's fallback — the applet's `Copy` after a refused `Paste` —
+/// is the only thing left that helps.
+///
+/// Beside [`is_service_absent`] for the same reason it exists: the error name
+/// is written down once, in the crate both sides already share.
+pub fn is_access_denied(error: &zbus::Error) -> bool {
+    error_name(error).as_deref() == Some(ACCESS_DENIED)
+}
+
 /// The D-Bus error name of a failed call, when it has one.
 ///
 /// Not every [`zbus::Error`] is an error *reply* — a transport failure has no
 /// name at all — which is why this is an `Option` rather than a string that
 /// would sometimes be empty.
 ///
-/// Private: [`is_service_absent`] is the question both frontends actually ask,
-/// and a name on its own is not a decision anybody outside this module makes.
+/// Private: [`is_service_absent`] and [`is_access_denied`] are the questions
+/// the frontends actually ask, and a name on its own is not a decision anybody
+/// outside this module makes.
 fn error_name(error: &zbus::Error) -> Option<String> {
     use zbus::DBusError as _;
 
@@ -226,6 +259,36 @@ mod tests {
             "no entry 9".to_owned(),
         )));
         assert!(!is_service_absent(&refused));
+    }
+
+    /// The third answer, which is neither of the other two: the daemon is there
+    /// and will not do it. The applet's `Paste` fallback turns on this, and a
+    /// hand-typed name that never matched would make that fallback dead code
+    /// nobody noticed — so the name is asserted against zbus's own.
+    #[test]
+    fn a_refusal_on_principle_is_told_apart_from_both_of_the_others() {
+        use zbus::DBusError as _;
+
+        let denied = zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
+            "clippo refuses Paste".to_owned(),
+        )));
+        assert!(is_access_denied(&denied));
+        assert!(!is_service_absent(&denied));
+
+        let absent = zbus::Error::FDO(Box::new(zbus::fdo::Error::ServiceUnknown(String::new())));
+        assert!(!is_access_denied(&absent));
+
+        let failed = zbus::Error::FDO(Box::new(zbus::fdo::Error::Failed(
+            "no compositor".to_owned(),
+        )));
+        assert!(!is_access_denied(&failed));
+
+        assert_eq!(
+            zbus::fdo::Error::AccessDenied(String::new())
+                .name()
+                .as_str(),
+            ACCESS_DENIED
+        );
     }
 
     /// Hand-written strings drift; asserting them against what zbus itself

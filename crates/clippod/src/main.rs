@@ -132,9 +132,19 @@ async fn run(logging: &str) -> anyhow::Result<()> {
         max_age_days = config.max_age_days,
         max_image_bytes = config.max_image_bytes,
         capture_primary = config.capture_primary,
+        allow_privileged_members = config.allow_privileged_members,
         entropy_rule = config.secrets.entropy_rule,
         "clippo's configuration"
     );
+    if !config.allow_privileged_members {
+        // Said once, at startup, where it explains every later refusal. A user
+        // who set this and then wondered why Ctrl+R does nothing has one line
+        // to find.
+        info!(
+            "allow_privileged_members is off; Reveal and Paste will be refused over D-Bus. \
+             List, Search and Copy are unaffected"
+        );
+    }
 
     let (database_key, key_source) = key::acquire()
         .await
@@ -157,14 +167,8 @@ async fn run(logging: &str) -> anyhow::Result<()> {
     let signals = Signals::bus(
         clippo_ipc::emitter(&connection).context("clippo could not prepare its D-Bus signals")?,
     );
-    let daemon = Daemon::new(
-        store,
-        signals,
-        config.secrets.clone(),
-        config.paste_shortcut.clone(),
-        config.auto_paste,
-    )
-    .context("clippo could not load its history")?;
+    let daemon =
+        Daemon::new(store, signals, &config).context("clippo could not load its history")?;
 
     // Export first, take the name second: a caller that resolves the name and
     // immediately calls must find the object already there.
@@ -286,6 +290,33 @@ fn watch_config(config: &Config) -> WatchConfig {
 /// database as the first — a silent no-op second instance, which is exactly
 /// what a user would never think to look for. With it, the second process says
 /// what happened and exits non-zero.
+///
+/// # `DoNotQueue`, and nothing else. Changing this is a regression.
+///
+/// A peer can take this name while `clippod` is down, and then a restarting
+/// daemon finds it held and gives up (see DESIGN.md's "Known risks", the row
+/// about a peer *being* the history). The obvious-looking answer is to ask for
+/// the name harder. It does not work, and it makes the problem worse — so it is
+/// written down here rather than left to be rediscovered:
+///
+/// - **`ReplaceExisting` cannot evict a squatter.** It only succeeds when the
+///   *current* owner asked for `AllowReplacement`, and an impostor chooses its
+///   own flags. A restarting `clippod` asking with both would still be told
+///   `Exists` and would still exit exactly where it does now.
+/// - **`AllowReplacement` on this request is an own goal.** It would let any
+///   peer on the session bus take the name from a *live, healthy* daemon with a
+///   single call — no crash needed, no waiting. That turns a bug with a
+///   precondition into an unconditional one-call takeover.
+/// - **Dropping `DoNotQueue`** is the only flag change that recovers ownership,
+///   and it reintroduces the silent second instance this flag exists to
+///   prevent: a queued `clippod` watches the clipboard and writes to the
+///   database while owning nothing.
+///
+/// Bus policy is no help either — `<deny own="…"/>` discriminates by uid, and
+/// every peer on a session bus is the same uid. There is no configuration-level
+/// defence; the mitigation is on the *other* side, in the frontends, which
+/// check who owns the name before they say anything to it. See
+/// [`clippo_ipc::peer`].
 async fn acquire_name(connection: &Connection) -> anyhow::Result<()> {
     let name = WellKnownName::try_from(BUS_NAME).expect("clippo's bus name is a valid one");
     let taken = || {

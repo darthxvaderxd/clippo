@@ -7,13 +7,27 @@
 //! `Arc<dyn ClippoBackend>` and forwards. All of the behaviour — the store, the
 //! preview cache, the paused flag — is on the other side of that trait, in
 //! `clippod`, where it can be tested without a bus.
+//!
+//! # The one member that inspects its caller
+//!
+//! With one exception, every member forwards without looking at the message
+//! header, because the header carries nothing a *read of the user's own data*
+//! should depend on. The exception is `Paste`, whose effect leaves clippo
+//! entirely: it presses the user's paste shortcut into whatever window has
+//! keyboard focus, so a peer that can call it can type a chosen clipboard entry
+//! into a terminal. That one is checked against [`crate::peer`] before it is
+//! forwarded — see [`ClippoInterface::with_policy`], and read `peer`'s own docs
+//! on how weak a check it is.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tracing::{debug, warn};
+use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 use zbus::{fdo, Connection};
 
+use crate::peer::{self, PeerPolicy};
 use crate::{EntrySummary, OBJECT_PATH};
 
 /// What a daemon has to be able to do to serve `com.nilfactor.Clippo`.
@@ -110,12 +124,75 @@ pub trait ClippoBackend: Send + Sync + 'static {
 /// `zbus::connection::Builder::serve_at`.
 pub struct ClippoInterface {
     backend: Arc<dyn ClippoBackend>,
+    /// Which executables may call `Paste`. Built once, at construction: the
+    /// answer does not change while the daemon runs, and stat-ing four
+    /// directories on every keystroke-driven call would be a syscall storm for
+    /// a constant.
+    callers: PeerPolicy,
 }
 
 impl ClippoInterface {
-    /// Serve `com.nilfactor.Clippo` out of `backend`.
+    /// Serve `com.nilfactor.Clippo` out of `backend`, admitting `Paste` only
+    /// from the clippo binaries installed on this machine.
     pub fn new(backend: Arc<dyn ClippoBackend>) -> Self {
-        Self { backend }
+        Self::with_policy(backend, PeerPolicy::installed())
+    }
+
+    /// The same, with the caller allowlist chosen explicitly.
+    ///
+    /// Exists for tests, which are not run from an installed tree and would
+    /// otherwise have to be one of clippo's own binaries to call `Paste` at
+    /// all. [`new`][Self::new] is what `clippod` uses.
+    pub fn with_policy(backend: Arc<dyn ClippoBackend>, callers: PeerPolicy) -> Self {
+        Self { backend, callers }
+    }
+
+    /// Refuse a caller that is not one of clippo's own binaries.
+    ///
+    /// The refusal is `AccessDenied` rather than `Failed` so that a frontend
+    /// can tell "clippo will not do this for you" apart from "clippo tried and
+    /// could not", and it is logged with the pid and the exe — the journal line
+    /// is the only record anybody gets that something on the bus went looking
+    /// for a keystroke.
+    async fn vet(
+        &self,
+        member: &str,
+        header: &Header<'_>,
+        connection: &Connection,
+    ) -> fdo::Result<()> {
+        let Some(sender) = header.sender() else {
+            warn!(member, "clippo refused a call that carried no sender");
+            return Err(fdo::Error::AccessDenied(format!(
+                "clippo refuses {member}: {}",
+                peer::PeerError::NoSender
+            )));
+        };
+
+        match peer::check(connection, sender, &self.callers).await {
+            Ok(caller) => {
+                debug!(member, pid = caller.pid, exe = %caller.exe.display(), "clippo checked a caller");
+                Ok(())
+            }
+            Err(error) => {
+                // Pid and exe as their own fields as well as in the message, so
+                // `journalctl -o json` can filter on them: this is the line an
+                // operator greps for after the fact, and the one that says
+                // which process to go and look at.
+                warn!(
+                    member,
+                    sender = sender.as_str(),
+                    pid = error.pid(),
+                    exe = error.exe_for_display(),
+                    %error,
+                    "clippo refused a caller it does not recognise"
+                );
+                Err(fdo::Error::AccessDenied(format!(
+                    "clippo refuses {member} from a peer it does not recognise: {error}. \
+                     {member} types into whatever window has keyboard focus, so clippod does it \
+                     only for its own frontends"
+                )))
+            }
+        }
     }
 }
 
@@ -140,7 +217,18 @@ impl ClippoInterface {
     }
 
     /// `Paste(id) -> bool`.
-    async fn paste(&self, id: i64) -> fdo::Result<bool> {
+    ///
+    /// The one member whose caller is inspected. `#[zbus(header)]` and
+    /// `#[zbus(connection)]` are zbus's special arguments — they do not appear
+    /// in the introspected signature and no caller passes them, so the wire
+    /// contract is still `(x) -> b`.
+    async fn paste(
+        &self,
+        id: i64,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<bool> {
+        self.vet("Paste", &header, connection).await?;
         self.backend.paste(id).await
     }
 

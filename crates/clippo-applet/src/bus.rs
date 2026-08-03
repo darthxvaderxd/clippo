@@ -26,6 +26,31 @@
 //!   answered again with nothing rebuilt — the applet only has to notice, so it
 //!   can refresh a list that went stale while the daemon was away.
 //!
+//! # Reconnection is not automatically good news
+//!
+//! That last property has a sharp edge, and it is the reason
+//! [`clippo_ipc::peer`] is called from here. `com.nilfactor.Clippo` is a
+//! *name*, not an identity: any peer on the session bus can take it while
+//! `clippod` is down, and a proxy that "starts being answered again" would then
+//! be answered by that peer. Since the applet sends the whole search query to
+//! `Search` on every keystroke, and draws whatever comes back, an unchecked
+//! reconnection turns the search box into a keylogger and the list into
+//! somebody else's.
+//!
+//! So the owner is checked at connect time and again on **every**
+//! `NameOwnerChanged` that gives the name an owner. An owner that fails is not
+//! merely not talked to — it becomes [`Event::DaemonUntrusted`], which the
+//! picker draws. Silence would leave the applet looking normal, which is
+//! exactly what makes the takeover invisible.
+//!
+//! What it does not close, said plainly: the proxy is addressed to the
+//! well-known name, so a request already in flight when the name changes hands
+//! is delivered to whoever holds it on arrival. Closing that would mean
+//! addressing the proxy to the *unique* name and rebuilding it on every
+//! restart, which is the property two paragraphs up. Combined with everything
+//! [`clippo_ipc::peer`] admits about itself, this is a speed bump. It is not a
+//! boundary and must not be read as one.
+//!
 //! # Failing to own the applet name is not fatal
 //!
 //! If `com.nilfactor.ClippoApplet` is already owned — a second applet instance,
@@ -36,6 +61,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use clippo_ipc::peer::{Owner, PeerPolicy};
 use clippo_ipc::{
     AppletFrontend, AppletInterface, ClippoProxy, EntrySummary, APPLET_BUS_NAME,
     APPLET_OBJECT_PATH, BUS_NAME,
@@ -44,6 +70,7 @@ use cosmic::iced::futures::{SinkExt, Stream, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use zbus::fdo;
+use zbus::names::OwnedUniqueName;
 use zeroize::Zeroizing;
 
 use crate::model::EntryKey;
@@ -64,9 +91,14 @@ pub enum Request {
     /// `Paste(id)` — copy, and have the daemon press the user's paste
     /// shortcut into whatever has focus once the picker is gone.
     ///
-    /// There is no `Copy` beside this because nothing in the applet wants one:
-    /// `Paste` copies first and always, so choosing an entry puts it on the
-    /// clipboard whether or not the keystroke can be synthesised.
+    /// There is no `Copy` variant beside this because the UI never asks for
+    /// one: `Paste` copies first and always, so choosing an entry puts it on
+    /// the clipboard whether or not the keystroke can be synthesised.
+    ///
+    /// The exception is `Paste` being *refused* rather than failing — with
+    /// `allow_privileged_members` off the daemon declines it before the copy —
+    /// and [`serve_request`] falls back to `Copy` there, which is what makes
+    /// "`Enter` in the picker becomes a copy" true rather than aspirational.
     Paste(i64),
     /// `Delete(id)`.
     Delete(i64),
@@ -137,6 +169,14 @@ pub enum Event {
     DaemonUp,
     /// The daemon is not answering.
     DaemonDown,
+    /// Something owns the daemon's name and it is not a clippo binary.
+    ///
+    /// Carries the reason, because the picker prints it: a user looking at a
+    /// panel applet has no journal in front of them, and "clippod is not
+    /// running" would be a lie that hid the interesting case. Distinct from
+    /// [`DaemonDown`][Self::DaemonDown] for the same reason — one of them is a
+    /// daemon to start and the other is a process to look at.
+    DaemonUntrusted(String),
     /// A call failed for a reason the journal should have.
     ///
     /// Not on screen: the [`Model`][crate::model::Model] has nowhere to put a
@@ -170,6 +210,7 @@ impl std::fmt::Debug for Event {
             Event::Toggle => f.write_str("Toggle"),
             Event::DaemonUp => f.write_str("DaemonUp"),
             Event::DaemonDown => f.write_str("DaemonDown"),
+            Event::DaemonUntrusted(why) => write!(f, "DaemonUntrusted({why:?})"),
             Event::Failed(message) => write!(f, "Failed({message:?})"),
         }
     }
@@ -260,34 +301,51 @@ pub fn worker() -> impl Stream<Item = Event> {
                 return;
             }
         };
-        let mut owners = watch_daemon_name(&connection).await;
+        let mut owners = watch_name(&connection, BUS_NAME).await;
+        let policy = PeerPolicy::installed();
 
         // The daemon may have been running before the applet was; the signal
         // only fires on a *change*, so the starting state has to be asked for.
-        let _ = output
-            .send(if daemon_is_running(&connection).await {
-                Event::DaemonUp
-            } else {
-                Event::DaemonDown
-            })
-            .await;
+        // And it is asked as "who owns it", not "does anybody" — see the module
+        // docs.
+        let starting = daemon_owner(&connection, BUS_NAME, &policy).await;
+        let mut trusted = matches!(starting, Event::DaemonUp);
+        let _ = output.send(starting).await;
 
         loop {
             tokio::select! {
                 Some(request) = inbox.recv() => {
+                    // The refusal has teeth here rather than in the UI: an
+                    // untrusted owner is sent nothing at all, whatever the
+                    // picker happens to be drawing at the time.
+                    if !trusted {
+                        warn!(?request, "clippo-applet dropped a request; the daemon's name is held by a peer it does not recognise");
+                        continue;
+                    }
                     if serve_request(&clippo, request, &mut output).await.is_err() {
                         return;
                     }
                 }
                 Some(_) = history.next() => {
                     debug!("clippo-applet heard HistoryChanged");
-                    if output.send(Event::DaemonUp).await.is_err() {
+                    // Only from an owner already checked. An impostor can emit
+                    // this signal too, and acting on it would refresh a list out
+                    // of a peer this applet has decided not to talk to.
+                    if trusted && output.send(Event::DaemonUp).await.is_err() {
                         return;
                     }
                 }
-                Some(change) = next_owner(&mut owners) => {
-                    info!(running = change, "clippo-applet saw clippod change state");
-                    let event = if change { Event::DaemonUp } else { Event::DaemonDown };
+                Some(owner) = next_owner(&mut owners) => {
+                    let event = match owner {
+                        // Every appearance is re-checked, not just the first:
+                        // the name changing hands mid-session is the whole
+                        // attack, and a check that ran once at startup would
+                        // miss it by construction.
+                        Some(name) => judged(clippo_ipc::peer::check(&connection, &name, &policy).await),
+                        None => Event::DaemonDown,
+                    };
+                    info!(state = ?event, "clippo-applet saw clippod change state");
+                    trusted = matches!(event, Event::DaemonUp);
                     if output.send(event).await.is_err() {
                         return;
                     }
@@ -326,8 +384,16 @@ async fn serve_toggle(connection: &zbus::Connection, toggles: mpsc::Sender<()>) 
     }
 }
 
-/// A stream of "is the daemon there now" changes.
-async fn watch_daemon_name(connection: &zbus::Connection) -> Option<fdo::NameOwnerChangedStream> {
+/// A stream of "who owns this name now" changes.
+///
+/// The name is a parameter only so the tests can watch one of their own: the
+/// whole suite runs on a single bus, and a test that took
+/// `com.nilfactor.Clippo` would fail whichever other test wanted it. Everything
+/// in this file passes [`BUS_NAME`].
+async fn watch_name(
+    connection: &zbus::Connection,
+    name: &str,
+) -> Option<fdo::NameOwnerChangedStream> {
     let dbus = match fdo::DBusProxy::new(connection).await {
         Ok(dbus) => dbus,
         Err(error) => {
@@ -339,7 +405,7 @@ async fn watch_daemon_name(connection: &zbus::Connection) -> Option<fdo::NameOwn
     // would otherwise wake this task, which on a busy desktop is a lot of
     // wakeups to discard.
     match dbus
-        .receive_name_owner_changed_with_args(&[(0, BUS_NAME)])
+        .receive_name_owner_changed_with_args(&[(0, name)])
         .await
     {
         Ok(stream) => Some(stream),
@@ -350,27 +416,67 @@ async fn watch_daemon_name(connection: &zbus::Connection) -> Option<fdo::NameOwn
     }
 }
 
-/// The next "daemon appeared" (`true`) or "daemon went away" (`false`).
+/// The unique name that now owns the daemon's name, or `None` when nothing
+/// does.
+///
+/// The *name* rather than a bare "is it there": whoever holds it is the peer
+/// the applet is about to send search queries to, and the only chance to ask
+/// who that is comes with this signal.
 ///
 /// Pending forever when the watch could not be set up, so that
 /// [`tokio::select`] simply never picks this branch instead of spinning on a
 /// stream that is immediately done.
-async fn next_owner(owners: &mut Option<fdo::NameOwnerChangedStream>) -> Option<bool> {
+async fn next_owner(
+    owners: &mut Option<fdo::NameOwnerChangedStream>,
+) -> Option<Option<OwnedUniqueName>> {
     let stream = match owners.as_mut() {
         Some(stream) => stream,
         None => std::future::pending().await,
     };
     let signal = stream.next().await?;
     let args = signal.args().ok()?;
-    Some(args.new_owner().is_some())
+    Some(args.new_owner().as_ref().map(|name| name.to_owned().into()))
 }
 
-/// Whether anything owns the daemon's name right now.
-async fn daemon_is_running(connection: &zbus::Connection) -> bool {
-    match fdo::DBusProxy::new(connection).await {
-        Ok(dbus) => dbus.name_has_owner(BUS_NAME.try_into().unwrap()).await == Ok(true),
-        Err(_) => false,
+/// Who owns the daemon's name right now, checked.
+///
+/// Not "does anybody own it". The distinction is the whole of F5: a name with
+/// an owner is not a daemon, and the applet has no other moment at which it
+/// could find that out before it starts typing into one.
+async fn daemon_owner(connection: &zbus::Connection, name: &str, policy: &PeerPolicy) -> Event {
+    match clippo_ipc::peer::owner_of(connection, name, policy).await {
+        Ok(Owner::Absent) => Event::DaemonDown,
+        Ok(Owner::Trusted(peer)) => {
+            debug!(pid = peer.pid, exe = %peer.exe.display(), "clippo-applet checked the daemon");
+            Event::DaemonUp
+        }
+        Ok(Owner::Untrusted(why)) => untrusted(why),
+        // Asking failed, so the answer is unknown — and an unknown peer is one
+        // this applet does not talk to. The alternative is trusting on a bus
+        // error, which is the one direction that must not be the default.
+        Err(error) => {
+            warn!(%error, "clippo-applet could not find out who owns the daemon's name");
+            Event::DaemonDown
+        }
     }
+}
+
+/// One peer check into one [`Event`], so the connect-time path and the
+/// `NameOwnerChanged` path cannot come to different conclusions.
+fn judged(checked: Result<clippo_ipc::Peer, clippo_ipc::PeerError>) -> Event {
+    match checked {
+        Ok(peer) => {
+            debug!(pid = peer.pid, exe = %peer.exe.display(), "clippo-applet checked the daemon");
+            Event::DaemonUp
+        }
+        Err(why) => untrusted(why),
+    }
+}
+
+/// A refused owner, logged and turned into something the picker can draw.
+fn untrusted(why: clippo_ipc::PeerError) -> Event {
+    warn!(%why, "clippo-applet refuses to talk to the peer holding the daemon's name");
+    Event::DaemonUntrusted(why.to_string())
 }
 
 /// Make one call and report what came back.
@@ -399,6 +505,31 @@ async fn serve_request(
         // would read. `clippod` logs the reason.
         Request::Paste(id) => match clippo.paste(id).await {
             Ok(_pressed) => Event::DaemonUp,
+            // A *refused* `Paste` is the one failure the applet can do
+            // something about. The daemon answers `AccessDenied` when
+            // `allow_privileged_members` is off, and it refuses **before** the
+            // copy, so without this the picker's primary action would close the
+            // popup and do nothing at all — for a user who had been told the
+            // knob leaves `Enter` working as a copy. `Copy` is not gated by
+            // either the knob or the caller check, so the entry still reaches
+            // the clipboard and the user pastes it themselves; the keystroke is
+            // the only thing lost, which is what the knob is for.
+            //
+            // The same fallback covers being refused for *not being a clippo
+            // binary* — an applet the daemon does not recognise — for the same
+            // reason: the user's `Enter` should still put the entry somewhere.
+            Err(error) if clippo_ipc::is_access_denied(&error) => {
+                warn!(
+                    id,
+                    %error,
+                    "clippod refused Paste; copying instead, so the entry is on the clipboard to \
+                     paste by hand"
+                );
+                match clippo.copy(id).await {
+                    Ok(()) => Event::DaemonUp,
+                    Err(error) => down("Copy", &error),
+                }
+            }
             Err(error) => down("Paste", &error),
         },
         Request::Delete(id) => match clippo.delete(id).await {
@@ -488,6 +619,276 @@ mod tests {
     fn debugging_the_message_that_wraps_it_is_no_different() {
         let message = crate::app::Message::Bus(Event::Revealed(3, "hunter2".to_owned().into()));
         assert!(!format!("{message:?}").contains("hunter2"));
+    }
+
+    /// A name of this test module's own, so a suite running on one shared bus
+    /// never has two tests fighting over `com.nilfactor.Clippo`.
+    const SCRATCH: &str = "com.nilfactor.ClippoAppletOwnerTest";
+
+    /// Whether there is a session bus to talk to. `just test` and CI run the
+    /// suite under `dbus-run-session`.
+    fn has_session_bus() -> bool {
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
+            return true;
+        }
+        eprintln!(
+            "skipping: no DBUS_SESSION_BUS_ADDRESS. Run the suite under `dbus-run-session -- \
+             cargo test`, as `just test` and CI do."
+        );
+        false
+    }
+
+    /// F5, at the moment it happens: a name that gains an owner mid-session is
+    /// re-checked, and an owner that fails becomes something the picker draws.
+    ///
+    /// The point of the test is the *re-check*. A check that ran once at
+    /// startup would pass every other assertion here and still miss the attack
+    /// entirely, because the whole of it is the name changing hands while the
+    /// applet is already running.
+    ///
+    /// It waits on the signal stream rather than sleeping: the bus delivers
+    /// `NameOwnerChanged` when it delivers it, and a fixed wait would be either
+    /// slow or flaky depending on the machine.
+    #[tokio::test]
+    async fn an_owner_that_appears_mid_session_is_checked_rather_than_welcomed() {
+        if !has_session_bus() {
+            return;
+        }
+
+        let connection = zbus::Connection::session().await.expect("a connection");
+        let mut owners = watch_name(&connection, SCRATCH).await;
+        assert!(owners.is_some(), "the watch should have been set up");
+
+        // Nothing owns it yet, so the starting state is "no daemon" — not
+        // "untrusted", which is the distinction the third state exists for.
+        assert!(matches!(
+            daemon_owner(&connection, SCRATCH, &PeerPolicy::from_paths([])).await,
+            Event::DaemonDown
+        ));
+
+        // Now something takes it. This test process is a real peer with a real
+        // pid and a real exe, and it is not a clippo binary.
+        let squatter = zbus::Connection::session().await.expect("a connection");
+        squatter
+            .request_name(SCRATCH)
+            .await
+            .expect("the scratch name");
+
+        let owner =
+            tokio::time::timeout(std::time::Duration::from_secs(5), next_owner(&mut owners))
+                .await
+                .expect("NameOwnerChanged should arrive within five seconds")
+                .expect("the stream should not have ended")
+                .expect("the name gained an owner, so the signal carries one");
+
+        let refused =
+            judged(clippo_ipc::peer::check(&connection, &owner, &PeerPolicy::from_paths([])).await);
+        let Event::DaemonUntrusted(why) = refused else {
+            panic!("an unrecognised owner must not be reported as a working daemon: {refused:?}");
+        };
+        // What the picker prints has to name the process, or there is nothing
+        // for the user to go and look at.
+        assert!(why.contains(&std::process::id().to_string()), "{why}");
+
+        // The same owner against a list it is on: the refusal above is the
+        // allowlist, not the applet refusing everything that ever appears.
+        let me = std::env::current_exe().expect("an exe");
+        let accepted = judged(
+            clippo_ipc::peer::check(&connection, &owner, &PeerPolicy::from_paths([me])).await,
+        );
+        assert!(matches!(accepted, Event::DaemonUp), "{accepted:?}");
+    }
+
+    /// A daemon that answers `Paste` the way `clippod` does with
+    /// `allow_privileged_members` off — a refusal, *before* the copy — and
+    /// records what it was asked for.
+    ///
+    /// `denied` is the only knob: the same fake also stands in for a `Paste`
+    /// that was attempted and failed, which is the case the fallback must not
+    /// fire on.
+    struct FakeDaemon {
+        denied: bool,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeDaemon {
+        fn new(denied: bool) -> Self {
+            Self {
+                denied,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, call: String) {
+            self.calls.lock().expect("not poisoned").push(call);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("not poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl clippo_ipc::ClippoBackend for FakeDaemon {
+        async fn list(&self, _limit: u32, _offset: u32) -> fdo::Result<Vec<EntrySummary>> {
+            Ok(Vec::new())
+        }
+
+        async fn search(&self, _query: &str, _limit: u32) -> fdo::Result<Vec<EntrySummary>> {
+            Ok(Vec::new())
+        }
+
+        async fn copy(&self, id: i64) -> fdo::Result<()> {
+            self.record(format!("copy({id})"));
+            Ok(())
+        }
+
+        async fn paste(&self, id: i64) -> fdo::Result<bool> {
+            self.record(format!("paste({id})"));
+            if self.denied {
+                Err(fdo::Error::AccessDenied(
+                    "clippo refuses Paste: allow_privileged_members is off".to_owned(),
+                ))
+            } else {
+                Err(fdo::Error::Failed("no compositor".to_owned()))
+            }
+        }
+
+        async fn delete(&self, _id: i64) -> fdo::Result<()> {
+            Ok(())
+        }
+
+        async fn pin(&self, _id: i64, _pinned: bool) -> fdo::Result<()> {
+            Ok(())
+        }
+
+        async fn clear(&self, _include_pinned: bool) -> fdo::Result<()> {
+            Ok(())
+        }
+
+        async fn reveal(&self, _id: i64) -> fdo::Result<String> {
+            Err(fdo::Error::AccessDenied("not in this test".to_owned()))
+        }
+
+        async fn thumbnail(&self, _id: i64) -> fdo::Result<Vec<u8>> {
+            Err(fdo::Error::NotSupported("not in this test".to_owned()))
+        }
+
+        async fn set_paused(&self, _paused: bool) -> fdo::Result<()> {
+            Ok(())
+        }
+
+        async fn paused(&self) -> fdo::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    /// Serve [`FakeDaemon`] on a connection of its own and hand back a proxy
+    /// pointed at it.
+    ///
+    /// The caller allowlist is this test process, deliberately: the refusal
+    /// under test has to be the *knob*, not `clippo-ipc`'s caller check, or the
+    /// test would pass with the fallback wired to the wrong condition.
+    async fn serve_fake(
+        denied: bool,
+    ) -> (
+        Arc<FakeDaemon>,
+        zbus::Connection,
+        clippo_ipc::ClippoProxy<'static>,
+    ) {
+        let backend = Arc::new(FakeDaemon::new(denied));
+        let served: Arc<dyn clippo_ipc::ClippoBackend> = Arc::clone(&backend) as Arc<_>;
+        let server = zbus::Connection::session().await.expect("a connection");
+        server
+            .object_server()
+            .at(
+                clippo_ipc::OBJECT_PATH,
+                clippo_ipc::ClippoInterface::with_policy(
+                    served,
+                    PeerPolicy::from_paths([std::env::current_exe().expect("an exe")]),
+                ),
+            )
+            .await
+            .expect("the interface should serve");
+
+        let client = zbus::Connection::session().await.expect("a connection");
+        let clippo = clippo_ipc::ClippoProxy::builder(&client)
+            .destination(server.unique_name().expect("a unique name").to_owned())
+            .expect("a destination")
+            .build()
+            .await
+            .expect("a proxy");
+
+        (backend, server, clippo)
+    }
+
+    /// `allow_privileged_members = false` leaves the picker's primary action
+    /// working.
+    ///
+    /// The daemon refuses `Paste` *before* the copy, so without the fallback
+    /// `Enter` would close the popup and put nothing anywhere — while the
+    /// config key and the README both promise it becomes a copy. This is the
+    /// test that makes that sentence true.
+    #[tokio::test]
+    async fn a_refused_paste_falls_back_to_a_copy_rather_than_doing_nothing() {
+        if !has_session_bus() {
+            return;
+        }
+
+        let (backend, _server, clippo) = serve_fake(true).await;
+        let (mut outbox, mut events) = cosmic::iced::futures::channel::mpsc::channel(8);
+
+        serve_request(&clippo, Request::Paste(3), &mut outbox)
+            .await
+            .expect("the outbox is open");
+
+        assert_eq!(
+            backend.calls(),
+            ["paste(3)", "copy(3)"],
+            "a refused Paste has to reach the clipboard by the other member"
+        );
+        let event = events.next().await.expect("one event");
+        assert!(
+            matches!(event, Event::DaemonUp),
+            "the daemon answered, so this is not a connection failure: {event:?}"
+        );
+    }
+
+    /// And the other half: a `Paste` that the daemon *tried* is not a refusal,
+    /// so it is reported rather than quietly turned into a copy. Copying there
+    /// would be doing something the daemon has already done — `Paste` copies
+    /// first — and would hide a broken compositor behind a working `Enter`.
+    #[tokio::test]
+    async fn a_paste_that_merely_failed_is_not_retried_as_a_copy() {
+        if !has_session_bus() {
+            return;
+        }
+
+        let (backend, _server, clippo) = serve_fake(false).await;
+        let (mut outbox, mut events) = cosmic::iced::futures::channel::mpsc::channel(8);
+
+        serve_request(&clippo, Request::Paste(3), &mut outbox)
+            .await
+            .expect("the outbox is open");
+
+        assert_eq!(backend.calls(), ["paste(3)"]);
+        let event = events.next().await.expect("one event");
+        assert!(matches!(event, Event::Failed(_)), "{event:?}");
+    }
+
+    /// The two absences are different states, and the applet has to keep them
+    /// apart: one is a daemon to start, the other is a process to look at.
+    /// Collapsing them is exactly the silence that made the takeover invisible.
+    #[test]
+    fn a_refused_owner_is_not_reported_as_a_missing_daemon() {
+        let event = untrusted(clippo_ipc::PeerError::Sandboxed {
+            name: ":1.9".to_owned(),
+            pid: 4321,
+        });
+        let Event::DaemonUntrusted(why) = event else {
+            panic!("a refusal is its own state");
+        };
+        assert!(why.contains("4321"), "{why}");
     }
 
     /// The rest of the events are still legible — a `Debug` that said nothing

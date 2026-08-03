@@ -311,6 +311,18 @@ impl Clippo {
                 // worth keeping.
                 self.thumbnails.clear();
             }
+            bus::Event::DaemonUntrusted(why) => {
+                // On screen, not only in the journal. The reason this is worth
+                // a state of its own is that the alternative — reconnecting and
+                // looking normal — is what makes a peer taking the daemon's
+                // name invisible to the person it is being taken from.
+                warn!(
+                    why,
+                    "clippo-applet is refusing to talk to the daemon's name owner"
+                );
+                self.model.set_status(Status::DaemonUntrusted(why));
+                self.thumbnails.clear();
+            }
             bus::Event::Failed(message) => {
                 warn!(message, "clippo-applet: a call failed");
             }
