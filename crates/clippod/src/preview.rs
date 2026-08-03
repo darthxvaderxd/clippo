@@ -24,6 +24,24 @@
 //! 120-character preview, which the entropy rule's length gate would otherwise
 //! see the wrong end of.
 //!
+//! # What we detect over is not what we render
+//!
+//! Two different questions, deliberately answered by two different functions:
+//!
+//! - **What we render** is [`preview_source`] — one flavor, the most readable
+//!   one, read through [`whole_value`]. `Reveal` reads the same function, so
+//!   revealing shows the whole of the thing the row showed part of.
+//! - **What we detect over** is [`detection_flavors`] — *every* text-bearing
+//!   flavor the entry carries, because a copy is several flavors of one thing
+//!   and a secret can be in any of them. A page that writes
+//!   `text/plain: "Click to continue"` beside `text/html: "<code>sk-…</code>"`
+//!   is stored as an `html` entry, previews as the innocuous line, and pastes
+//!   the key — so reading only the previewed flavor loses the flag, which is
+//!   the one signal a frontend gives the user that a row is dangerous.
+//!
+//! They were one call before, and the divergence is the point rather than an
+//! oversight: the flag describes the entry, the preview describes the row.
+//!
 //! The cost of storing the answer is that a row keeps whatever this module
 //! concluded on the day it was captured — before masking existed, or while
 //! `entropy_rule` was off. There is no migration pass over the history, so the
@@ -33,6 +51,7 @@
 //! together, and only ever towards safety.
 
 use std::borrow::Cow;
+use std::ptr;
 
 use clippo_core::secrets::{self, Signal};
 use clippo_core::{EntryKind, Flavor, SecretsConfig};
@@ -124,18 +143,27 @@ pub struct Description {
 /// contradicting it — the marker fires on the flavors, not on what the picture
 /// shows, and an image whose *preview* is deliberately unmasked has nothing
 /// left for a mask to protect. `Reveal` still refuses an image outright.
+///
+/// # Detection reads every flavor; the mask covers the rendered one
+///
+/// The rules run over each of [`detection_flavors`], not over the previewed
+/// flavor alone — see the module docs for why. The *mask* is still built from
+/// the previewed value, because a mask is a rendering of the row: an entry
+/// flagged by its `text/html` flavor still shows `Cl••••••••ue` over the plain
+/// text it would otherwise have shown, which is the same shape of row as every
+/// other masked entry.
 pub fn describe(
     kind: EntryKind,
     flavors: &[Flavor],
     hinted: bool,
     config: &SecretsConfig,
 ) -> Description {
-    let value = whole_value(kind, flavors).unwrap_or_default();
-    let signal = secrets::detect(&value, hinted, config);
+    let signal = detect_over_flavors(kind, flavors, hinted, config);
     let sensitive = signal.is_some();
 
     let preview = if sensitive && kind != EntryKind::Image {
-        secrets::mask(&flatten(&value), config)
+        let rendered = whole_value(kind, flavors).unwrap_or_default();
+        secrets::mask(&flatten(&rendered), config)
     } else {
         build(kind, flavors)
     };
@@ -145,6 +173,98 @@ pub fn describe(
         sensitive,
         signal,
     }
+}
+
+/// Run the detection rules over every text-bearing flavor and report one signal.
+///
+/// # Which signal, when more than one flavor fires
+///
+/// The rules are ordered before the flavors are, which is the same rule
+/// [`secrets::detect`] already applies within a single value: the reported
+/// signal is the **highest-confidence** one any flavor produced — the marker,
+/// then a token shape, then entropy — and only ties are broken by flavor order,
+/// **canonical flavor first, then the remaining flavors in captured order**.
+///
+/// Stating it matters because the alternative is deciding by whichever flavor a
+/// compositor happened to advertise first. Confidence first means an entry
+/// whose `text/html` matched an AWS key and whose `text/plain` merely looked
+/// random is reported as `shape:aws-access-key-id` — the defensible answer —
+/// and the tie-break prefers the flavor that is the entry's identity.
+///
+/// The marker is checked once, up front, because it is a property of the
+/// *selection* rather than of any one flavor: it may be advertised and never
+/// received, and an image carries no text for the other two rules to read.
+fn detect_over_flavors(
+    kind: EntryKind,
+    flavors: &[Flavor],
+    hinted: bool,
+    config: &SecretsConfig,
+) -> Option<Signal> {
+    if hinted {
+        return Some(Signal::PasswordManagerHint);
+    }
+
+    // Two lines implement the rule above. A shape is the best a flavor can
+    // report once the marker is out of the way, so the first one found is the
+    // answer and nothing after it can change it — the same reason
+    // `secrets::detect` stops at its first match. Entropy is only ever a
+    // fallback, so it is kept and beaten later by a shape from any flavor.
+    let mut fallback: Option<Signal> = None;
+    for flavor in detection_flavors(kind, flavors) {
+        match secrets::detect(&String::from_utf8_lossy(&flavor.data), false, config) {
+            Some(shape @ Signal::Shape(_)) => return Some(shape),
+            Some(other) if fallback.is_none() => fallback = Some(other),
+            _ => {}
+        }
+    }
+    fallback
+}
+
+/// The flavors detection is run over, in the order that breaks a tie.
+///
+/// Canonical flavor first — it is the entry's identity, so a signal from it is
+/// the one that describes the entry rather than one of its renderings — then
+/// every other text-bearing flavor in the order it was captured in.
+fn detection_flavors(kind: EntryKind, flavors: &[Flavor]) -> Vec<&Flavor> {
+    let canonical = dedup::canonical_flavor(kind, flavors)
+        .and_then(|canonical| flavors.iter().position(|flavor| ptr::eq(flavor, canonical)))
+        .filter(|index| is_text_bearing(&flavors[*index].mime));
+
+    let mut ordered: Vec<&Flavor> = canonical.map(|index| &flavors[index]).into_iter().collect();
+    ordered.extend(
+        flavors
+            .iter()
+            .enumerate()
+            .filter(|(index, flavor)| Some(*index) != canonical && is_text_bearing(&flavor.mime))
+            .map(|(_, flavor)| flavor),
+    );
+    ordered
+}
+
+/// Whether a flavor's bytes are text the detection rules should read.
+///
+/// Decided from the MIME essence and nothing else, so it is the same answer for
+/// `text/plain`, `text/plain; charset=UTF-8` and a `text/*` type no one has
+/// invented yet. Included: the whole `text/` tree — `text/plain`, `text/html`
+/// and `text/uri-list` are what clippo stores, and a secret can be in any of
+/// them.
+///
+/// Excluded, deliberately:
+///
+/// - **Image flavors**, including the derived thumbnail. Running the shape
+///   regexes over PNG bytes costs a scan over megabytes on the capture path and
+///   can only produce noise: the rules are about characters a human copied, and
+///   a match inside compressed pixels would be a false positive by
+///   construction.
+/// - **The `x-kde-passwordManagerHint` marker**, whose presence is already
+///   rule 1 and reaches [`describe`] as `hinted`. Its payload is not a value
+///   the user copied.
+///
+/// A text flavor attached to an *image* entry still counts — some sources
+/// advertise a filename or a URL beside a screenshot, and there is no reason a
+/// token in one of those should be missed. Only the mask is kind-dependent.
+fn is_text_bearing(mime: &str) -> bool {
+    essence(mime).starts_with("text/")
 }
 
 /// The flavor a preview is read from, which is not always the canonical one.
@@ -199,14 +319,20 @@ pub fn reveal(kind: EntryKind, flavors: &[Flavor]) -> Option<String> {
 
 /// The same value [`reveal`] returns, borrowed.
 ///
-/// [`describe`] needs the whole value to detect against and would otherwise
-/// copy a multi-megabyte text copy to look at the first sixty kilobytes of it,
-/// on the capture path, for every copy. `Cow` borrows for valid UTF-8, which is
-/// every text flavor that is not corrupt.
+/// [`describe`] builds a sensitive entry's mask from it and would otherwise
+/// copy a multi-megabyte text copy to render twelve characters of it, on the
+/// capture path, for every copy. `Cow` borrows for valid UTF-8, which is every
+/// text flavor that is not corrupt.
 ///
-/// Detection and `Reveal` reading the *same* function is the point, and not
-/// only an optimisation: a value that detection judged and a value the user is
-/// shown must not be able to become two different strings.
+/// The mask and `Reveal` reading the *same* function is the point, and not only
+/// an optimisation: the value a row showed part of and the value revealing
+/// returns must not be able to become two different strings.
+///
+/// What this is **not** is what detection reads. That is every text-bearing
+/// flavor — see [`detect_over_flavors`] and the module docs — because a flavor this function
+/// does not return is still a flavor a paste can deliver. Rendering one flavor
+/// and judging all of them is the asymmetry the two doc comments exist to make
+/// visible.
 fn whole_value(kind: EntryKind, flavors: &[Flavor]) -> Option<Cow<'_, str>> {
     if kind == EntryKind::Image {
         return None;
@@ -496,6 +622,168 @@ mod tests {
             described.preview,
             "Xr4$\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
         );
+    }
+
+    /// A fixture-shaped OpenAI key, not a real one. Long enough to clear the
+    /// shape rule's 16-character floor.
+    const KEY: &str = "sk-Wq3nR8tVzLm2Ka7Jd0Xy5Pb1Ce6Gh4Fs9Ut8Nv2Iw7Qr3Zx";
+
+    /// The audit's F3 scenario verbatim: a page writing an innocuous
+    /// `text/plain` beside a `text/html` carrying the key. The row is the
+    /// harmless line and the entry is an `html` one, but the flag — the only
+    /// signal a frontend gives that this row is dangerous — must still be set.
+    fn a_page_that_hides_a_key_in_its_html() -> Vec<Flavor> {
+        vec![
+            Flavor::new("text/plain;charset=utf-8", "Click to continue"),
+            Flavor::new("text/html", format!("<code>{KEY}</code>")),
+        ]
+    }
+
+    #[test]
+    fn a_secret_in_a_flavor_the_preview_never_shows_is_still_flagged() {
+        let flavors = a_page_that_hides_a_key_in_its_html();
+        assert_eq!(EntryKind::for_flavors(&flavors), Some(EntryKind::Html));
+
+        let described = describe(EntryKind::Html, &flavors, false, &secrets());
+        assert!(described.sensitive);
+        assert_eq!(
+            described.signal,
+            Some(Signal::Shape(secrets::Shape::OpenAiApiKey))
+        );
+
+        // The rendered preview is still the plain-text flavor — masked, in the
+        // same shape every other masked row has, and with no part of the key
+        // in it.
+        assert_eq!(build(EntryKind::Html, &flavors), "Click to continue");
+        assert_eq!(
+            described.preview,
+            "Cl\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}ue"
+        );
+        assert!(!described.preview.contains("sk-"), "{}", described.preview);
+    }
+
+    /// Detection reading more flavors must not move anything else: the kind is
+    /// still `html`, the dedup hash is still BLAKE3 over the canonical flavor
+    /// alone, and `Reveal` still answers with the whole of what the row showed.
+    #[test]
+    fn detecting_over_an_extra_flavor_changes_neither_identity_nor_reveal() {
+        let flavors = a_page_that_hides_a_key_in_its_html();
+        let markup_alone = vec![flavors[1].clone()];
+
+        assert_eq!(EntryKind::for_flavors(&flavors), Some(EntryKind::Html));
+        assert_eq!(
+            dedup::hash(EntryKind::Html, &flavors),
+            dedup::hash(EntryKind::Html, &markup_alone),
+        );
+        assert_eq!(
+            reveal(EntryKind::Html, &flavors).unwrap(),
+            "Click to continue"
+        );
+    }
+
+    /// The other direction, and the reason this is a false-negative fix rather
+    /// than a new source of false positives: an ordinary browser copy, whose
+    /// markup is only markup, is described exactly as it was before.
+    #[test]
+    fn a_copy_whose_every_flavor_is_clean_is_still_not_flagged() {
+        let flavors = vec![
+            Flavor::new("text/plain;charset=utf-8", "Click to continue"),
+            Flavor::new("text/html", "<b>Click to continue</b>"),
+        ];
+        let described = describe(EntryKind::Html, &flavors, false, &secrets());
+        assert!(!described.sensitive);
+        assert_eq!(described.signal, None);
+        assert_eq!(described.preview, "Click to continue");
+    }
+
+    /// The stated rule for choosing between flavors that both fire: the
+    /// highest-confidence signal wins, whichever flavor it came from, and only
+    /// a tie is broken by flavor order. Asserted in the direction that tells
+    /// the two rules apart — the **canonical** flavor merely looks random and
+    /// the other one matches a shape, so deciding by flavor order would report
+    /// `entropy` where the defensible answer is the shape.
+    #[test]
+    fn the_reported_signal_is_the_most_defensible_one_any_flavor_produced() {
+        let canonical_is_weaker = vec![
+            Flavor::new("text/html", "Xr4$Tp9!Lm2#Wq7&Zc5%"),
+            Flavor::new("text/plain;charset=utf-8", KEY),
+        ];
+        assert_eq!(
+            describe(EntryKind::Html, &canonical_is_weaker, false, &secrets()).signal,
+            Some(Signal::Shape(secrets::Shape::OpenAiApiKey))
+        );
+
+        // The same both ways round, so the answer does not depend on the order
+        // a compositor happened to advertise the flavors in.
+        let canonical_is_stronger = vec![
+            Flavor::new("text/plain;charset=utf-8", "Xr4$Tp9!Lm2#Wq7&Zc5%"),
+            Flavor::new("text/html", format!("<code>{KEY}</code>")),
+        ];
+        assert_eq!(
+            describe(EntryKind::Html, &canonical_is_stronger, false, &secrets()).signal,
+            Some(Signal::Shape(secrets::Shape::OpenAiApiKey))
+        );
+
+        // …and the marker still outranks both, without either being read.
+        assert_eq!(
+            describe(EntryKind::Html, &canonical_is_stronger, true, &secrets()).signal,
+            Some(Signal::PasswordManagerHint)
+        );
+    }
+
+    /// Every text flavor, in the order the tie-break names: the canonical one
+    /// first, then the rest as captured. The marker and the image are not text
+    /// and are not in it.
+    #[test]
+    fn only_the_text_flavors_are_detected_over_and_the_canonical_one_leads() {
+        let flavors = vec![
+            Flavor::new("text/plain;charset=utf-8", "plain"),
+            Flavor::new("image/png", vec![0_u8; 8]),
+            Flavor::new("x-kde-passwordManagerHint", "secret"),
+            Flavor::new("text/html", "markup"),
+        ];
+        let ordered: Vec<&str> = detection_flavors(EntryKind::Html, &flavors)
+            .iter()
+            .map(|flavor| flavor.mime.as_str())
+            .collect();
+        assert_eq!(ordered, ["text/html", "text/plain;charset=utf-8"]);
+
+        assert!(is_text_bearing("text/plain; charset=UTF-8"));
+        assert!(is_text_bearing("TEXT/uri-list"));
+        assert!(!is_text_bearing("image/png"));
+        assert!(!is_text_bearing("x-kde-passwordManagerHint"));
+    }
+
+    /// Image bytes never reach the regexes, so a token's characters appearing
+    /// inside compressed pixels cannot flag a screenshot. Only the marker can.
+    #[test]
+    fn an_image_flavor_is_not_run_through_the_rules() {
+        let flavors = vec![Flavor::new(
+            "image/png",
+            format!("AKIAIOSFODNN7EXAMPLE {KEY}"),
+        )];
+        let described = describe(EntryKind::Image, &flavors, false, &secrets());
+        assert!(!described.sensitive);
+        assert_eq!(described.signal, None);
+    }
+
+    /// A text flavor beside an image still counts — a source that advertises a
+    /// URL or a filename next to a screenshot can advertise a token, and the
+    /// flag is worth as much there. The preview stays the size line, which is
+    /// the kind-dependent half.
+    #[test]
+    fn a_text_flavor_beside_an_image_is_still_detected_over() {
+        let flavors = vec![
+            Flavor::new("image/png", vec![0_u8; 2048]),
+            Flavor::new("text/plain;charset=utf-8", KEY),
+        ];
+        let described = describe(EntryKind::Image, &flavors, false, &secrets());
+        assert!(described.sensitive);
+        assert_eq!(
+            described.signal,
+            Some(Signal::Shape(secrets::Shape::OpenAiApiKey))
+        );
+        assert_eq!(described.preview, "image/png, 2.0 KB");
     }
 
     #[test]
