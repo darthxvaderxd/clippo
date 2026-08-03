@@ -167,6 +167,24 @@ pub enum StoreError {
         cap: u64,
     },
 
+    /// The database file's mode could not be read or narrowed to `0600`.
+    ///
+    /// SQLite creates the file at the process umask, so clippo narrows it
+    /// immediately afterwards; a failure here means the file is sitting at
+    /// whatever the umask allowed, which for the usual `022` is readable by
+    /// every account on the machine.
+    #[error(
+        "the clippo history database at {path} could not be restricted to its owner (mode \
+         0600); it may be readable by other accounts. Fix it with `chmod 600 {path}`"
+    )]
+    FilePermissions {
+        /// The database file.
+        path: PathBuf,
+        /// Why the mode could not be read or set.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The key could not be obtained.
     #[error(transparent)]
     Key(#[from] KeyError),

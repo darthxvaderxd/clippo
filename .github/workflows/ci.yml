@@ -47,6 +47,29 @@ jobs:
       - name: cargo test
         run: dbus-run-session -- cargo test --workspace
 
+  # The dependency judgement, made by a tool with a current advisory database
+  # rather than by reading the manifests. See deny.toml for what is checked,
+  # what is deliberately accepted, and why.
+  #
+  # A separate job, and a *blocking* one. Separate because it is a different
+  # question from "does this code compile and pass its tests": an advisory
+  # published overnight against a crate nobody touched would otherwise turn the
+  # fmt/clippy/test job red and make it useless as a signal about the change in
+  # front of it. Blocking because the alternative — `continue-on-error` — is a
+  # check nobody looks at, and because there is somewhere to put an advisory
+  # that has been read and accepted: an `ignore` entry in deny.toml with the
+  # reasoning next to it. Going red is the prompt to make that decision.
+  advisories:
+    name: cargo-deny (advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Needs neither the toolchain nor a build: the check reads Cargo.lock.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+
   # Separate job because it needs neither Rust nor the build: `res/` is data,
   # and nothing in `cargo test` looks at it. Without this, a typo in the
   # `.desktop` file is only found by installing on the target host and

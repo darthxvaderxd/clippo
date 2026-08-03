@@ -40,6 +40,13 @@
 //! that something went wrong, and carrying on would encrypt the next copy under
 //! a key that account can already read.
 //!
+//! The directory holding it gets the same attention, in the milder form the
+//! difference deserves: `~/.local/share/clippo` is created at `0700` and, if it
+//! was already there at something wider, narrowed to `0700` rather than used as
+//! found — see `create_data_dir`. A leaked key cannot be un-leaked, so that is
+//! refused; a wide directory can simply be closed, and refusing to start over
+//! something clippo can fix itself would be an outage in the name of a warning.
+//!
 //! # Getting back to the keyring
 //!
 //! Rule 1 is absolute *once a key file exists*, so there is no automatic
@@ -67,9 +74,12 @@ pub const KEY_BYTES: usize = 32;
 /// The fallback key file's name inside the data directory.
 pub const KEY_FILE_NAME: &str = "key";
 
-/// Mode bits that must not be set on the fallback key file: anything that gives
-/// group or other any access at all.
+/// Mode bits that must not be set on the fallback key file, or on the data
+/// directory holding it: anything that gives group or other any access at all.
 const FORBIDDEN_MODE_BITS: u32 = 0o077;
+
+/// The mode clippo's data directory is kept at.
+const DATA_DIR_MODE: u32 = 0o700;
 
 /// The label the Secret Service shows for clippo's key.
 pub const KEYRING_LABEL: &str = "clippo clipboard history database key";
@@ -250,6 +260,22 @@ pub enum KeyError {
         /// The directory clippo tried to create.
         path: PathBuf,
         /// Why it failed.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The data directory lets other accounts in and could not be narrowed.
+    #[error(
+        "the clippo data directory at {path} has mode {mode:04o}, which lets users other than \
+         its owner in, and clippo could not narrow it to 0700; the encrypted history database \
+         and the fallback key file both live here. Fix the permissions with `chmod 700 {path}`"
+    )]
+    DataDirPermissions {
+        /// The offending directory.
+        path: PathBuf,
+        /// Its permission bits, masked to `0o777`, as clippo last saw them.
+        mode: u32,
+        /// Why it could not be narrowed.
         #[source]
         source: std::io::Error,
     },
@@ -485,6 +511,13 @@ fn create_key_file(path: &Path) -> Result<Key, KeyError> {
 /// Only clippo's own directory gets the narrow mode. Creating `~/.local` and
 /// `~/.local/share` at `0700` on a machine that happens not to have them yet
 /// would be clippo reaching well outside its own business.
+///
+/// A directory that is **already there** is checked and narrowed rather than
+/// accepted as it stands: the mode a `DirBuilder` asks for only applies to a
+/// directory it actually creates, so without this the `0700` above holds on
+/// first run and never again. A pre-existing `0755` would leave the encrypted
+/// database world-readable — the contents are ciphertext, but its size and the
+/// times it changes are not, and both are readable by any local account.
 pub(crate) fn create_data_dir(dir: &Path) -> Result<(), KeyError> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(|source| KeyError::CreateDataDir {
@@ -493,14 +526,101 @@ pub(crate) fn create_data_dir(dir: &Path) -> Result<(), KeyError> {
         })?;
     }
 
-    match DirBuilder::new().mode(0o700).create(dir) {
+    match DirBuilder::new().mode(DATA_DIR_MODE).create(dir) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => narrow_data_dir(dir),
         Err(source) => Err(KeyError::CreateDataDir {
             path: dir.to_path_buf(),
             source,
         }),
     }
+}
+
+/// Bring an existing data directory to `0700`, or fail naming it.
+///
+/// The same shape of check [`read_key_file`] makes on the key file, with one
+/// deliberate difference: a wider-than-`0600` key file is *refused*, because by
+/// then the secret has already been readable and clippo cannot un-leak it,
+/// whereas a wide directory is fixed. Narrowing it is both sufficient and the
+/// only thing a user could do by hand anyway, and refusing to start over a
+/// mode clippo can correct itself would be an outage in the name of a warning.
+///
+/// Narrower than `0700` — `0500`, say — is left alone: the check is for bits
+/// that let *other* accounts in, not for an exact match.
+fn narrow_data_dir(dir: &Path) -> Result<(), KeyError> {
+    narrow_data_dir_with(dir, |dir| {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(DATA_DIR_MODE))
+    })
+}
+
+/// [`narrow_data_dir`], with the `chmod` passed in.
+///
+/// Split out only so the two refusals below are testable. Neither can be
+/// provoked through the real `chmod` in a unit test — the owner of a directory
+/// can always chmod it, and a filesystem that ignores the call is not something
+/// a test can mount — and a refusal that has never been executed is a refusal
+/// nobody has checked.
+fn narrow_data_dir_with(
+    dir: &Path,
+    chmod: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), KeyError> {
+    let mode = data_dir_mode(dir)?;
+    if mode & FORBIDDEN_MODE_BITS == 0 {
+        return Ok(());
+    }
+
+    chmod(dir).map_err(|source| KeyError::DataDirPermissions {
+        path: dir.to_path_buf(),
+        mode,
+        source,
+    })?;
+
+    // Re-read rather than trust the call: `chmod` is allowed to succeed and do
+    // nothing on filesystems that do not carry unix modes, and a data
+    // directory on one of those really is open to every local account. This is
+    // the "cannot be brought to 0700" case that has to be an error rather than
+    // a silent continue — the directory is not what the check above assumed.
+    let now = data_dir_mode(dir)?;
+    if now & FORBIDDEN_MODE_BITS != 0 {
+        return Err(KeyError::DataDirPermissions {
+            path: dir.to_path_buf(),
+            mode: now,
+            source: std::io::Error::other(
+                "chmod reported success but the mode did not change; the filesystem may not \
+                 support unix permissions",
+            ),
+        });
+    }
+
+    tracing::warn!(
+        path = %dir.display(),
+        was = format!("{mode:04o}"),
+        "clippo's data directory was readable by other accounts; narrowed it to 0700"
+    );
+    Ok(())
+}
+
+/// The permission bits of an existing data directory, masked to `0o777`.
+fn data_dir_mode(dir: &Path) -> Result<u32, KeyError> {
+    let metadata = std::fs::metadata(dir).map_err(|source| KeyError::CreateDataDir {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+
+    // `create` reports `AlreadyExists` for a *file* in the directory's place
+    // too, and chmodding that to 0700 would be pointless: nothing can be
+    // written inside it. Report it as the creation failure it is.
+    if !metadata.is_dir() {
+        return Err(KeyError::CreateDataDir {
+            path: dir.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "exists but is not a directory",
+            ),
+        });
+    }
+
+    Ok(metadata.permissions().mode() & 0o777)
 }
 
 #[cfg(test)]
@@ -575,6 +695,105 @@ mod tests {
 
         let read_back = read_key_file(&path).unwrap().unwrap();
         assert_eq!(read_back.0, created.0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_data_directory_clippo_creates_is_0700() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("share").join("clippo");
+
+        create_data_dir(&data).unwrap();
+
+        assert_eq!(mode_of(&data), 0o700);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_data_directory_that_was_already_there_is_narrowed_not_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("clippo");
+
+        // Every mode that lets some other account in, including the 0755 a
+        // `mkdir -p` at the default umask leaves behind.
+        for mode in [0o755, 0o750, 0o705, 0o777, 0o701] {
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::set_permissions(&data, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            create_data_dir(&data).unwrap();
+
+            assert_eq!(mode_of(&data), 0o700, "starting from {mode:o}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_narrower_data_directory_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("clippo");
+        std::fs::create_dir(&data).unwrap();
+
+        // 0500 lets nobody else in, which is all this check is about. Widening
+        // it to 0700 would be clippo overruling a deliberate choice.
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500)).unwrap();
+        create_data_dir(&data).unwrap();
+        assert_eq!(mode_of(&data), 0o500);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_data_directory_that_cannot_be_narrowed_is_a_named_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("clippo");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A chmod that fails outright — someone else's directory.
+        let refused = narrow_data_dir_with(&data, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(refused, KeyError::DataDirPermissions { mode: 0o755, .. }),
+            "{refused:?}"
+        );
+
+        // And a chmod that reports success and changes nothing — a filesystem
+        // that does not carry unix modes. Trusting the return value here would
+        // be a silent continue over a world-readable directory, which is the
+        // thing this check exists to stop.
+        let ignored = narrow_data_dir_with(&data, |_| Ok(())).unwrap_err();
+        assert!(
+            matches!(ignored, KeyError::DataDirPermissions { mode: 0o755, .. }),
+            "{ignored:?}"
+        );
+
+        let message = ignored.to_string();
+        assert!(message.contains("0755"), "{message}");
+        assert!(message.contains("chmod 700"), "{message}");
+        assert!(message.contains(&data.display().to_string()), "{message}");
+
+        // The real chmod does move it, so the refusals above are reserved for
+        // the cases where it does not.
+        create_data_dir(&data).unwrap();
+        assert_eq!(mode_of(&data), 0o700);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_file_where_the_data_directory_should_be_is_reported_not_chmodded() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("clippo");
+        std::fs::write(&data, "not a directory").unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = create_data_dir(&data).unwrap_err();
+
+        assert!(matches!(error, KeyError::CreateDataDir { .. }), "{error:?}");
+        // Left as it was found: chmodding a stranger's file to 0700 would not
+        // make it a directory clippo can write a database into.
+        assert!(data.is_file());
+        assert_eq!(mode_of(&data), 0o644);
     }
 
     #[test]

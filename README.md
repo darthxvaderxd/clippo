@@ -40,8 +40,16 @@ Then, from the repo root:
 ```sh
 just build     # cargo build --workspace
 just test      # cargo test --workspace
-just check     # fmt + clippy + test, exactly what CI runs
+just check     # fmt + clippy + test, the build half of what CI runs
+just deny      # cargo deny check advisories, the other half
 ```
+
+`just deny` is separate because it needs `cargo-deny` installed and a network round trip to
+the RustSec advisory database. CI runs it as its own job on every push, so the answer to "is
+anything in this tree carrying a published advisory" is a current one rather than whenever
+somebody last looked. What is deliberately accepted, and why, is in
+[deny.toml](deny.toml) — as `ignore` entries with the reasoning next to them, never as a
+loosened check.
 
 `just` itself is optional for development — every recipe there is a one-line `cargo`
 invocation you can run directly. `install` and `uninstall` are the two that do real work; see

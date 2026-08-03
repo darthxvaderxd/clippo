@@ -1,5 +1,6 @@
 //! The encrypted history database itself.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use clippo_core::{Config, Entry, EntryId, EntryKind, Flavor, NewEntry, Timestamp};
@@ -69,8 +70,9 @@ pub struct Store {
 impl Store {
     /// Open the history database at clippo's usual location.
     ///
-    /// Creates `~/.local/share/clippo` at mode `0700` if it is not there yet,
-    /// then opens `history.db` inside it.
+    /// Creates `~/.local/share/clippo` at mode `0700` if it is not there yet —
+    /// and narrows it to `0700` if it is there and wider — then opens
+    /// `history.db` inside it.
     pub fn open_default(key: &Key) -> Result<Self, StoreError> {
         let dir = clippo_core::paths::data_dir()?;
         crate::key::create_data_dir(&dir)?;
@@ -90,6 +92,9 @@ impl Store {
     /// it tries to decrypt a page — so the first query is what turns a wrong
     /// key into [`StoreError::WrongKey`] rather than an incomprehensible
     /// failure several calls later.
+    ///
+    /// The `chmod` between the two is `restrict_db_file`; see there for why the
+    /// mode cannot be set as part of the open.
     pub fn open(path: impl AsRef<Path>, key: &Key) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
         let conn = Connection::open_with_flags(
@@ -102,6 +107,8 @@ impl Store {
             path: path.clone(),
             source,
         })?;
+
+        restrict_db_file(&path)?;
 
         conn.execute_batch(&key.pragma())
             .map_err(|source| StoreError::Open {
@@ -693,6 +700,55 @@ fn distinct_flavors(flavors: &[Flavor]) -> Vec<&Flavor> {
         kept.push(flavor);
     }
     kept
+}
+
+/// The mode the history database is kept at: its owner, and nobody else.
+const DB_FILE_MODE: u32 = 0o600;
+
+/// Mode bits that must not be set on the database file: anything at all for
+/// group or other. The same rule [`crate::key`] applies to the key file.
+const DB_FORBIDDEN_MODE_BITS: u32 = 0o077;
+
+/// Narrow the database file to [`DB_FILE_MODE`].
+///
+/// **Why this is two steps rather than one.** SQLite creates the file itself,
+/// inside its VFS, and neither `rusqlite` nor SQLCipher exposes the mode to
+/// create it with: the unix VFS uses `0644` masked by the process umask, so
+/// the usual `022` leaves `history.db` world-readable. There is no flag to
+/// pass and no hook to take, so the only place to set the mode is after the
+/// file exists — which is the instant [`Connection::open_with_flags`] returns.
+///
+/// Two things make that gap uninteresting. The file is inside a `0700`
+/// directory, which `create_data_dir` checks on the same startup, so nothing
+/// can reach it during the gap anyway. And the chmod happens before the first
+/// statement, so it is also before the first write: SQLite copies the database
+/// file's own mode onto the rollback journal and any WAL file it creates, so
+/// narrowing here narrows those too rather than leaving a `0644` journal
+/// holding the same pages.
+///
+/// The contents are ciphertext either way. What a world-readable file leaks is
+/// its size and the times it changes — how much clipboard history there is and
+/// when the user copied something — to any account on the machine.
+fn restrict_db_file(path: &Path) -> Result<(), StoreError> {
+    let metadata = std::fs::metadata(path).map_err(|source| StoreError::FilePermissions {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    // Narrower than 0600 is not "wider than 0600": a database the owner has
+    // deliberately made read-only is their business, and SQLite has already
+    // had its say about whether it can be opened read-write.
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & DB_FORBIDDEN_MODE_BITS == 0 {
+        return Ok(());
+    }
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(DB_FILE_MODE)).map_err(
+        |source| StoreError::FilePermissions {
+            path: path.to_path_buf(),
+            source,
+        },
+    )
 }
 
 /// SQLite's auto-vacuum mode, as `PRAGMA auto_vacuum` reports it.
@@ -1523,6 +1579,52 @@ mod tests {
             !bytes.starts_with(b"SQLite format 3\0"),
             "the file still looks like a plain SQLite database"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_database_is_not_readable_by_anyone_but_its_owner() {
+        // The contents are ciphertext, so this is not about the copied bytes;
+        // it is about the file's size and mtime, which say how much history
+        // there is and when the user last copied something.
+        let temp = Temp::new();
+        let mut store = temp.open();
+        store
+            .insert(&text(1_000, "something to make it grow"))
+            .unwrap();
+
+        // Every file the store left behind, for the reason
+        // `what_was_copied_is_not_in_the_file` checks them all: a journal or a
+        // WAL holds the same pages as the database.
+        let mut checked = 0;
+        for entry in std::fs::read_dir(temp.dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode & DB_FORBIDDEN_MODE_BITS,
+                0,
+                "{} is mode {mode:04o}",
+                path.display()
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "the database file should exist");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_database_left_wide_by_an_earlier_run_is_narrowed_when_it_is_opened() {
+        // Not only fresh files: a history.db created before clippo set the
+        // mode, or by a user's `cp`, is fixed on the next open rather than
+        // left as it was found.
+        let temp = Temp::new();
+        drop(temp.open());
+        std::fs::set_permissions(temp.db(), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        drop(temp.open());
+
+        let mode = std::fs::metadata(temp.db()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:04o}");
     }
 
     #[test]

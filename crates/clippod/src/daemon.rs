@@ -33,7 +33,7 @@ use tracing::{debug, error, info, warn};
 use zbus::fdo;
 use zbus::object_server::SignalEmitter;
 
-use crate::cache::PreviewCache;
+use crate::cache::{self, PreviewCache};
 use crate::echo::EchoGuard;
 use crate::preview;
 
@@ -480,9 +480,20 @@ impl ClippoBackend for Daemon {
         Ok(state.cache.page(limit as usize, offset as usize))
     }
 
+    /// The history, fuzzy-matched against `query`.
+    ///
+    /// The length check happens **before** the lock, deliberately: an
+    /// over-long query is refused without the caller ever holding up the
+    /// frontends that are using the daemon properly. See
+    /// [`cache::MAX_QUERY_CHARS`].
     async fn search(&self, query: &str, limit: u32) -> fdo::Result<Vec<EntrySummary>> {
+        cache::check_query(query).map_err(|error| fdo::Error::InvalidArgs(error.to_string()))?;
+
         let mut state = self.state.lock().await;
-        Ok(state.cache.search(query, limit as usize))
+        state
+            .cache
+            .search(query, limit as usize)
+            .map_err(|error| fdo::Error::InvalidArgs(error.to_string()))
     }
 
     /// Put an entry back on the clipboard, and move it to the front.
@@ -1086,6 +1097,37 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].kind, "text");
         assert_eq!(fixture.emitted(), 1);
+    }
+
+    /// A query nobody types is refused over the wire, and — the part that
+    /// matters — refused before the state lock is taken, so a peer sending one
+    /// cannot hold up the frontends using the daemon properly.
+    #[tokio::test]
+    async fn an_over_long_search_query_is_refused_without_taking_the_lock() {
+        let fixture = Fixture::new();
+        fixture.capture(&["hello world"]).await;
+
+        // Held for the duration of the call: if `search` waited for it, the
+        // `await` below would never return.
+        let held = fixture.daemon.state.lock().await;
+
+        // Bounded so that a check moved back under the lock fails the test
+        // rather than hanging it.
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixture.daemon.search(&"h".repeat(4 * 1024 * 1024), 10),
+        )
+        .await
+        .expect("an over-long query must be refused without waiting for the lock")
+        .unwrap_err();
+        assert!(matches!(error, fdo::Error::InvalidArgs(_)), "{error:?}");
+        assert!(error.to_string().contains("search query"), "{error}");
+
+        drop(held);
+
+        // And an ordinary query still works once nothing is holding the lock.
+        let found = fixture.daemon.search("hlo", 10).await.unwrap();
+        assert_eq!(found.len(), 1);
     }
 
     /// The cache is rebuilt from the store at startup, so a second daemon over
