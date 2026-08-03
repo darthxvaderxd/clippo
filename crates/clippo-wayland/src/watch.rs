@@ -69,8 +69,8 @@ fn for_log(mime: &str) -> String {
     one_line(mime, MIME_LOG_CHARS)
 }
 
-/// How many MIME types one offer may advertise before clippo stops recording
-/// them.
+/// How many *uninteresting* MIME types one offer may advertise before clippo
+/// stops recording them.
 ///
 /// The list is kept for the life of the offer and travels to the daemon as
 /// `Selection::advertised`, so its size is a per-selection allocation a client
@@ -79,8 +79,17 @@ fn for_log(mime: &str) -> String {
 /// is what was on offer" is what makes a missed capture diagnosable. Real
 /// sources advertise dozens (a rich-text editor offering every flavor of a
 /// copied selection lands in the tens), so a ceiling of 256 sits an order of
-/// magnitude above the busiest honest source while bounding the list at a few
-/// kilobytes rather than at whatever a hostile one cares to send.
+/// magnitude above the busiest honest source.
+///
+/// This bounds the *diagnostic* list only — see [`AdvertisedMimes::push`], which
+/// keeps an interesting type past the ceiling rather than truncating flat, so
+/// the ceiling can never decide what clippo captures. The total is therefore
+/// this plus [`mime::INTERESTING_MIMES`]`.len()`.
+///
+/// On size: a MIME string is itself bounded by the Wayland message the source
+/// sends it in, a few kilobytes, so the worst case here is on the order of a
+/// megabyte. That is transient — the daemon does not store `advertised` — and
+/// small beside the seven flavors it may buy at the per-flavor cap.
 const MAX_ADVERTISED_MIMES: usize = 256;
 
 /// A running watcher thread.
@@ -357,7 +366,7 @@ struct OfferState {
     mimes: AdvertisedMimes,
 }
 
-/// What one offer advertised, up to [`MAX_ADVERTISED_MIMES`] of it.
+/// What one offer advertised, bounded.
 ///
 /// Its own type rather than a bare `Vec` so the ceiling is applied in one place
 /// and can be tested without a compositor — an [`Offer`] cannot be built
@@ -371,13 +380,34 @@ struct AdvertisedMimes {
 }
 
 impl AdvertisedMimes {
-    /// Remember one advertised MIME type, or discard it if the list is full.
+    /// Remember one advertised MIME type, discarding it only if the list is
+    /// full *and* clippo would not have read it.
     ///
-    /// Discarding costs nothing a caller can see: what clippo reads is decided
-    /// by [`mime::is_interesting`], and no honest source puts an interesting
-    /// type past the ceiling of a list it began with hundreds of private ones.
+    /// The ceiling bounds a diagnostic list; it must not decide what clippo
+    /// captures, and a flat truncation would. This list is the input to
+    /// [`interesting_flavors`], so a truncated interesting type is a copy
+    /// silently not captured — and it is the input to
+    /// `Selection::has_password_manager_hint`, so a truncated
+    /// `x-kde-passwordManagerHint` is secret-detection rule 1 not firing and a
+    /// marked credential stored with an unmasked preview. Neither is reachable
+    /// from an honest source, which is exactly why it would go unnoticed.
+    ///
+    /// So past the ceiling the interesting types still get in. The tail that
+    /// buys is bounded by the argument [`interesting_flavors`] makes: an
+    /// interesting type normalises to one of [`mime::INTERESTING_MIMES`], so
+    /// once the tail holds all seven every further one [`mime::same`]-matches
+    /// something already in it. Deduping against the tail alone rather than the
+    /// whole list is what keeps that scan bounded while the client's input is
+    /// not; the cost is that a type also present in the first
+    /// [`MAX_ADVERTISED_MIMES`] can appear twice, which is one entry and which
+    /// [`interesting_flavors`] dedups again anyway.
     fn push(&mut self, mime: String) {
         if self.mimes.len() < MAX_ADVERTISED_MIMES {
+            self.mimes.push(mime);
+            return;
+        }
+        let tail = &self.mimes[MAX_ADVERTISED_MIMES..];
+        if mime::is_interesting(&mime) && !tail.iter().any(|seen| mime::same(seen, &mime)) {
             self.mimes.push(mime);
             return;
         }
@@ -387,7 +417,8 @@ impl AdvertisedMimes {
             warn!(
                 ceiling = MAX_ADVERTISED_MIMES,
                 first_ignored = %for_log(&mime),
-                "an offer advertised more MIME types than clippo records; ignoring the rest"
+                "an offer advertised more MIME types than clippo records; ignoring the rest, \
+                 except any flavor clippo would read"
             );
         }
     }
@@ -439,7 +470,13 @@ impl DataControlSink for WatchState {
     fn offer_mime(&mut self, offer: &ObjectId, mime: String) {
         match self.offers.get_mut(offer) {
             Some(state) => state.mimes.push(mime),
-            None => trace!(?offer, %mime, "mime advertised for an offer we do not track"),
+            // Escaped like the `warn!`s: this is the one log site a MIME string
+            // reaches without `is_interesting` having vouched for its bytes.
+            None => trace!(
+                ?offer,
+                mime = %for_log(&mime),
+                "mime advertised for an offer we do not track"
+            ),
         }
     }
 
@@ -1245,6 +1282,53 @@ mod tests {
             kept[MAX_ADVERTISED_MIMES - 1],
             format!("application/x-private-{}", MAX_ADVERTISED_MIMES - 1)
         );
+    }
+
+    /// The ceiling bounds the diagnostic list; it must not decide what clippo
+    /// captures. A flat truncation would, and silently: the copy is simply not
+    /// there, and the only trace is a `warn!` about advertised types.
+    #[test]
+    fn the_ceiling_never_costs_a_flavor_clippo_would_have_read() {
+        let mut advertised = AdvertisedMimes::default();
+        for n in 0..MAX_ADVERTISED_MIMES {
+            advertised.push(format!("application/x-private-{n}"));
+        }
+        // Every interesting type arrives only after the ceiling is full, in a
+        // spelling `is_interesting` accepts but an exact match would not.
+        for known in mime::INTERESTING_MIMES {
+            advertised.push(format!(" {} ", known.to_ascii_uppercase()));
+        }
+        let kept = advertised.into_vec();
+
+        assert_eq!(
+            kept.len(),
+            MAX_ADVERTISED_MIMES + mime::INTERESTING_MIMES.len()
+        );
+        // Rule 1 of secret detection reads this list, not the flavors.
+        assert!(
+            kept.iter()
+                .any(|mime| mime::same(mime, clippo_core::secrets::PASSWORD_MANAGER_HINT_MIME)),
+            "the password-manager marker was truncated away"
+        );
+        // Composed the way the watcher composes it: what `offer_mime` kept is
+        // what `interesting_flavors` selects from.
+        let wanted = interesting_flavors(&kept);
+        assert_eq!(wanted.len(), mime::INTERESTING_MIMES.len(), "{wanted:?}");
+    }
+
+    /// The rescue above cannot itself become the unbounded quantity: it is one
+    /// entry per *distinct* interesting type, by the same `same` argument
+    /// `interesting_flavors` makes.
+    #[test]
+    fn interesting_types_past_the_ceiling_are_bounded_too() {
+        let mut advertised = AdvertisedMimes::default();
+        for n in 0..MAX_ADVERTISED_MIMES {
+            advertised.push(format!("application/x-private-{n}"));
+        }
+        for spelling in permutations("text/plain", 5000) {
+            advertised.push(spelling);
+        }
+        assert_eq!(advertised.into_vec().len(), MAX_ADVERTISED_MIMES + 1);
     }
 
     #[test]
