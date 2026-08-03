@@ -100,6 +100,14 @@ const REVEAL_LINES: usize = 32;
 /// Pixel size of a thumbnail in the list.
 const THUMB: f32 = 40.0;
 
+/// Characters of the refusal reason the picker prints.
+///
+/// Generous, because the reason is the actionable part — it carries the pid and
+/// the executable path — but bounded, because that path comes from `/proc` and
+/// therefore from the refused process itself. A peer that named itself two
+/// thousand characters would otherwise choose the height of this popup.
+const REASON_CHARS: usize = 240;
+
 /// The whole picker.
 pub fn picker<'a>(model: &'a Model, thumbnails: &'a Thumbnails) -> Element<'a, Message> {
     let search = widget::search_input("Search the clipboard", model.query())
@@ -113,6 +121,7 @@ pub fn picker<'a>(model: &'a Model, thumbnails: &'a Thumbnails) -> Element<'a, M
 
     let body: Element<'a, Message> = match model.status() {
         Status::DaemonUnavailable => daemon_missing(),
+        Status::DaemonUntrusted(why) => daemon_untrusted(why),
         Status::Connected if model.entries().is_empty() => nothing_here(model.query()),
         Status::Connected => list(model, thumbnails),
     };
@@ -232,6 +241,48 @@ fn daemon_missing<'a>() -> Element<'a, Message> {
         .align_x(Alignment::Center)
         .width(Length::Fill)
         .into()
+}
+
+/// Something holds the daemon's name and it is not clippod.
+///
+/// The one screen in this applet that exists to be alarming. The chain F5
+/// describes ends in "the applet reconnects and looks normal", and a check that
+/// refused quietly would leave that ending intact — the user would see an empty
+/// picker and assume their history had gone, which is a story with an innocent
+/// explanation. So this says what is happening, in the place they are looking.
+///
+/// The reason is printed through [`shorten`] rather than raw: it is built from
+/// a path out of `/proc`, which is a filename of somebody else's choosing, and
+/// a panel popup is not the place to find out what a very long one does to the
+/// layout.
+fn daemon_untrusted(why: &str) -> Element<'_, Message> {
+    widget::Column::new()
+        .push(widget::icon::from_name("dialog-error-symbolic").size(32))
+        .push(widget::text::body("Not talking to this clippod"))
+        .push(widget::text::caption(untrusted_caption(why)))
+        .push(widget::text::caption(
+            "Your history is on disk and encrypted; a peer on the bus cannot read it. Check \
+             `systemctl --user status clippod`, then look at the process above.",
+        ))
+        .spacing(8)
+        .padding(16)
+        .align_x(Alignment::Center)
+        .width(Length::Fill)
+        .into()
+}
+
+/// The sentence [`daemon_untrusted`] leads with.
+///
+/// A function of its own so the wording is testable without building a widget
+/// tree: the two things that must be true of it are that it says nothing was
+/// sent, and that it names the process — and neither is worth having to render
+/// a popup to check.
+fn untrusted_caption(why: &str) -> String {
+    format!(
+        "Something is holding clippo's D-Bus name and it is not a clippo program, so nothing has \
+         been sent to it — not your searches, not anything. {}",
+        shorten(why, REASON_CHARS)
+    )
 }
 
 /// Connected, but with nothing to show.
@@ -458,6 +509,31 @@ mod tests {
 
         assert_eq!(drawn, exactly.trim_end_matches('\n'));
         assert!(!drawn.contains('\u{2026}'));
+    }
+
+    /// F5's step 2: the refusal is visible where the user actually looks. The
+    /// journal is not evidence a panel user will ever see; this caption is.
+    #[test]
+    fn the_picker_says_it_is_refusing_and_names_the_process() {
+        let drawn = untrusted_caption(":1.42 is pid 4321, which is running /usr/bin/python3");
+
+        assert!(drawn.contains("nothing has been sent"), "{drawn}");
+        assert!(drawn.contains("4321"), "{drawn}");
+        assert!(drawn.contains("/usr/bin/python3"), "{drawn}");
+    }
+
+    /// The reason comes out of `/proc`, so its length is chosen by the process
+    /// being refused. A popup whose height an impostor picks is not one.
+    #[test]
+    fn a_very_long_refusal_reason_is_cut_before_it_reaches_the_popup() {
+        let drawn = untrusted_caption(&"x".repeat(10_000));
+
+        assert!(
+            drawn.chars().count() < 500,
+            "{} chars",
+            drawn.chars().count()
+        );
+        assert!(drawn.contains('\u{2026}'), "{drawn}");
     }
 
     #[test]

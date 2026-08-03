@@ -495,6 +495,61 @@ Two limits worth knowing, both of which follow from how Wayland works rather tha
   still works. That is also why a keystroke clippo could not send is not reported as a failed
   `Paste` — the half that matters succeeded. The reason goes to `clippod`'s journal.
 
+## Who can talk to clippod
+
+Worth knowing before you decide how much to keep in your history: **a session bus authenticates
+nobody.** Every process running as you can call every member of `com.nilfactor.Clippo`, and
+every process running as you can equally *take* that name the moment nothing owns it. Those are
+the same gap read in two directions, and clippo does what can be done about each — which is less
+than it sounds like, so it is written down rather than implied.
+
+The part that is not just "a local process can read local files" is this: `clippod` re-exports
+two capabilities Wayland is careful about. Reading the clipboard, and typing into other
+applications. A Flatpak application with `--socket=session-bus` — an extremely common manifest
+line — is deliberately denied both by the proxied Wayland socket. With `clippod` running it can
+have them back: `List` for the ids, `Reveal` for each value, `Paste` to have clippod type a
+chosen entry into whatever window has focus. Aim that at a terminal and the entry is a command
+line.
+
+**What clippo checks.** `Paste` looks at who called it: the bus is asked for the caller's pid,
+`/proc/<pid>/exe` is read, and it must be one of the clippo binaries installed beside `clippod`
+— a peer inside a Flatpak sandbox is refused whatever its executable claims to be. The
+frontends run the identical check in the other direction, on whoever owns the daemon's name,
+before they send anything and again every time the name changes hands. `clippo` exits non-zero
+saying so, and the picker draws it instead of quietly reconnecting.
+
+**Be clear about what that is.** Pids get reused, and an allowlisted binary does whatever
+whoever started it tells it to. It narrows impersonation from *anything on the bus* to
+*anything that can be, or can drive, the real binary*. That is a speed bump, not a boundary,
+and it is worth having mostly because it is cheap. A uid check would be worth nothing at all —
+every peer on a session bus is the same uid, which is also why a D-Bus policy file cannot help.
+The genuinely correct answer is compositor-mediated access, which does not exist for clipboard
+managers on Wayland yet.
+
+One consequence to expect: `Paste` from a binary outside the daemon's own tree is refused, and
+says which executable it saw. An installed `clippod` talking to a `cargo run` frontend is the
+case that hits — run both from the same place.
+
+**Turning the two capabilities off.** If you run sandboxed applications and would rather they
+could not ask at all:
+
+```toml
+# ~/.config/clippo/config.toml
+allow_privileged_members = false
+```
+
+`Reveal` and `Paste` are then refused outright, and nothing else changes: the history is intact,
+`clippo list` and `clippo search` work, and `Copy` still puts an entry on the clipboard for you
+to paste yourself. The cost is that `clippo reveal` stops working and `Enter` in the picker
+becomes a copy, so `Ctrl+R` has nothing to show. **The daemon enforces it**, not the frontends —
+a switch a caller could skip by not being the applet would not be one. Read once at startup, so
+`systemctl --user restart clippod` after editing, and `clippod` says which way it is set:
+
+```
+$ journalctl --user -u clippod -b | grep allow_privileged_members
+allow_privileged_members is off; Reveal and Paste will be refused over D-Bus
+```
+
 ## Secrets
 
 The feature clippo exists for. A clipboard history is a list of the last five hundred things

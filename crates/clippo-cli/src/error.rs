@@ -47,6 +47,24 @@ pub enum CliError {
     )]
     NoSessionBus(#[source] zbus::Error),
 
+    #[error(
+        "refusing to talk to whatever is holding {bus} — {0}. That name should be held by \
+         clippod. A process that is not a clippo binary holding it sees everything this command \
+         would have sent, including what you searched for, and chooses everything it would have \
+         shown you. Nothing was sent. The pid above is what to look at; \
+         `systemctl --user status clippod` says whether the real daemon is even running",
+        bus = clippo_ipc::BUS_NAME
+    )]
+    DaemonNotTrusted(String),
+
+    #[error(
+        "refusing to ask whatever is holding {bus} to open a picker — {0}. That name should be \
+         held by clippo-applet; a picker drawn by something else is a convincing place to type. \
+         Nothing was sent",
+        bus = clippo_ipc::APPLET_BUS_NAME
+    )]
+    AppletNotTrusted(String),
+
     #[error("the daemon refused {member}: {message}")]
     Call {
         member: &'static str,

@@ -91,6 +91,16 @@ pub enum Status {
     Connected,
     /// Nothing owns the daemon's name, or a call to it failed.
     DaemonUnavailable,
+    /// Something owns the daemon's name and it is not a clippo binary, so the
+    /// applet is refusing to talk to it. Carries the reason, which the picker
+    /// prints.
+    ///
+    /// A third state rather than a flavour of the second, because the two need
+    /// opposite things from the user: one is a daemon to start, the other is a
+    /// process to go and look at. Telling them "clippod is not running" while a
+    /// peer sat on its name is precisely the silence that made the takeover
+    /// invisible.
+    DaemonUntrusted(String),
 }
 
 impl Status {
@@ -494,6 +504,25 @@ mod tests {
         assert_eq!(model.selected_id(), None);
         assert_eq!(model.revealed(), None);
         assert!(!model.status().is_connected());
+    }
+
+    /// Refusing the name's owner clears the same things losing the daemon
+    /// does, and for a stronger reason: the rows on screen were answered by a
+    /// peer this applet has just decided not to talk to.
+    #[test]
+    fn refusing_the_name_owner_clears_the_rows_and_any_revealed_value() {
+        let mut model = model_with(&[1, 2]);
+        model.set_revealed(1, "hunter2".to_owned());
+
+        model.set_status(Status::DaemonUntrusted("pid 4321 is /usr/bin/x".to_owned()));
+
+        assert!(model.entries().is_empty());
+        assert_eq!(model.revealed(), None);
+        assert!(!model.status().is_connected());
+        // And it is not the same state as a missing daemon: the picker draws a
+        // different screen, and telling the user to start clippod when
+        // something is squatting on its name would send them the wrong way.
+        assert_ne!(model.status(), &Status::DaemonUnavailable);
     }
 
     /// The applet ranks nothing itself — this asserts the model hands back

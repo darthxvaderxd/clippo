@@ -43,8 +43,10 @@
 //! # The other direction
 //!
 //! [`AppletInterface`] and [`ClippoAppletProxy`] are a second, much smaller
-//! interface that the *applet* serves and `clippo show` calls. See
-//! [`applet`](crate::applet) for why it is a separate bus name.
+//! interface that the *applet* serves and `clippo show` calls. It is on a name
+//! of its own, [`APPLET_BUS_NAME`], because two processes cannot own one name
+//! and the applet and the daemon are two processes; the `applet` module says
+//! the rest.
 //!
 //! # Previews and full values
 //!
@@ -55,6 +57,15 @@
 //! secrets masked, and it does so by changing the one function that builds a
 //! preview. If a full value could leave by any other route, M4 would be a
 //! redesign instead of an edit.
+//!
+//! # Who is on the other end
+//!
+//! A session bus authenticates nobody: every peer running as the user can call
+//! every member here, and every peer can equally take [`BUS_NAME`] the moment
+//! nothing owns it. [`peer`] is the one helper both directions use to narrow
+//! that — `clippod` points it at the caller of `Paste`, the frontends point it
+//! at the owner of the name — and its own docs are blunt about how far it goes,
+//! which is not far. Read them before relying on it for anything.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,6 +79,7 @@
 //! ```
 
 mod applet;
+pub mod peer;
 mod proxy;
 mod service;
 
@@ -78,6 +90,7 @@ pub use applet::{
     AppletFrontend, AppletInterface, ClippoAppletProxy, ClippoAppletProxyBlocking, APPLET_BUS_NAME,
     APPLET_INTERFACE_NAME, APPLET_OBJECT_PATH,
 };
+pub use peer::{Owner, Peer, PeerError, PeerPolicy};
 pub use proxy::{ClippoProxy, ClippoProxyBlocking};
 pub use service::{emitter, ClippoBackend, ClippoInterface};
 

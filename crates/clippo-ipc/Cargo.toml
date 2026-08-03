@@ -12,8 +12,13 @@ rust-version.workspace = true
 async-trait = { workspace = true }
 clippo-core = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
+# The one place a refusal is decided is also the one place it has to be
+# recorded: `peer` logs which caller was turned away, with its pid and exe.
+tracing = { workspace = true }
 zbus = { workspace = true }
 
 [dev-dependencies]
 futures-util = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["time"] }

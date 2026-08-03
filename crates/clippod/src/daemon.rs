@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use clippo_core::{Chord, EntryId, EntryKind, Flavor, NewEntry, SecretsConfig, Timestamp};
+use clippo_core::{Chord, Config, EntryId, EntryKind, Flavor, NewEntry, SecretsConfig, Timestamp};
 use clippo_ipc::{ClippoBackend, ClippoInterface, EntrySummary};
 use clippo_store::{dedup, is_offerable, Store, StoreError};
 use clippo_wayland::{Clipboard, Keystrokes, Selection};
@@ -96,6 +96,14 @@ pub struct Daemon {
     paste_shortcut: Chord,
     /// The user's `auto_paste`. `false` makes `Paste` stop after the copy.
     auto_paste: bool,
+    /// The user's `allow_privileged_members`. `false` refuses `Reveal` and
+    /// `Paste` outright.
+    ///
+    /// Here rather than in a frontend on purpose: the two members it covers are
+    /// reachable by any peer on the session bus, and a switch a caller could
+    /// skip by not being the applet would protect nobody. See
+    /// [`Config::allow_privileged_members`][clippo_core::Config::allow_privileged_members].
+    allow_privileged_members: bool,
 }
 
 impl Daemon {
@@ -105,18 +113,12 @@ impl Daemon {
     /// not read fails at startup, in the journal, rather than on a user's first
     /// `List`.
     ///
-    /// `secrets` is the `[secrets]` table of the user's config, which decides
-    /// how much of a masked entry is shown and whether the entropy rule runs at
-    /// all. It is read once, here, for the reason the config module gives:
-    /// re-deriving it mid-run would leave a history captured under two
-    /// different sets of rules.
-    pub fn new(
-        store: Store,
-        signals: Signals,
-        secrets: SecretsConfig,
-        paste_shortcut: Chord,
-        auto_paste: bool,
-    ) -> Result<Arc<Self>, StoreError> {
+    /// The whole [`Config`] rather than the four fields out of it, because
+    /// three of those four are booleans and a call site that passed them in the
+    /// wrong order would compile. It is read once, here, for the reason the
+    /// config module gives: re-deriving it mid-run would leave a history
+    /// captured under two different sets of rules.
+    pub fn new(store: Store, signals: Signals, config: &Config) -> Result<Arc<Self>, StoreError> {
         let mut state = State {
             store,
             cache: PreviewCache::new(),
@@ -130,12 +132,13 @@ impl Daemon {
         Ok(Arc::new(Self {
             state: Mutex::new(state),
             paused: AtomicBool::new(false),
-            secrets,
+            secrets: config.secrets.clone(),
             signals,
             clipboard: OnceLock::new(),
             keystrokes: OnceLock::new(),
-            paste_shortcut,
-            auto_paste,
+            paste_shortcut: config.paste_shortcut.clone(),
+            auto_paste: config.auto_paste,
+            allow_privileged_members: config.allow_privileged_members,
         }))
     }
 
@@ -365,6 +368,32 @@ impl Daemon {
         self.paused.load(Ordering::Relaxed)
     }
 
+    /// Refuse `Reveal` or `Paste` when the user has switched them off.
+    ///
+    /// One function for both because they are one switch, and because the
+    /// message a frontend prints should say the same thing either way: the
+    /// history is intact, this is a setting, and here is the setting's name.
+    ///
+    /// `AccessDenied` rather than `NotSupported`: the daemon is capable of it
+    /// and is declining, which is a different thing from a compositor that
+    /// cannot synthesise keys, and a frontend that conflated the two would tell
+    /// the user to change their compositor.
+    fn check_privileged(&self, member: &str) -> fdo::Result<()> {
+        if self.allow_privileged_members {
+            return Ok(());
+        }
+        debug!(
+            member,
+            "clippo refused a privileged member; it is switched off"
+        );
+        Err(fdo::Error::AccessDenied(format!(
+            "clippo will not serve {member} over D-Bus: allow_privileged_members is false in \
+             your config, which turns off the two members any process on the session bus could \
+             otherwise use to read a whole entry or to type one into a focused window. Your \
+             history is unchanged, and List, Search and Copy still work"
+        )))
+    }
+
     /// Apply the retention limits to a history that has been sitting idle.
     ///
     /// Retention normally runs inside `Store::insert`, so a daemon nobody has
@@ -514,7 +543,15 @@ impl ClippoBackend for Daemon {
         self.copy_at(EntryId::new(id), Timestamp::now()).await
     }
 
+    /// `Copy`, and then the user's paste shortcut.
+    ///
+    /// Refused outright when `allow_privileged_members` is off, and **before
+    /// the copy**: a refusal that had already put the entry on the clipboard
+    /// would have done most of what the switch exists to prevent, since the
+    /// caller could then paste it itself.
     async fn paste(&self, id: i64) -> fdo::Result<bool> {
+        self.check_privileged("Paste")?;
+
         // The copy half first, and its failure is the whole call's failure:
         // pressing the paste shortcut with the old clipboard still loaded would
         // paste the wrong thing, which is worse than pasting nothing.
@@ -633,6 +670,11 @@ impl ClippoBackend for Daemon {
     /// stray `{cache:?}` to leak, and a revealed value lives only as long as
     /// this call.
     async fn reveal(&self, id: i64) -> fdo::Result<String> {
+        // Before the lock and before the read: with the switch off there is no
+        // value to fetch, and fetching one to throw away would decrypt it into
+        // this process's memory for nothing.
+        self.check_privileged("Reveal")?;
+
         let id = EntryId::new(id);
         let state = self.state.lock().await;
         let stored = state
@@ -813,6 +855,18 @@ mod tests {
             .expect("the default paste shortcut parses")
     }
 
+    /// The documented defaults, which is what a user with no config file has.
+    ///
+    /// Every fixture starts from these and overrides the one knob it is about,
+    /// so a test that says nothing about `allow_privileged_members` is testing
+    /// the configuration almost everybody runs.
+    fn config() -> Config {
+        Config {
+            paste_shortcut: paste_shortcut(),
+            ..Config::default()
+        }
+    }
+
     /// The compositor, in process.
     ///
     /// This is the seam DESIGN.md's risk table asks the self-echo loop to be
@@ -919,28 +973,37 @@ mod tests {
         /// The same, with the `[secrets]` table the caller wants — the entropy
         /// knob is the only thing any test needs to vary.
         fn with_secrets(secrets: SecretsConfig) -> Self {
-            Self::build(secrets, true)
+            Self::build(Config {
+                secrets,
+                ..config()
+            })
         }
 
         /// A daemon with `auto_paste = false`, for the one thing that knob
         /// changes.
         fn without_auto_paste() -> Self {
-            Self::build(SecretsConfig::default(), false)
+            Self::build(Config {
+                auto_paste: false,
+                ..config()
+            })
         }
 
-        fn build(secrets: SecretsConfig, auto_paste: bool) -> Self {
+        /// A daemon with `allow_privileged_members = false`, for the switch
+        /// that refuses `Reveal` and `Paste` outright.
+        fn without_privileged_members() -> Self {
+            Self::build(Config {
+                allow_privileged_members: false,
+                ..config()
+            })
+        }
+
+        fn build(config: Config) -> Self {
             let dir = tempfile::tempdir().expect("a temp dir for the test database");
             let key = Key::random().expect("a key for the test database");
             let store =
                 Store::open(dir.path().join("history.db"), &key).expect("the store should open");
-            let daemon = Daemon::new(
-                store,
-                Signals::discard(),
-                secrets,
-                paste_shortcut(),
-                auto_paste,
-            )
-            .expect("the daemon should start");
+            let daemon =
+                Daemon::new(store, Signals::discard(), &config).expect("the daemon should start");
             let clipboard = Arc::new(FakeClipboard::default());
             daemon.connect_clipboard(Arc::clone(&clipboard) as Arc<dyn Clipboard>);
             Self {
@@ -1142,9 +1205,7 @@ mod tests {
         let first = Daemon::new(
             Store::open(&path, &key).expect("open"),
             Signals::discard(),
-            SecretsConfig::default(),
-            paste_shortcut(),
-            true,
+            &config(),
         )
         .expect("start");
         first
@@ -1158,9 +1219,7 @@ mod tests {
         let second = Daemon::new(
             Store::open(&path, &key).expect("reopen"),
             Signals::discard(),
-            SecretsConfig::default(),
-            paste_shortcut(),
-            true,
+            &config(),
         )
         .expect("restart");
         assert_eq!(second.search("restart", 10).await.unwrap().len(), 1);
@@ -1520,6 +1579,67 @@ mod tests {
             keyboard.presses().is_empty(),
             "auto_paste = false must not press a key even with a keyboard to press it with"
         );
+    }
+
+    /// The other switch, and the whole of what *it* changes: `Reveal` and
+    /// `Paste` are refused, and the history is still there to list and to
+    /// search.
+    ///
+    /// The two halves are asserted together on purpose. A switch that turned
+    /// the members off by breaking the daemon would pass the first half and
+    /// fail the second, and it is the second that makes this a setting somebody
+    /// might actually live with.
+    #[tokio::test]
+    async fn the_privileged_members_switch_off_without_taking_the_history_with_them() {
+        let fixture = Fixture::without_privileged_members();
+        let keyboard = Arc::new(FakeKeyboard::default());
+        fixture
+            .daemon
+            .connect_keystrokes(Arc::clone(&keyboard) as Arc<dyn Keystrokes>);
+        fixture.capture(&["still here", "and this too"]).await;
+
+        let listed = fixture.daemon.list(0, 0).await.expect("List still works");
+        assert_eq!(listed.len(), 2);
+        let id = listed[0].id;
+        assert_eq!(
+            fixture
+                .daemon
+                .search("still", 10)
+                .await
+                .expect("Search still works")
+                .len(),
+            1
+        );
+
+        for refused in [
+            fixture.daemon.reveal(id).await.err(),
+            fixture.daemon.paste(id).await.err(),
+        ] {
+            let error = refused.expect("the switch is off, so this must be a refusal");
+            assert!(
+                matches!(error, fdo::Error::AccessDenied(_)),
+                "a refusal by policy, not a failure: {error:?}"
+            );
+            // The message is what a frontend prints, so it has to name the key
+            // that caused it.
+            assert!(
+                error.to_string().contains("allow_privileged_members"),
+                "{error}"
+            );
+        }
+
+        assert_eq!(
+            fixture.clipboard.offer_count(),
+            0,
+            "a refused Paste must not have copied first; the caller could paste it itself"
+        );
+        assert!(keyboard.presses().is_empty());
+
+        // And `Copy` is untouched — the entry can still be put back on the
+        // clipboard, which is what "without losing the history" means in
+        // practice.
+        fixture.daemon.copy(id).await.expect("Copy still works");
+        assert_eq!(fixture.clipboard.offer_count(), 1);
     }
 
     /// The ordering that matters most: pressing the shortcut before the entry
@@ -1893,9 +2013,7 @@ mod tests {
         let daemon = Daemon::new(
             Store::open(dir.path().join("history.db"), &key).expect("open"),
             Signals::discard(),
-            SecretsConfig::default(),
-            paste_shortcut(),
-            true,
+            &config(),
         )
         .expect("start");
         if let Some(clipboard) = clipboard {
