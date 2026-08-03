@@ -187,7 +187,9 @@ pub struct Config {
     /// changes: the history is intact, `List` and `Search` still answer, and
     /// `Copy` still puts an entry on the clipboard for you to paste yourself.
     /// The visible cost is that the picker's `Ctrl+R` and `clippo reveal` stop
-    /// working, and `Enter` in the picker becomes a copy.
+    /// working, and `Enter` in the picker becomes a copy — the applet falls
+    /// back to `Copy` when its `Paste` is refused, so choosing an entry still
+    /// puts it on the clipboard and only the keystroke is lost.
     ///
     /// **The daemon enforces it**, not the frontends — a knob a hostile caller
     /// could skip by not being the applet would not be one.

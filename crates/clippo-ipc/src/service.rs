@@ -182,7 +182,7 @@ impl ClippoInterface {
                     member,
                     sender = sender.as_str(),
                     pid = error.pid(),
-                    exe = error.exe().map(|exe| exe.display().to_string()),
+                    exe = error.exe_for_display(),
                     %error,
                     "clippo refused a caller it does not recognise"
                 );

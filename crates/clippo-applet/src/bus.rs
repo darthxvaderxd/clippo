@@ -91,9 +91,14 @@ pub enum Request {
     /// `Paste(id)` — copy, and have the daemon press the user's paste
     /// shortcut into whatever has focus once the picker is gone.
     ///
-    /// There is no `Copy` beside this because nothing in the applet wants one:
-    /// `Paste` copies first and always, so choosing an entry puts it on the
-    /// clipboard whether or not the keystroke can be synthesised.
+    /// There is no `Copy` variant beside this because the UI never asks for
+    /// one: `Paste` copies first and always, so choosing an entry puts it on
+    /// the clipboard whether or not the keystroke can be synthesised.
+    ///
+    /// The exception is `Paste` being *refused* rather than failing — with
+    /// `allow_privileged_members` off the daemon declines it before the copy —
+    /// and [`serve_request`] falls back to `Copy` there, which is what makes
+    /// "`Enter` in the picker becomes a copy" true rather than aspirational.
     Paste(i64),
     /// `Delete(id)`.
     Delete(i64),
@@ -500,6 +505,31 @@ async fn serve_request(
         // would read. `clippod` logs the reason.
         Request::Paste(id) => match clippo.paste(id).await {
             Ok(_pressed) => Event::DaemonUp,
+            // A *refused* `Paste` is the one failure the applet can do
+            // something about. The daemon answers `AccessDenied` when
+            // `allow_privileged_members` is off, and it refuses **before** the
+            // copy, so without this the picker's primary action would close the
+            // popup and do nothing at all — for a user who had been told the
+            // knob leaves `Enter` working as a copy. `Copy` is not gated by
+            // either the knob or the caller check, so the entry still reaches
+            // the clipboard and the user pastes it themselves; the keystroke is
+            // the only thing lost, which is what the knob is for.
+            //
+            // The same fallback covers being refused for *not being a clippo
+            // binary* — an applet the daemon does not recognise — for the same
+            // reason: the user's `Enter` should still put the entry somewhere.
+            Err(error) if clippo_ipc::is_access_denied(&error) => {
+                warn!(
+                    id,
+                    %error,
+                    "clippod refused Paste; copying instead, so the entry is on the clipboard to \
+                     paste by hand"
+                );
+                match clippo.copy(id).await {
+                    Ok(()) => Event::DaemonUp,
+                    Err(error) => down("Copy", &error),
+                }
+            }
             Err(error) => down("Paste", &error),
         },
         Request::Delete(id) => match clippo.delete(id).await {
@@ -667,6 +697,183 @@ mod tests {
             clippo_ipc::peer::check(&connection, &owner, &PeerPolicy::from_paths([me])).await,
         );
         assert!(matches!(accepted, Event::DaemonUp), "{accepted:?}");
+    }
+
+    /// A daemon that answers `Paste` the way `clippod` does with
+    /// `allow_privileged_members` off — a refusal, *before* the copy — and
+    /// records what it was asked for.
+    ///
+    /// `denied` is the only knob: the same fake also stands in for a `Paste`
+    /// that was attempted and failed, which is the case the fallback must not
+    /// fire on.
+    struct FakeDaemon {
+        denied: bool,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeDaemon {
+        fn new(denied: bool) -> Self {
+            Self {
+                denied,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, call: String) {
+            self.calls.lock().expect("not poisoned").push(call);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("not poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl clippo_ipc::ClippoBackend for FakeDaemon {
+        async fn list(&self, _limit: u32, _offset: u32) -> fdo::Result<Vec<EntrySummary>> {
+            Ok(Vec::new())
+        }
+
+        async fn search(&self, _query: &str, _limit: u32) -> fdo::Result<Vec<EntrySummary>> {
+            Ok(Vec::new())
+        }
+
+        async fn copy(&self, id: i64) -> fdo::Result<()> {
+            self.record(format!("copy({id})"));
+            Ok(())
+        }
+
+        async fn paste(&self, id: i64) -> fdo::Result<bool> {
+            self.record(format!("paste({id})"));
+            if self.denied {
+                Err(fdo::Error::AccessDenied(
+                    "clippo refuses Paste: allow_privileged_members is off".to_owned(),
+                ))
+            } else {
+                Err(fdo::Error::Failed("no compositor".to_owned()))
+            }
+        }
+
+        async fn delete(&self, _id: i64) -> fdo::Result<()> {
+            Ok(())
+        }
+
+        async fn pin(&self, _id: i64, _pinned: bool) -> fdo::Result<()> {
+            Ok(())
+        }
+
+        async fn clear(&self, _include_pinned: bool) -> fdo::Result<()> {
+            Ok(())
+        }
+
+        async fn reveal(&self, _id: i64) -> fdo::Result<String> {
+            Err(fdo::Error::AccessDenied("not in this test".to_owned()))
+        }
+
+        async fn thumbnail(&self, _id: i64) -> fdo::Result<Vec<u8>> {
+            Err(fdo::Error::NotSupported("not in this test".to_owned()))
+        }
+
+        async fn set_paused(&self, _paused: bool) -> fdo::Result<()> {
+            Ok(())
+        }
+
+        async fn paused(&self) -> fdo::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    /// Serve [`FakeDaemon`] on a connection of its own and hand back a proxy
+    /// pointed at it.
+    ///
+    /// The caller allowlist is this test process, deliberately: the refusal
+    /// under test has to be the *knob*, not `clippo-ipc`'s caller check, or the
+    /// test would pass with the fallback wired to the wrong condition.
+    async fn serve_fake(
+        denied: bool,
+    ) -> (
+        Arc<FakeDaemon>,
+        zbus::Connection,
+        clippo_ipc::ClippoProxy<'static>,
+    ) {
+        let backend = Arc::new(FakeDaemon::new(denied));
+        let served: Arc<dyn clippo_ipc::ClippoBackend> = Arc::clone(&backend) as Arc<_>;
+        let server = zbus::Connection::session().await.expect("a connection");
+        server
+            .object_server()
+            .at(
+                clippo_ipc::OBJECT_PATH,
+                clippo_ipc::ClippoInterface::with_policy(
+                    served,
+                    PeerPolicy::from_paths([std::env::current_exe().expect("an exe")]),
+                ),
+            )
+            .await
+            .expect("the interface should serve");
+
+        let client = zbus::Connection::session().await.expect("a connection");
+        let clippo = clippo_ipc::ClippoProxy::builder(&client)
+            .destination(server.unique_name().expect("a unique name").to_owned())
+            .expect("a destination")
+            .build()
+            .await
+            .expect("a proxy");
+
+        (backend, server, clippo)
+    }
+
+    /// `allow_privileged_members = false` leaves the picker's primary action
+    /// working.
+    ///
+    /// The daemon refuses `Paste` *before* the copy, so without the fallback
+    /// `Enter` would close the popup and put nothing anywhere — while the
+    /// config key and the README both promise it becomes a copy. This is the
+    /// test that makes that sentence true.
+    #[tokio::test]
+    async fn a_refused_paste_falls_back_to_a_copy_rather_than_doing_nothing() {
+        if !has_session_bus() {
+            return;
+        }
+
+        let (backend, _server, clippo) = serve_fake(true).await;
+        let (mut outbox, mut events) = cosmic::iced::futures::channel::mpsc::channel(8);
+
+        serve_request(&clippo, Request::Paste(3), &mut outbox)
+            .await
+            .expect("the outbox is open");
+
+        assert_eq!(
+            backend.calls(),
+            ["paste(3)", "copy(3)"],
+            "a refused Paste has to reach the clipboard by the other member"
+        );
+        let event = events.next().await.expect("one event");
+        assert!(
+            matches!(event, Event::DaemonUp),
+            "the daemon answered, so this is not a connection failure: {event:?}"
+        );
+    }
+
+    /// And the other half: a `Paste` that the daemon *tried* is not a refusal,
+    /// so it is reported rather than quietly turned into a copy. Copying there
+    /// would be doing something the daemon has already done — `Paste` copies
+    /// first — and would hide a broken compositor behind a working `Enter`.
+    #[tokio::test]
+    async fn a_paste_that_merely_failed_is_not_retried_as_a_copy() {
+        if !has_session_bus() {
+            return;
+        }
+
+        let (backend, _server, clippo) = serve_fake(false).await;
+        let (mut outbox, mut events) = cosmic::iced::futures::channel::mpsc::channel(8);
+
+        serve_request(&clippo, Request::Paste(3), &mut outbox)
+            .await
+            .expect("the outbox is open");
+
+        assert_eq!(backend.calls(), ["paste(3)"]);
+        let event = events.next().await.expect("one event");
+        assert!(matches!(event, Event::Failed(_)), "{event:?}");
     }
 
     /// The two absences are different states, and the applet has to keep them

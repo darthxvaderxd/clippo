@@ -540,8 +540,11 @@ allow_privileged_members = false
 
 `Reveal` and `Paste` are then refused outright, and nothing else changes: the history is intact,
 `clippo list` and `clippo search` work, and `Copy` still puts an entry on the clipboard for you
-to paste yourself. The cost is that `clippo reveal` stops working and `Enter` in the picker
-becomes a copy, so `Ctrl+R` has nothing to show. **The daemon enforces it**, not the frontends —
+to paste yourself. The cost is that `clippo reveal` stops working, so `Ctrl+R` in the picker has
+nothing to show, and `Enter` in the picker becomes a copy: the applet falls back to `Copy` when
+its `Paste` comes back refused, so choosing an entry still puts it on the clipboard and only the
+keystroke is lost. `clippo paste 2` on the command line reports the refusal instead — use
+`clippo copy 2`. **The daemon enforces it**, not the frontends —
 a switch a caller could skip by not being the applet would not be one. Read once at startup, so
 `systemctl --user restart clippod` after editing, and `clippod` says which way it is set:
 

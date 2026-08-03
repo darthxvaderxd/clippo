@@ -52,6 +52,19 @@
 //! "We could not tell" and "it is not ours" have the same consequence, and a
 //! check that admits the peers it could not identify would be worth nothing at
 //! all.
+//!
+//! # A refusal is written by the peer it refuses
+//!
+//! The one useful thing a refusal can say is *what the peer was running*, and
+//! that string is the refused process's to choose: a filename may contain any
+//! byte but `/` and NUL, so an impostor can exec from a directory named
+//! `` `ESC [ 2 K` `` and have the warning about it erase the line it is printed
+//! on, or from one containing `U+202E` and have the picker's caption read
+//! backwards. It reaches a terminal (`clippo`'s stderr), a GUI (the applet's
+//! untrusted screen) and the journal, so it goes through
+//! [`clippo_core::display::one_line`] at the one place the refusal is built —
+//! the same escaping every other frontend already applies to previews. See
+//! [`PeerError::exe_for_display`].
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -156,8 +169,9 @@ pub enum PeerError {
 
     /// The peer's exe is not one of the installed clippo binaries.
     #[error(
-        "{name} is pid {pid}, which is running {exe} — not one of the clippo binaries installed \
-         beside this one"
+        "{name} is pid {pid}, which is running {shown} — not one of the clippo binaries installed \
+         beside this one",
+        shown = escaped(.exe)
     )]
     NotAllowlisted {
         /// The name that was asked about.
@@ -165,8 +179,32 @@ pub enum PeerError {
         /// The pid the bus reported.
         pid: u32,
         /// What `/proc/<pid>/exe` resolved to.
+        ///
+        /// **Chosen by the process being refused**, so it is raw: anything
+        /// putting it in front of a human wants
+        /// [`exe_for_display`][PeerError::exe_for_display], which is what the
+        /// message above renders.
         exe: PathBuf,
     },
+}
+
+/// How much of a path a refusal prints.
+///
+/// A path is at most `PATH_MAX` (4096) bytes and a real one is a small fraction
+/// of that, so this only ever bites on a name built to be long — which is the
+/// same process that chose the rest of the string. Long enough that any genuine
+/// installed path arrives whole, and the reader can go and look at it.
+const EXE_CHARS: usize = 200;
+
+/// A peer-chosen path as it is safe to print, anywhere.
+///
+/// [`one_line`][clippo_core::display::one_line] is the escaping the CLI's table
+/// and the applet's rows already run every preview through, for the same reason
+/// and against the same set: control characters that a terminal *acts* on, and
+/// the invisible and reordering characters that reorder a line of shaped text
+/// in a GUI list just as they do a table column.
+fn escaped(exe: &Path) -> String {
+    clippo_core::display::one_line(&exe.display().to_string(), EXE_CHARS)
 }
 
 impl PeerError {
@@ -184,10 +222,18 @@ impl PeerError {
         }
     }
 
-    /// What the refused peer was running, when it got as far as being read.
-    pub fn exe(&self) -> Option<&Path> {
+    /// What the refused peer was running, when it got as far as being read,
+    /// escaped for printing.
+    ///
+    /// A `String` rather than a `&Path` because there is no caller that wants
+    /// the raw bytes and several that would print them: the journal field beside
+    /// the message is a sink like any other, and `journalctl` writes it to a
+    /// terminal. It is the same [`clippo_core::display::one_line`] pass the
+    /// message itself makes, so the field and the message cannot disagree about
+    /// what the peer's path looked like.
+    pub fn exe_for_display(&self) -> Option<String> {
         match self {
-            PeerError::NotAllowlisted { exe, .. } => Some(exe),
+            PeerError::NotAllowlisted { exe, .. } => Some(escaped(exe)),
             _ => None,
         }
     }
@@ -500,7 +546,52 @@ mod tests {
         let printed = error.to_string();
         assert!(printed.contains(&me.display().to_string()), "{printed}");
         assert_eq!(error.pid(), Some(std::process::id()));
-        assert_eq!(error.exe(), Some(me.as_path()));
+        assert_eq!(error.exe_for_display(), Some(me.display().to_string()));
+    }
+
+    /// The refused peer wrote part of this message, so it does not get to
+    /// repaint it.
+    ///
+    /// `/proc/<pid>/exe` is the path of a binary the *impostor* chose to run,
+    /// and a filename may hold any byte but `/` and NUL. The two that matter
+    /// are here: an erase-and-move-up pair, which would rub out the warning as
+    /// it is printed to `clippo`'s stderr, and a right-to-left override, which
+    /// reorders the picker's caption without a terminal being involved at all.
+    /// Both sinks read this one string, which is why the escaping is here and
+    /// not in either of them.
+    #[test]
+    fn a_refused_peers_own_path_cannot_repaint_the_message_it_appears_in() {
+        let hostile = PeerError::NotAllowlisted {
+            name: ":1.9".to_owned(),
+            pid: 4321,
+            exe: PathBuf::from("/tmp/\u{1b}[2K\u{1b}[A\u{202e}/clippod"),
+        };
+
+        for rendered in [
+            hostile.to_string(),
+            hostile.exe_for_display().expect("an exe"),
+        ] {
+            assert!(
+                !rendered.contains('\u{1b}') && !rendered.contains('\u{202e}'),
+                "{rendered}"
+            );
+            // Escaped rather than dropped: the path is what the reader has to
+            // go and look at, so it has to still be legible.
+            assert!(rendered.contains("\\u{1b}[2K"), "{rendered}");
+            assert!(rendered.contains("\\u{202e}"), "{rendered}");
+            assert!(rendered.contains("clippod"), "{rendered}");
+        }
+        // And the message still says which peer, which is the other half of
+        // being actionable.
+        assert!(hostile.to_string().contains("4321"));
+    }
+
+    /// The same escaping cannot be so eager that an ordinary path stops being
+    /// one — a refusal nobody can copy out of the journal is no use either.
+    #[test]
+    fn an_ordinary_path_survives_the_escaping_unchanged() {
+        let path = PathBuf::from("/home/someone/.local/bin/not-clippo");
+        assert_eq!(escaped(&path), "/home/someone/.local/bin/not-clippo");
     }
 
     /// Failing closed, both ways of failing.

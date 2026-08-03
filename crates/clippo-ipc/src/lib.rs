@@ -130,14 +130,34 @@ pub fn is_service_absent(error: &zbus::Error) -> bool {
     error_name(error).is_some_and(|name| ABSENT_SERVICE.contains(&name.as_str()))
 }
 
+/// The name `clippod` refuses with when it will not do something at all, as
+/// opposed to trying and failing.
+const ACCESS_DENIED: &str = "org.freedesktop.DBus.Error.AccessDenied";
+
+/// Whether a failed call is the daemon declining on principle.
+///
+/// There are exactly two reasons clippo answers this way, and they are the two
+/// a frontend can do something about rather than only report: the user turned
+/// `allow_privileged_members` off, or the caller is not one of clippo's own
+/// binaries. Both mean the member will keep refusing, so retrying is pointless
+/// and the frontend's fallback — the applet's `Copy` after a refused `Paste` —
+/// is the only thing left that helps.
+///
+/// Beside [`is_service_absent`] for the same reason it exists: the error name
+/// is written down once, in the crate both sides already share.
+pub fn is_access_denied(error: &zbus::Error) -> bool {
+    error_name(error).as_deref() == Some(ACCESS_DENIED)
+}
+
 /// The D-Bus error name of a failed call, when it has one.
 ///
 /// Not every [`zbus::Error`] is an error *reply* — a transport failure has no
 /// name at all — which is why this is an `Option` rather than a string that
 /// would sometimes be empty.
 ///
-/// Private: [`is_service_absent`] is the question both frontends actually ask,
-/// and a name on its own is not a decision anybody outside this module makes.
+/// Private: [`is_service_absent`] and [`is_access_denied`] are the questions
+/// the frontends actually ask, and a name on its own is not a decision anybody
+/// outside this module makes.
 fn error_name(error: &zbus::Error) -> Option<String> {
     use zbus::DBusError as _;
 
@@ -239,6 +259,36 @@ mod tests {
             "no entry 9".to_owned(),
         )));
         assert!(!is_service_absent(&refused));
+    }
+
+    /// The third answer, which is neither of the other two: the daemon is there
+    /// and will not do it. The applet's `Paste` fallback turns on this, and a
+    /// hand-typed name that never matched would make that fallback dead code
+    /// nobody noticed — so the name is asserted against zbus's own.
+    #[test]
+    fn a_refusal_on_principle_is_told_apart_from_both_of_the_others() {
+        use zbus::DBusError as _;
+
+        let denied = zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
+            "clippo refuses Paste".to_owned(),
+        )));
+        assert!(is_access_denied(&denied));
+        assert!(!is_service_absent(&denied));
+
+        let absent = zbus::Error::FDO(Box::new(zbus::fdo::Error::ServiceUnknown(String::new())));
+        assert!(!is_access_denied(&absent));
+
+        let failed = zbus::Error::FDO(Box::new(zbus::fdo::Error::Failed(
+            "no compositor".to_owned(),
+        )));
+        assert!(!is_access_denied(&failed));
+
+        assert_eq!(
+            zbus::fdo::Error::AccessDenied(String::new())
+                .name()
+                .as_str(),
+            ACCESS_DENIED
+        );
     }
 
     /// Hand-written strings drift; asserting them against what zbus itself

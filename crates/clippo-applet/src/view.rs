@@ -106,6 +106,11 @@ const THUMB: f32 = 40.0;
 /// the executable path — but bounded, because that path comes from `/proc` and
 /// therefore from the refused process itself. A peer that named itself two
 /// thousand characters would otherwise choose the height of this popup.
+///
+/// Length is all this bounds. The *characters* in that path — the reordering
+/// ones a GUI acts on as readily as a terminal does — are escaped where the
+/// refusal is built, in `clippo_ipc::peer`, because the same string is also
+/// printed by `clippo` and written to the journal.
 const REASON_CHARS: usize = 240;
 
 /// The whole picker.
