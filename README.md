@@ -27,16 +27,6 @@ the failure mode is not an error you go looking for, it is capture silently doin
 
 Use a host terminal (`cosmic-term`), and check the socket before anything else:
 
-```sh
-echo $WAYLAND_DISPLAY   # must print wayland-0, not wayland-1
-```
-
-If it says `wayland-1`, you are on the proxied socket and nothing below will work. Whenever
-capture "silently stops working", check this first. `clippod` and `clippo-watch` both name
-both protocols and print the `$WAYLAND_DISPLAY` they actually saw when they cannot bind, so
-the cause is diagnosable from the output alone. Details in [DESIGN.md](docs/DESIGN.md),
-"Environment constraints".
-
 ## Building
 
 The host needs a Rust toolchain (stable); RustRover's bundled one is for its own use only:
