@@ -9,6 +9,8 @@
 //! max_age_days = 30
 //! max_image_bytes = 8388608
 //! capture_primary = false
+//! auto_paste = true
+//! paste_shortcut = "Ctrl+V"
 //!
 //! [secrets]
 //! entropy_rule = true
@@ -42,6 +44,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::chord::Chord;
 use crate::paths;
 
 /// Entries kept before the oldest unpinned ones are dropped. DESIGN.md,
@@ -57,6 +60,23 @@ pub const DEFAULT_MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 /// Whether the middle-click primary selection is captured. DESIGN.md,
 /// `clippo-wayland`: **off**.
 pub const DEFAULT_CAPTURE_PRIMARY: bool = false;
+
+/// The shortcut `Paste` synthesises once the entry is on the clipboard.
+///
+/// `Ctrl+V` because it is what almost everything pastes on. It is a config key
+/// rather than a constant because the exception is a large one: most terminals
+/// paste on `Ctrl+Shift+V` and treat `Ctrl+V` as something else entirely, so a
+/// user who mostly pastes into a terminal needs the other one. There is one
+/// shortcut for every application — see [`Config::paste_shortcut`].
+pub const DEFAULT_PASTE_SHORTCUT: &str = "Ctrl+V";
+
+/// Whether `Paste` presses the shortcut at all. **On.**
+///
+/// On because a picker that leaves you to press the key yourself is doing half
+/// the job, and that half is the one the user is there for. Off is for people
+/// who would rather clippo never synthesised input — see [`Config::auto_paste`],
+/// which is a capability switch and not a preference about the applet.
+pub const DEFAULT_AUTO_PASTE: bool = true;
 
 /// Whether the entropy heuristic runs. DESIGN.md, "Known risks": on, with an
 /// escape hatch.
@@ -117,6 +137,33 @@ pub struct Config {
     /// Off by default; feeds `clippo_wayland::WatchConfig::primary`.
     pub capture_primary: bool,
 
+    /// Whether clippo may press keys for you at all.
+    ///
+    /// With this off, `Paste` copies and stops there: `Enter` in the picker
+    /// puts the entry on the clipboard and you press your own paste key, which
+    /// is what clippo did before it could do this. `clippo paste` is affected
+    /// too, and deliberately — this is not "what `Enter` does", it is whether
+    /// clippo is allowed to synthesise input at all, and a switch for that
+    /// should not have an exception that types into a window anyway.
+    ///
+    /// Nothing else changes. The entry still reaches the clipboard, so every
+    /// application's own paste key still works.
+    pub auto_paste: bool,
+
+    /// The shortcut `Paste` synthesises into the focused window.
+    ///
+    /// `Paste(id)` is `Copy(id)` plus this combination pressed for the user, so
+    /// choosing an entry from the picker puts it where the cursor is instead of
+    /// leaving them to press it themselves.
+    ///
+    /// **It is one shortcut for every application**, and applications disagree:
+    /// the default `Ctrl+V` is wrong in most terminals, which want
+    /// `Ctrl+Shift+V`. Set it to whichever you paste into most; the other one
+    /// still works by hand, because `Paste` really does put the entry on the
+    /// clipboard first. A shortcut clippo cannot read stops the daemon at
+    /// startup naming the key, rather than silently pasting nothing.
+    pub paste_shortcut: Chord,
+
     /// Secret detection and masking.
     pub secrets: SecretsConfig,
 }
@@ -128,6 +175,14 @@ impl Default for Config {
             max_age_days: DEFAULT_MAX_AGE_DAYS,
             max_image_bytes: DEFAULT_MAX_IMAGE_BYTES,
             capture_primary: DEFAULT_CAPTURE_PRIMARY,
+            auto_paste: DEFAULT_AUTO_PASTE,
+            // Parsed rather than built by hand so that the default is held to
+            // the same rule as a user's value: if `DEFAULT_PASTE_SHORTCUT` ever
+            // stops being readable, every test fails rather than the daemon
+            // quietly shipping a shortcut nobody wrote.
+            paste_shortcut: DEFAULT_PASTE_SHORTCUT
+                .parse()
+                .expect("the default paste shortcut parses"),
             secrets: SecretsConfig::default(),
         }
     }
@@ -277,6 +332,8 @@ struct RawConfig {
     max_age_days: Option<i64>,
     max_image_bytes: Option<i64>,
     capture_primary: Option<bool>,
+    auto_paste: Option<bool>,
+    paste_shortcut: Option<String>,
     secrets: Option<Secrets>,
 }
 
@@ -340,6 +397,20 @@ impl RawConfig {
             Some(value) => value,
         };
 
+        let auto_paste = match self.auto_paste {
+            None => DEFAULT_AUTO_PASTE,
+            Some(value) => value,
+        };
+
+        let paste_shortcut = match self.paste_shortcut.as_deref() {
+            None => DEFAULT_PASTE_SHORTCUT
+                .parse()
+                .expect("the default paste shortcut parses"),
+            Some(value) => value.parse().map_err(|error| {
+                format!("paste_shortcut is not a shortcut clippo can press: {error}")
+            })?,
+        };
+
         let entropy_rule = match secrets.entropy_rule {
             None => DEFAULT_ENTROPY_RULE,
             Some(value) => value,
@@ -382,6 +453,8 @@ impl RawConfig {
             max_age_days,
             max_image_bytes,
             capture_primary,
+            auto_paste,
+            paste_shortcut,
             secrets: SecretsConfig {
                 entropy_rule,
                 mask_prefix,
@@ -410,7 +483,7 @@ impl fmt::Display for Config {
         write!(
             f,
             "max_entries={}, max_age_days={} ({}), max_image_bytes={}, capture_primary={}, \
-             entropy_rule={}, mask={}/{}",
+             auto_paste={}, paste_shortcut={}, entropy_rule={}, mask={}/{}",
             self.max_entries,
             self.max_age_days,
             if self.max_age().is_some() {
@@ -420,6 +493,8 @@ impl fmt::Display for Config {
             },
             self.max_image_bytes,
             self.capture_primary,
+            self.auto_paste,
+            self.paste_shortcut,
             self.secrets.entropy_rule,
             self.secrets.mask_prefix,
             self.secrets.mask_suffix,
@@ -517,6 +592,60 @@ mask_suffix = 2
     fn primary_capture_can_be_turned_on() {
         assert!(parse("capture_primary = true\n").unwrap().capture_primary);
         assert!(!parse("capture_primary = false\n").unwrap().capture_primary);
+    }
+
+    #[test]
+    fn auto_paste_is_on_unless_it_is_turned_off() {
+        assert!(parse("").unwrap().auto_paste);
+        assert!(parse("auto_paste = true\n").unwrap().auto_paste);
+        assert!(!parse("auto_paste = false\n").unwrap().auto_paste);
+    }
+
+    /// Turning the keystroke off leaves the shortcut readable rather than
+    /// making it meaningless: the two keys are independent, and turning
+    /// `auto_paste` back on should not require re-reading the other one.
+    #[test]
+    fn auto_paste_off_still_parses_the_shortcut() {
+        let config = parse("auto_paste = false\npaste_shortcut = \"Ctrl+Shift+V\"\n").unwrap();
+        assert!(!config.auto_paste);
+        assert_eq!(config.paste_shortcut.to_string(), "Ctrl+Shift+V");
+    }
+
+    /// And an unreadable one is still an error when the keystroke is off. A
+    /// config that would break on being switched back on is a config that is
+    /// wrong now.
+    #[test]
+    fn auto_paste_off_does_not_excuse_an_unpressable_shortcut() {
+        assert!(parse("auto_paste = false\npaste_shortcut = \"Ctrl+F13\"\n").is_err());
+    }
+
+    #[test]
+    fn the_paste_shortcut_defaults_to_the_one_almost_everything_uses() {
+        assert_eq!(parse("").unwrap().paste_shortcut.to_string(), "Ctrl+V");
+    }
+
+    /// The case the key exists for: a user who mostly pastes into a terminal.
+    #[test]
+    fn the_paste_shortcut_can_be_a_terminals() {
+        let config = parse("paste_shortcut = \"Ctrl+Shift+V\"\n").unwrap();
+        assert_eq!(config.paste_shortcut.to_string(), "Ctrl+Shift+V");
+    }
+
+    /// Rule 2 of the module docs, for the one key whose value is not a number:
+    /// a shortcut clippo cannot press must stop the daemon rather than become a
+    /// `Paste` that copies and then does nothing visible.
+    #[test]
+    fn an_unpressable_paste_shortcut_is_an_error_naming_the_key() {
+        let error = parse("paste_shortcut = \"Ctrl+F13\"\n").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("paste_shortcut"), "{message}");
+        assert!(message.contains("F13"), "{message}");
+    }
+
+    #[test]
+    fn a_paste_shortcut_with_no_key_is_an_error() {
+        assert!(parse("paste_shortcut = \"Ctrl\"\n").is_err());
+        assert!(parse("paste_shortcut = \"\"\n").is_err());
     }
 
     #[test]

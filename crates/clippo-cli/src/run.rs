@@ -53,6 +53,28 @@ pub fn run(command: Command) -> Result<(), CliError> {
             Ok(())
         }
 
+        Command::Paste { id } => {
+            let id = client.resolve(&id)?;
+            // The daemon says whether it pressed anything, so this does not
+            // claim a paste that did not happen: `auto_paste` may be off, the
+            // compositor may offer no way to synthesise keys, or the attempt
+            // may have failed. All three leave the entry on the clipboard,
+            // which is the part worth telling the user either way.
+            let pressed = client.paste(id)?;
+            note(if pressed {
+                format!(
+                    "entry {id} is on the clipboard, and clippo pressed your paste shortcut \
+                     wherever the focus was"
+                )
+            } else {
+                format!(
+                    "entry {id} is on the clipboard — clippo did not press anything; \
+                     paste it yourself, and see clippod's log for why"
+                )
+            });
+            Ok(())
+        }
+
         Command::Pin { id, off } => {
             let id = client.resolve(&id)?;
             client.pin(id, !off)?;

@@ -76,6 +76,11 @@ impl ClippoBackend for Recorder {
         Ok(())
     }
 
+    async fn paste(&self, id: i64) -> fdo::Result<bool> {
+        self.record(format!("paste({id})"));
+        Ok(true)
+    }
+
     async fn delete(&self, id: i64) -> fdo::Result<()> {
         self.record(format!("delete({id})"));
         Err(fdo::Error::InvalidArgs(format!("no entry {id}")))
@@ -166,6 +171,10 @@ async fn every_member_carries_its_arguments_and_its_answer_across_the_bus() {
     assert_eq!(found, vec![entry(8, "found")]);
 
     clippo.copy(1).await.expect("Copy");
+    assert!(
+        clippo.paste(1).await.expect("Paste"),
+        "Paste answers a bool"
+    );
     clippo.pin(2, true).await.expect("Pin");
     clippo.clear(false).await.expect("Clear");
     assert_eq!(clippo.reveal(3).await.expect("Reveal"), "the whole value");
@@ -196,6 +205,7 @@ async fn every_member_carries_its_arguments_and_its_answer_across_the_bus() {
             "list(10, 5)",
             "search(\"needle\", 3)",
             "copy(1)",
+            "paste(1)",
             "pin(2, true)",
             "clear(false)",
             "reveal(3)",

@@ -9,10 +9,10 @@
 //! # Every action is a D-Bus call the CLI also makes
 //!
 //! M5 requires no second code path, and there is none: `Enter` sends
-//! [`Request::Copy`], `Delete` sends [`Request::Delete`], `Ctrl+P` sends
+//! [`Request::Paste`], `Delete` sends [`Request::Delete`], `Ctrl+P` sends
 //! [`Request::Pin`]. The applet has no store, no database handle and no
 //! `clippo-store` dependency — it cannot reach the history except through the
-//! same members `clippo copy`, `clippo rm` and `clippo pin` use.
+//! same members `clippo paste`, `clippo rm` and `clippo pin` use.
 //!
 //! # Why the keys are read globally
 //!
@@ -88,7 +88,7 @@ pub enum Action {
     Previous,
     /// `↓`
     Next,
-    /// `Enter` — copy the selected entry and close.
+    /// `Enter` — paste the selected entry where the cursor is, and close.
     Activate,
     /// `Delete` — remove the selected entry.
     Remove,
@@ -166,13 +166,24 @@ impl Clippo {
         }
     }
 
-    /// Copy the selected entry and put the picker away.
+    /// Paste the selected entry into whatever was focused, and put the picker
+    /// away.
     ///
-    /// Closing is not optional: the user asked for this value in order to paste
-    /// it somewhere, and a picker still on screen is over the window they are
-    /// about to paste into.
+    /// Closing is not optional and, since `Paste`, is not only tidiness: the
+    /// daemon presses the user's paste shortcut into whatever holds keyboard
+    /// focus, and while the picker is up that is the picker. It has to be gone
+    /// before the keystroke lands, which is why the daemon waits before
+    /// pressing — see `clippod`'s `FOCUS_SETTLE`. Nothing here can do better
+    /// than that: the applet knows when it asked the compositor to destroy the
+    /// surface, not when the compositor moved focus back.
     ///
-    /// It closes before the `Copy` can have failed, which is the cost of that:
+    /// The request goes out *before* the close rather than after, and the order
+    /// is deliberate. There is no "closed" to wait for that would help — the
+    /// daemon's wait is what covers the gap — and sending afterwards would mean
+    /// keeping something alive to send from after the surface that owns the
+    /// selection is gone.
+    ///
+    /// It closes before the `Paste` can have failed, which is the cost of that:
     /// a refusal reaches the journal and not the user, who finds out by pasting
     /// the wrong thing. Holding the picker open until the answer came back
     /// would put a frame's delay on every copy to catch a case that only arises
@@ -182,7 +193,7 @@ impl Clippo {
         let Some(id) = self.model.selected_id() else {
             return Task::none();
         };
-        self.ask(Request::Copy(id));
+        self.ask(Request::Paste(id));
         self.dismiss()
     }
 

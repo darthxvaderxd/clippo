@@ -157,8 +157,14 @@ async fn run(logging: &str) -> anyhow::Result<()> {
     let signals = Signals::bus(
         clippo_ipc::emitter(&connection).context("clippo could not prepare its D-Bus signals")?,
     );
-    let daemon = Daemon::new(store, signals, config.secrets.clone())
-        .context("clippo could not load its history")?;
+    let daemon = Daemon::new(
+        store,
+        signals,
+        config.secrets.clone(),
+        config.paste_shortcut.clone(),
+        config.auto_paste,
+    )
+    .context("clippo could not load its history")?;
 
     // Export first, take the name second: a caller that resolves the name and
     // immediately calls must find the object already there.
@@ -191,6 +197,36 @@ async fn run(logging: &str) -> anyhow::Result<()> {
     // `Copy` works from here on. Before this the object is exported but there
     // is no compositor connection behind it, and it says so.
     daemon.connect_clipboard(Arc::new(watcher.clipboard()));
+
+    // `Paste` is the one capability clippo starts without rather than failing
+    // over: a compositor with no way to synthesise keys still serves every
+    // other member, and `Paste` there is `Copy`, which is what the user had
+    // before it existed. So this is said once, here, where it is useful, and
+    // not on every call.
+    if !config.auto_paste {
+        // Not even bound. `auto_paste = false` is a user saying clippo must not
+        // synthesise input, and the honest way to honour that is to never hold
+        // the means to: no virtual keyboard is created, so there is nothing for
+        // a later bug to press.
+        info!("auto_paste is off; Paste will copy and leave the pasting to you");
+    } else {
+        match clippo_wayland::VirtualKeyboard::new() {
+            Ok(keyboard) => {
+                info!(
+                    shortcut = %config.paste_shortcut,
+                    "clippo can press the paste shortcut for you"
+                );
+                daemon.connect_keystrokes(Arc::new(keyboard));
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "clippo cannot press the paste shortcut; Paste will copy and leave the \
+                     pasting to you"
+                );
+            }
+        }
+    }
 
     let capture = tokio::spawn({
         let daemon = Arc::clone(&daemon);

@@ -24,10 +24,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use clippo_core::{EntryId, EntryKind, Flavor, NewEntry, SecretsConfig, Timestamp};
+use clippo_core::{Chord, EntryId, EntryKind, Flavor, NewEntry, SecretsConfig, Timestamp};
 use clippo_ipc::{ClippoBackend, ClippoInterface, EntrySummary};
 use clippo_store::{dedup, is_offerable, Store, StoreError};
-use clippo_wayland::{Clipboard, Selection};
+use clippo_wayland::{Clipboard, Keystrokes, Selection};
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, error, info, warn};
 use zbus::fdo;
@@ -36,6 +36,16 @@ use zbus::object_server::SignalEmitter;
 use crate::cache::PreviewCache;
 use crate::echo::EchoGuard;
 use crate::preview;
+
+/// How long `Paste` waits between copying and pressing the shortcut.
+///
+/// Long enough for the compositor to have taken keyboard focus off the applet's
+/// picker and put it back on the window underneath, because a keystroke sent
+/// before that happens goes to the picker. There is no event this side of the
+/// bus that says focus has settled — see [`Daemon::paste`] — so it is a number,
+/// and a generous one: 120 ms is imperceptible next to the act of choosing an
+/// entry, and being early means pasting into the wrong surface.
+const FOCUS_SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// The mutable half, behind one lock.
 ///
@@ -76,6 +86,16 @@ pub struct Daemon {
     /// Where `Copy` puts an entry. Filled in once, after the Wayland watcher
     /// has started — see [`Daemon::connect_clipboard`].
     clipboard: OnceLock<Arc<dyn Clipboard>>,
+    /// What `Paste` presses once the entry is on the clipboard, and the
+    /// combination to press. Filled in once, like the clipboard, and absent on
+    /// a compositor that offers no way to synthesise keys — see
+    /// [`Daemon::connect_keystrokes`].
+    keystrokes: OnceLock<Arc<dyn Keystrokes>>,
+    /// The user's `paste_shortcut`, read once at startup with the rest of the
+    /// config.
+    paste_shortcut: Chord,
+    /// The user's `auto_paste`. `false` makes `Paste` stop after the copy.
+    auto_paste: bool,
 }
 
 impl Daemon {
@@ -94,6 +114,8 @@ impl Daemon {
         store: Store,
         signals: Signals,
         secrets: SecretsConfig,
+        paste_shortcut: Chord,
+        auto_paste: bool,
     ) -> Result<Arc<Self>, StoreError> {
         let mut state = State {
             store,
@@ -111,6 +133,9 @@ impl Daemon {
             secrets,
             signals,
             clipboard: OnceLock::new(),
+            keystrokes: OnceLock::new(),
+            paste_shortcut,
+            auto_paste,
         }))
     }
 
@@ -129,6 +154,19 @@ impl Daemon {
     pub fn connect_clipboard(&self, clipboard: Arc<dyn Clipboard>) {
         if self.clipboard.set(clipboard).is_err() {
             error!("clippo was given a second clipboard to serve Copy from; ignoring it");
+        }
+    }
+
+    /// Give the daemon the keyboard `Paste` presses the shortcut on.
+    ///
+    /// Optional in a way the clipboard is not. Without it `Paste` is `Copy`,
+    /// which is a working clipboard manager and what every user had before this
+    /// existed, so a compositor with no `zwp_virtual_keyboard_v1` is a reason
+    /// to log once at startup rather than to refuse to run. `main` does not
+    /// call this at all in that case.
+    pub fn connect_keystrokes(&self, keystrokes: Arc<dyn Keystrokes>) {
+        if self.keystrokes.set(keystrokes).is_err() {
+            error!("clippo was given a second keyboard to serve Paste from; ignoring it");
         }
     }
 
@@ -465,6 +503,78 @@ impl ClippoBackend for Daemon {
         self.copy_at(EntryId::new(id), Timestamp::now()).await
     }
 
+    async fn paste(&self, id: i64) -> fdo::Result<bool> {
+        // The copy half first, and its failure is the whole call's failure:
+        // pressing the paste shortcut with the old clipboard still loaded would
+        // paste the wrong thing, which is worse than pasting nothing.
+        self.copy_at(EntryId::new(id), Timestamp::now()).await?;
+
+        // Checked after the copy rather than before it, so that turning
+        // `auto_paste` off changes exactly one thing: whether a key is pressed.
+        // The entry still reaches the clipboard, the history still reorders,
+        // and `Paste` still succeeds — it is `Copy` with the second half
+        // switched off, not a different member.
+        if !self.auto_paste {
+            debug!(id, "auto_paste is off; the entry is on the clipboard");
+            return Ok(false);
+        }
+
+        let Some(keystrokes) = self.keystrokes.get().cloned() else {
+            // Logged at debug rather than warn: on a compositor without the
+            // protocol this is every `Paste`, and `main` has already said so
+            // once, at startup, where it is useful.
+            debug!(
+                id,
+                "clippo has no way to press the paste shortcut; the entry is on the clipboard"
+            );
+            return Ok(false);
+        };
+
+        // The picker is still on screen when this call arrives — the applet
+        // sends `Paste` and closes in the same breath, because it cannot send
+        // it *after* closing without keeping a surface alive to send from. So
+        // the keystroke has to wait for the compositor to take focus off the
+        // picker and give it back to the window underneath, and there is no
+        // event here that says it has: this daemon is not the applet, has no
+        // surface, and sees none of that.
+        //
+        // Hence a delay, which is exactly the kind of thing that is wrong on
+        // somebody else's machine. It is deliberately more than it usually
+        // needs to be; the cost of being early is pasting into the picker.
+        tokio::time::sleep(FOCUS_SETTLE).await;
+
+        let shortcut = self.paste_shortcut.clone();
+        // `send` sleeps while the key is held and then blocks on a round trip,
+        // so it does not belong on a runtime worker.
+        let sent = tokio::task::spawn_blocking(move || keystrokes.send(&shortcut)).await;
+
+        match sent {
+            Ok(Ok(())) => {
+                info!(id, shortcut = %self.paste_shortcut, "clippo pressed the paste shortcut");
+                return Ok(true);
+            }
+            // Reported to the journal and not to the caller, deliberately. The
+            // entry is on the clipboard, so the user can finish this by hand,
+            // and an error here would have a frontend report a failed `Paste`
+            // for something that half worked — the half that matters most.
+            Ok(Err(error)) => {
+                warn!(
+                    id,
+                    error = %error,
+                    "clippo put the entry on the clipboard but could not press the paste shortcut"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    id,
+                    error = %error,
+                    "clippo's keystroke task did not finish; the entry is still on the clipboard"
+                );
+            }
+        }
+        Ok(false)
+    }
+
     async fn delete(&self, id: i64) -> fdo::Result<()> {
         let id = EntryId::new(id);
         let mut state = self.state.lock().await;
@@ -680,6 +790,18 @@ mod tests {
 
     use super::*;
 
+    /// The default paste shortcut, for the daemons these tests build.
+    ///
+    /// Which combination it is does not matter to anything here — no test
+    /// presses a key on a real compositor — but it has to be *a* chord, and
+    /// taking the documented default keeps these from asserting against a value
+    /// no user would ever have.
+    fn paste_shortcut() -> Chord {
+        clippo_core::config::DEFAULT_PASTE_SHORTCUT
+            .parse()
+            .expect("the default paste shortcut parses")
+    }
+
     /// The compositor, in process.
     ///
     /// This is the seam DESIGN.md's risk table asks the self-echo loop to be
@@ -689,6 +811,41 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeClipboard {
         offers: StdMutex<Vec<Vec<Flavor>>>,
+    }
+
+    /// The keyboard, in process: it records what it was asked to press.
+    ///
+    /// The seam that makes `Paste` testable without a compositor, and the
+    /// reason [`Keystrokes`] is a trait. What these tests can check is the part
+    /// that is clippo's own logic — that the copy happens first, that it
+    /// happens even when the keystroke cannot, and that the chord pressed is
+    /// the configured one — and not whether cosmic-comp honours the keystroke,
+    /// which needs a compositor and is ROADMAP Verification §6's job.
+    #[derive(Debug, Default)]
+    struct FakeKeyboard {
+        pressed: StdMutex<Vec<String>>,
+        /// Set to make every press fail, standing in for a compositor that
+        /// took the protocol away mid-run.
+        broken: bool,
+    }
+
+    impl FakeKeyboard {
+        fn presses(&self) -> Vec<String> {
+            self.pressed.lock().expect("not poisoned").clone()
+        }
+    }
+
+    impl Keystrokes for FakeKeyboard {
+        fn send(&self, chord: &Chord) -> Result<(), clippo_wayland::KeyError> {
+            if self.broken {
+                return Err(clippo_wayland::KeyError::Unsupported);
+            }
+            self.pressed
+                .lock()
+                .expect("not poisoned")
+                .push(chord.to_string());
+            Ok(())
+        }
     }
 
     impl FakeClipboard {
@@ -751,12 +908,28 @@ mod tests {
         /// The same, with the `[secrets]` table the caller wants — the entropy
         /// knob is the only thing any test needs to vary.
         fn with_secrets(secrets: SecretsConfig) -> Self {
+            Self::build(secrets, true)
+        }
+
+        /// A daemon with `auto_paste = false`, for the one thing that knob
+        /// changes.
+        fn without_auto_paste() -> Self {
+            Self::build(SecretsConfig::default(), false)
+        }
+
+        fn build(secrets: SecretsConfig, auto_paste: bool) -> Self {
             let dir = tempfile::tempdir().expect("a temp dir for the test database");
             let key = Key::random().expect("a key for the test database");
             let store =
                 Store::open(dir.path().join("history.db"), &key).expect("the store should open");
-            let daemon =
-                Daemon::new(store, Signals::discard(), secrets).expect("the daemon should start");
+            let daemon = Daemon::new(
+                store,
+                Signals::discard(),
+                secrets,
+                paste_shortcut(),
+                auto_paste,
+            )
+            .expect("the daemon should start");
             let clipboard = Arc::new(FakeClipboard::default());
             daemon.connect_clipboard(Arc::clone(&clipboard) as Arc<dyn Clipboard>);
             Self {
@@ -928,6 +1101,8 @@ mod tests {
             Store::open(&path, &key).expect("open"),
             Signals::discard(),
             SecretsConfig::default(),
+            paste_shortcut(),
+            true,
         )
         .expect("start");
         first
@@ -942,6 +1117,8 @@ mod tests {
             Store::open(&path, &key).expect("reopen"),
             Signals::discard(),
             SecretsConfig::default(),
+            paste_shortcut(),
+            true,
         )
         .expect("restart");
         assert_eq!(second.search("restart", 10).await.unwrap().len(), 1);
@@ -1250,6 +1427,151 @@ mod tests {
         );
     }
 
+    /// `Paste` is `Copy` plus a keystroke, and this is the "plus a keystroke"
+    /// half: the configured chord, pressed once.
+    #[tokio::test]
+    async fn pasting_copies_and_then_presses_the_configured_shortcut() {
+        let fixture = Fixture::new();
+        let keyboard = Arc::new(FakeKeyboard::default());
+        fixture
+            .daemon
+            .connect_keystrokes(Arc::clone(&keyboard) as Arc<dyn Keystrokes>);
+        fixture.capture(&["the thing to paste"]).await;
+
+        let id = fixture.daemon.list(1, 0).await.unwrap().remove(0).id;
+        assert!(
+            fixture.daemon.paste(id).await.expect("paste"),
+            "a pressed shortcut is reported as pressed"
+        );
+
+        assert_eq!(
+            fixture.clipboard.offer_count(),
+            1,
+            "Paste has to copy before it presses anything"
+        );
+        assert_eq!(keyboard.presses(), vec!["Ctrl+V".to_owned()]);
+    }
+
+    /// The knob, and the whole of what it changes: the entry still reaches the
+    /// clipboard and the call still succeeds, and no key is pressed.
+    #[tokio::test]
+    async fn auto_paste_off_copies_and_presses_nothing() {
+        let fixture = Fixture::without_auto_paste();
+        let keyboard = Arc::new(FakeKeyboard::default());
+        fixture
+            .daemon
+            .connect_keystrokes(Arc::clone(&keyboard) as Arc<dyn Keystrokes>);
+        fixture.capture(&["copied, not pasted"]).await;
+
+        let id = fixture.daemon.list(1, 0).await.unwrap().remove(0).id;
+        assert!(
+            !fixture.daemon.paste(id).await.expect("paste must not fail"),
+            "nothing was pressed, and the answer has to say so"
+        );
+
+        assert_eq!(
+            fixture.clipboard.offer_count(),
+            1,
+            "auto_paste is about the keystroke, not about the copy"
+        );
+        assert!(
+            keyboard.presses().is_empty(),
+            "auto_paste = false must not press a key even with a keyboard to press it with"
+        );
+    }
+
+    /// The ordering that matters most: pressing the shortcut before the entry
+    /// is on the clipboard would paste whatever was there before, which is a
+    /// wrong paste rather than a failed one.
+    #[tokio::test]
+    async fn a_paste_that_cannot_copy_never_presses_anything() {
+        let fixture = Fixture::new();
+        let keyboard = Arc::new(FakeKeyboard::default());
+        fixture
+            .daemon
+            .connect_keystrokes(Arc::clone(&keyboard) as Arc<dyn Keystrokes>);
+
+        assert!(matches!(
+            fixture.daemon.paste(4_242).await,
+            Err(fdo::Error::InvalidArgs(_))
+        ));
+        assert!(
+            keyboard.presses().is_empty(),
+            "an entry that does not exist must not paste the last one"
+        );
+    }
+
+    /// A compositor that will not synthesise keys degrades `Paste` to `Copy`
+    /// rather than failing it: the entry is on the clipboard, so the user can
+    /// finish by hand, and reporting an error would have a frontend say the
+    /// whole thing failed.
+    #[tokio::test]
+    async fn a_paste_with_no_keyboard_at_all_still_copies_and_still_succeeds() {
+        let fixture = Fixture::new();
+        fixture.capture(&["copied but not pressed"]).await;
+
+        let id = fixture.daemon.list(1, 0).await.unwrap().remove(0).id;
+        assert!(
+            !fixture.daemon.paste(id).await.expect("paste must not fail"),
+            "no keyboard means nothing was pressed"
+        );
+
+        assert_eq!(fixture.clipboard.offer_count(), 1);
+    }
+
+    /// The same, for a keyboard that is there and refuses.
+    #[tokio::test]
+    async fn a_keystroke_that_fails_does_not_fail_the_paste() {
+        let fixture = Fixture::new();
+        let keyboard = Arc::new(FakeKeyboard {
+            broken: true,
+            ..FakeKeyboard::default()
+        });
+        fixture
+            .daemon
+            .connect_keystrokes(Arc::clone(&keyboard) as Arc<dyn Keystrokes>);
+        fixture.capture(&["copied but not pressed"]).await;
+
+        let id = fixture.daemon.list(1, 0).await.unwrap().remove(0).id;
+        assert!(
+            !fixture.daemon.paste(id).await.expect("paste must not fail"),
+            "a refused keystroke is not a pressed one"
+        );
+
+        assert_eq!(fixture.clipboard.offer_count(), 1);
+        assert!(keyboard.presses().is_empty());
+    }
+
+    /// A masked entry pastes its real value, for the same reason `Copy` does —
+    /// and this is the path where getting it wrong would be worst, because the
+    /// value lands in another application without the user seeing it first.
+    #[tokio::test]
+    async fn pasting_a_masked_entry_presses_for_the_real_value() {
+        let fixture = Fixture::new();
+        let keyboard = Arc::new(FakeKeyboard::default());
+        fixture
+            .daemon
+            .connect_keystrokes(Arc::clone(&keyboard) as Arc<dyn Keystrokes>);
+        let password = "Xr4$Tp9!Lm2#Wq7&Zc5%";
+        fixture.capture(&[password]).await;
+
+        let entry = fixture.daemon.list(1, 0).await.unwrap().remove(0);
+        assert!(entry.sensitive);
+        assert!(fixture.daemon.paste(entry.id).await.expect("paste"));
+
+        assert_eq!(
+            fixture
+                .clipboard
+                .last_offer()
+                .iter()
+                .find(|flavor| flavor.mime.starts_with("text/plain"))
+                .and_then(|flavor| flavor.as_str()),
+            Some(password),
+            "a synthesised paste must deliver the value, not the mask"
+        );
+        assert_eq!(keyboard.presses().len(), 1);
+    }
+
     /// DESIGN.md's escape hatch, at the daemon level: the knob switches off the
     /// entropy rule for captures and leaves the other two working.
     #[tokio::test]
@@ -1530,6 +1852,8 @@ mod tests {
             Store::open(dir.path().join("history.db"), &key).expect("open"),
             Signals::discard(),
             SecretsConfig::default(),
+            paste_shortcut(),
+            true,
         )
         .expect("start");
         if let Some(clipboard) = clipboard {

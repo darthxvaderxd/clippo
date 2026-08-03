@@ -45,6 +45,31 @@ pub trait Clippo {
     /// success beyond what this call returned.
     fn copy(&self, id: i64) -> zbus::Result<()>;
 
+    /// [`copy`](ClippoProxy::copy), and then press the user's configured paste
+    /// shortcut into whatever has keyboard focus.
+    ///
+    /// For a frontend, the difference from `Copy` is only that the user does
+    /// not have to press the shortcut themselves. Everything `Copy` documents
+    /// still applies, including the daemon having to stay running to serve the
+    /// selection.
+    ///
+    /// **Close your own surface first.** The keystroke goes wherever focus is
+    /// when it lands, so a picker still on screen receives its own paste. The
+    /// daemon waits a little before pressing to let focus return, but it cannot
+    /// wait for something it has no way to observe.
+    ///
+    /// **Returns whether the key was actually pressed.** `false` means the
+    /// entry is on the clipboard and nothing was typed for the user — because
+    /// they turned `auto_paste` off, because this compositor offers no way to
+    /// synthesise keys, or because the attempt failed. A frontend does the same
+    /// thing in all three cases, so they are not distinguished; the reason is in
+    /// `clippod`'s journal.
+    ///
+    /// Not an error, in any of them: the entry really is on the clipboard, and
+    /// reporting a failed `Paste` would be reporting failure for the half that
+    /// worked.
+    fn paste(&self, id: i64) -> zbus::Result<bool>;
+
     /// Remove one entry, pinned or not.
     fn delete(&self, id: i64) -> zbus::Result<()>;
 

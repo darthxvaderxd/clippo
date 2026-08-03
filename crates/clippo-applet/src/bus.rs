@@ -3,10 +3,11 @@
 //! Two directions cross this module, and keeping them in one place is what
 //! keeps [`crate::app`] synchronous and testable:
 //!
-//! - **Out** — [`Request`]s the UI makes: search, copy, delete, pin, reveal,
-//!   thumbnail. Each is one call on the same `com.nilfactor.Clippo` proxy the
-//!   CLI uses. M5 requires there be no second code path for these, and there is
-//!   not one: `clippo pin 3` and `Ctrl+P` reach the identical member.
+//! - **Out** — [`Request`]s the UI makes: search, paste, delete, pin,
+//!   reveal, thumbnail. Each is one call on the same `com.nilfactor.Clippo`
+//!   proxy the CLI uses. M5 requires there be no second code path for these,
+//!   and there is not one: `clippo pin 3` and `Ctrl+P` reach the identical
+//!   member.
 //! - **In** — [`Event`]s the UI reacts to: answers to those calls, the
 //!   daemon's `HistoryChanged`, the daemon appearing or disappearing, and
 //!   `Toggle` arriving on the applet's *own* interface from `clippo show`.
@@ -60,8 +61,13 @@ pub const ROW_LIMIT: u32 = 200;
 pub enum Request {
     /// Re-read the list for this query. An empty query is the whole history.
     Refresh(String),
-    /// `Copy(id)`.
-    Copy(i64),
+    /// `Paste(id)` — copy, and have the daemon press the user's paste
+    /// shortcut into whatever has focus once the picker is gone.
+    ///
+    /// There is no `Copy` beside this because nothing in the applet wants one:
+    /// `Paste` copies first and always, so choosing an entry puts it on the
+    /// clipboard whether or not the keystroke can be synthesised.
+    Paste(i64),
     /// `Delete(id)`.
     Delete(i64),
     /// `Pin(id, pinned)`.
@@ -86,7 +92,7 @@ impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Request::Refresh(query) => write!(f, "Refresh({} chars)", query.chars().count()),
-            Request::Copy(id) => write!(f, "Copy({id})"),
+            Request::Paste(id) => write!(f, "Paste({id})"),
             Request::Delete(id) => write!(f, "Delete({id})"),
             Request::Pin(id, pinned) => write!(f, "Pin({id}, {pinned})"),
             Request::Reveal(id) => write!(f, "Reveal({id})"),
@@ -386,9 +392,14 @@ async fn serve_request(
             Ok(entries) => Event::Entries(query, entries),
             Err(error) => down("Search", &error),
         },
-        Request::Copy(id) => match clippo.copy(id).await {
-            Ok(()) => Event::DaemonUp,
-            Err(error) => down("Copy", &error),
+        // The answer says whether the daemon actually pressed the key. The
+        // applet does the same thing either way — the picker is already closed
+        // and the entry is on the clipboard — and it has nowhere to report it,
+        // so it is dropped here rather than carried into a `Message` nothing
+        // would read. `clippod` logs the reason.
+        Request::Paste(id) => match clippo.paste(id).await {
+            Ok(_pressed) => Event::DaemonUp,
+            Err(error) => down("Paste", &error),
         },
         Request::Delete(id) => match clippo.delete(id).await {
             Ok(()) => Event::DaemonUp,

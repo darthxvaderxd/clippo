@@ -46,6 +46,7 @@
 //! [`Error::NoDataControlManager`].
 
 mod flavor;
+mod keys;
 mod mime;
 mod offer;
 mod protocol;
@@ -54,6 +55,7 @@ mod watch;
 use std::fmt;
 use std::time::Duration;
 
+pub use keys::{KeyError, Keystrokes, VirtualKeyboard, VIRTUAL_KEYBOARD_PROTOCOL};
 pub use mime::{
     is_interesting, is_password_manager_hint, same, INTERESTING_MIMES, PASSWORD_MANAGER_HINT_MIME,
 };

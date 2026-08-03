@@ -201,6 +201,41 @@ systemd user unit, `.desktop`, metainfo, icons, `just install`, and a README —
 > COSMIC session and no running systemd user manager, so the unit is verified only as far as
 > `systemd-analyze verify --user` accepting it.
 
+### M7 — pasting for you
+
+`Paste(id)`: the entry on the clipboard *and* in the document, rather than the entry on the
+clipboard and the user pressing the key themselves.
+
+- [x] `clippo-core::chord` reads a `Ctrl+Shift+V` written any way a person writes it, and
+      rejects one it cannot press by naming the part it could not read. The keycodes are the
+      kernel's, and they live here rather than in `clippo-wayland` so that the config loader
+      can hold `paste_shortcut` to the same rule as every other key.
+- [x] `paste_shortcut` config key, defaulting to `Ctrl+V`. One setting for every application,
+      because nothing can tell which application is about to be pasted into; terminals mostly
+      want `Ctrl+Shift+V`.
+- [x] `clippo-wayland::keys` binds `zwp_virtual_keyboard_v1` on its own connection, uploads a
+      compiled `us` keymap, and presses a chord. The keymap is clippo's rather than the
+      user's, which is what makes `Ctrl+V` mean `Ctrl+V` on any physical layout.
+- [x] `Keystrokes` is a trait, like `Clipboard`, so `clippod`'s `Paste` is tested against a
+      recording double rather than against the developer's own desktop.
+- [x] `Paste(id) -> bool` on `com.nilfactor.Clippo`: copy, wait for focus to leave the picker,
+      press. It fails only where `Copy` fails — a keystroke that was not sent comes back as
+      `false`, not as an error, because the entry is on the clipboard either way and the user
+      can finish by hand. `clippo paste` uses the answer rather than claiming a paste it did
+      not make.
+- [x] `auto_paste`, on by default, turns the pressing off for every caller — a switch on
+      whether clippo may synthesise input at all, not on what `Enter` does. With it off the
+      virtual keyboard is never created, so the capability is absent rather than merely
+      unused.
+- [x] `Enter` and a row click in the applet send `Paste` rather than `Copy`, and `clippo paste
+      ID` is the same member from a terminal.
+- [x] A compositor with no virtual-keyboard protocol starts normally and says so once, at
+      startup. `Paste` there is `Copy`.
+
+> **Gate:** [verification 7](#7-pasting) below. Manual, and it cannot be otherwise: what is
+> being checked is that another application received a keystroke, which needs a compositor, a
+> focused window and a person to look at it.
+
 ## Verification
 
 **Build and run on the host, not inside RustRover's Flatpak.** This is the single most
@@ -339,6 +374,40 @@ running systemd user manager as well, which a container does not have either —
 checked of the unit here is that `systemd-analyze verify --user` accepts it with its
 `ExecStart` pointing at a real binary, and that `just install` / `just uninstall` place and
 remove it correctly against a scratch `$HOME`.
+
+### 7. Pasting
+
+The M7 gate. Every box needs a second application to paste *into*, which is what makes all of
+this manual: the thing being checked is that a program clippo has no connection to received a
+keystroke.
+
+- [ ] `journalctl --user -u clippod -b | grep 'paste shortcut'` says clippo **can** press it.
+      If it says it cannot, this compositor has no `zwp_virtual_keyboard_v1` and every box
+      below degrades to `Copy` — which is the documented behaviour, not a failure.
+- [ ] Open `cosmic-edit`, click into the text area, `Super+V`, choose a row, `Enter` → the
+      value appears **in the document**, and the picker is gone. This is the whole feature.
+- [ ] The same again with the mouse: clicking a row does what `Enter` does.
+- [ ] `clippo paste <id>` from a terminal, with the terminal focused, pastes into the terminal
+      — with `paste_shortcut = "Ctrl+Shift+V"` set, since the default `Ctrl+V` is not a paste
+      in most terminals. This is the case the config key exists for.
+- [ ] A masked entry pastes its **real value**, not `ab••••••••yz`. Same severity as the M4
+      box that says so for `Copy`: a mask reaching another application is the worst bug this
+      feature can have, and here it arrives without the user seeing it first.
+- [ ] With a deliberately wrong shortcut for the focused application, the entry is still on
+      the clipboard afterwards and `Ctrl+V` by hand still pastes it. `Paste` must never be
+      worse than `Copy`.
+- [ ] `paste_shortcut = "Ctrl+F13"` in the config → `clippod` refuses to start and the journal
+      names `F13`, rather than starting and pasting nothing.
+- [ ] `auto_paste = false`, restart, `Enter` on a row → the entry is on the clipboard and
+      **nothing is typed**. `clippo paste <id>` says it pressed nothing, and the journal says
+      `auto_paste is off`. `Ctrl+V` by hand still pastes the entry.
+- [ ] No modifier is left held down afterwards: type into the pasted-into window and confirm
+      ordinary characters arrive, not shortcuts. A synthesised chord that released its key but
+      not its `Ctrl` would leave the desktop unusable until something else pressed it.
+
+The last one is the one worth being deliberate about. It is the failure with consequences
+beyond clippo, and the release half of the chord is the part no automated test here can
+observe.
 
 ### 7. Automated
 

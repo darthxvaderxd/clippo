@@ -72,6 +72,13 @@ impl Client {
             .map_err(|error| CliError::from_call("Copy", error))
     }
 
+    /// `Paste(id)`, answering whether the shortcut was actually pressed.
+    pub fn paste(&self, id: i64) -> Result<bool, CliError> {
+        self.proxy
+            .paste(id)
+            .map_err(|error| CliError::from_call("Paste", error))
+    }
+
     /// `Delete(id)`.
     pub fn delete(&self, id: i64) -> Result<(), CliError> {
         self.proxy

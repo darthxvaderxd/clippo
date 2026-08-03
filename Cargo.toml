@@ -72,6 +72,14 @@ nucleo-matcher = "0.3"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# `zwp_virtual_keyboard_v1`, which lives in neither of the two above: it is a
+# "misc" protocol rather than a staging or wlr one. `Paste` synthesises the
+# user's paste shortcut through it — see `clippo-wayland::keys`.
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+# Compiling the keymap that virtual keyboard has to be given before it will
+# accept a keystroke. Links the system libxkbcommon, which any Wayland session
+# already has because the compositor is using it.
+xkbcommon = "0.8"
 calloop = "0.14"
 calloop-wayland-source = "0.4"
 rustix = { version = "1", features = ["pipe", "fs"] }

@@ -149,6 +149,22 @@ works, and if clippod stops, the clipboard empties. Paste before you stop it.")]
         id: String,
     },
 
+    /// Put an entry on the clipboard and paste it where the cursor is.
+    #[command(
+        long_about = "Put an entry on the clipboard and paste it where the cursor is.
+
+Copy, then press your paste shortcut into whatever window has keyboard focus. Which window that is depends entirely on what is focused a moment after you run this, so from a terminal it is usually the terminal itself.
+
+The shortcut pressed is `paste_shortcut` in clippo's config, `Ctrl+V` by default. Applications disagree about it — most terminals paste on `Ctrl+Shift+V` — and there is one setting for all of them.
+
+The copy always happens. If clippo cannot press the key, for a compositor without the protocol or a shortcut it cannot press, the entry is still on the clipboard and this still succeeds; the reason is in clippod's journal."
+    )]
+    Paste {
+        /// The entry's ID, in full or as an unambiguous prefix.
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+
     /// Pin an entry, exempting it from retention and from `clear`.
     Pin {
         /// The entry's ID, in full or as an unambiguous prefix.

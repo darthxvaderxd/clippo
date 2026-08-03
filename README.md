@@ -6,14 +6,15 @@ rest, and a suspected password or token is never rendered in full in the UI, whi
 pasting the real value.
 
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, components, and the decisions on record.
-- [docs/ROADMAP.md](docs/ROADMAP.md) — build order (M0–M6) and how each stage is verified.
+- [docs/ROADMAP.md](docs/ROADMAP.md) — build order (M0–M7) and how each stage is verified.
 
-> **Status:** M6 complete — all milestones are in. `clippod` records every copy and serves
+> **Status:** M7 complete — all milestones are in. `clippod` records every copy and serves
 > `com.nilfactor.Clippo` on the session bus, `clippo copy <id>` puts an entry back on the
 > clipboard for any application to paste, a suspected password or token shows as
 > `ab••••••••yz` rather than in full — see [Secrets](#secrets) — [the applet](#the-applet) is
-> a keyboard-driven picker in the COSMIC panel, and [`just install`](#installing) puts the
-> lot in place with a systemd user unit. What is left is the manual verification that needs a
+> a keyboard-driven picker in the COSMIC panel that [pastes straight into whatever you were
+> working in](#pasting-for-you), and [`just install`](#installing) puts the lot in place with a
+> systemd user unit. What is left is the manual verification that needs a
 > real COSMIC session; the roadmap says which boxes those are.
 
 ## ⚠️ Build and run from a host terminal, not RustRover's Flatpak
@@ -231,6 +232,7 @@ cargo run -p clippo-cli -- list      # or `just run-cli list`, or the built ./ta
 | `clippo list [-n N] [--offset N] [--json]` | The history, most recently used first. Defaults to 20 entries; `-n 0` is all of them. |
 | `clippo search QUERY [-n N] [--json]` | Fuzzy-match the previews, best match first. |
 | `clippo copy ID` | Put that entry back on the clipboard, and move it to the front of the history. Needs `clippod` to stay running — see above. |
+| `clippo paste ID` | The same, and then press your paste shortcut into whatever window has keyboard focus. From a terminal that is usually the terminal itself. Says so when it pressed nothing. See [Pasting for you](#pasting-for-you). |
 | `clippo pin ID` / `clippo pin ID --off` | Pin or unpin. A pinned entry is exempt from retention and from `clear`. |
 | `clippo rm ID...` | Delete entries, pinned or not. |
 | `clippo clear [--yes] [--include-pinned]` | Delete the whole history. Asks first. |
@@ -341,7 +343,7 @@ start typing immediately, and nothing below needs the mouse.
 |---|---|
 | *(type)* | Filter. This is the daemon's `Search`, so the applet and `clippo search` rank a query identically. |
 | `↑` / `↓` | Move the highlight. It stops at the ends rather than wrapping. |
-| `Enter` | Copy the highlighted entry and close. The picker gets out of the way because you are about to paste. |
+| `Enter` | Paste the highlighted entry into whatever you were last working in, and close. It is copied first and always, so it is on the clipboard either way — see [Pasting for you](#pasting-for-you). |
 | `Delete` | Remove the highlighted entry. No confirmation — this is one row of a rolling history, and `clippo clear` is the destructive one. |
 | `Ctrl+P` | Pin or unpin. A pinned entry is exempt from retention and from `clear`. |
 | `Ctrl+R` | Show the highlighted entry's stored value in place, up to a bound. This is how a masked row is read — see below. |
@@ -436,6 +438,64 @@ Two things worth knowing about this path:
 - The picker opens **in the middle of the screen** rather than under the panel icon. A layer
   surface is positioned against the whole output rather than against the applet that opened it,
   so it goes where COSMIC's other keyboard-opened surfaces go.
+
+### Pasting for you
+
+Pressing `Enter` on a row does not only copy it. `clippod` puts the entry on the clipboard and
+then presses your paste shortcut into whatever window had focus before the picker opened, so
+the value lands where your cursor was. `clippo paste ID` does the same thing from a terminal.
+
+Wayland gives no client a way to write into another application's window — deliberately — so
+this works by synthesising the keystroke you would have pressed, through
+`zwp_virtual_keyboard_v1`. `cosmic-comp` supports it. A compositor that does not is not a
+problem: `Paste` still copies, and you paste by hand exactly as before — and if you would
+rather it never did this, `auto_paste = false` below turns it off. `clippod` says which you
+have at startup:
+
+```
+$ journalctl --user -u clippod -b | grep 'paste shortcut'
+clippo can press the paste shortcut for you
+```
+
+**The shortcut it presses is one setting for every application**, and applications disagree
+about it. The default is `Ctrl+V`, which is right nearly everywhere and wrong in most
+terminals — `cosmic-term`, like most, pastes on `Ctrl+Shift+V`. Set whichever you paste into
+most often:
+
+```toml
+# ~/.config/clippo/config.toml
+paste_shortcut = "Ctrl+Shift+V"
+```
+
+**To turn the pressing off entirely**, leaving `Enter` to copy and nothing else:
+
+```toml
+# ~/.config/clippo/config.toml
+auto_paste = false
+```
+
+That is a switch on whether clippo may synthesise input at all, not a preference about the
+picker, so `clippo paste` stops pressing too — a setting that said "never type into my
+windows" and then had an exception that types into your windows would not be one. With it off,
+`clippod` does not even create the virtual keyboard, so there is nothing left to press with.
+Everything else is unchanged: `Enter` still copies, and your own paste key still works.
+
+Modifiers are `Ctrl`, `Shift`, `Alt` and `Super`, in any order and any casing, and the key is
+a letter, a digit or `Insert`. A shortcut clippo cannot press stops the daemon at startup and
+names the part it could not read, rather than leaving you with a `Paste` that quietly does
+nothing. Like every other key, it is read once — `systemctl --user restart clippod` after
+editing.
+
+Two limits worth knowing, both of which follow from how Wayland works rather than from clippo:
+
+- **It goes to whatever has focus, which nothing can address or predict.** The picker closes
+  first and the daemon waits a moment before pressing, but there is no event anywhere that
+  says "focus has finished returning" — so if you click into a different window in that
+  moment, that is where it pastes.
+- **The copy always happens.** If the shortcut is wrong for the application you are pasting
+  into, nothing is lost: the entry is on the clipboard, and the application's own paste key
+  still works. That is also why a keystroke clippo could not send is not reported as a failed
+  `Paste` — the half that matters succeeded. The reason goes to `clippod`'s journal.
 
 ## Secrets
 

@@ -5,6 +5,8 @@
 //!   `clippo-store` maps them rather than translating them.
 //! - [`config`] — every knob DESIGN.md names, its documented default, and the
 //!   TOML file it can be overridden from.
+//! - [`chord`] — a key combination, for the one knob whose value is one: the
+//!   shortcut `Paste` synthesises to make the focused application paste.
 //! - [`paths`] — the one place that knows where clippo's config file and
 //!   database live, so no other crate hardcodes either.
 //! - [`secrets`] — detection and masking, the differentiating feature: three
@@ -21,12 +23,14 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+pub mod chord;
 pub mod config;
 pub mod display;
 pub mod entry;
 pub mod paths;
 pub mod secrets;
 
+pub use chord::{Chord, ParseChordError};
 pub use config::{Config, ConfigError, SecretsConfig};
 pub use display::{is_invisible_or_reordering, one_line};
 pub use entry::{Entry, EntryId, EntryKind, Flavor, NewEntry, ParseEntryKindError, Timestamp};

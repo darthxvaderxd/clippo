@@ -127,6 +127,12 @@ selection atomically and re-offer all of them from a long-lived process.
   compute it.*
 - Runs on its own thread, talking to the daemon over `tokio::sync::mpsc`.
 - Primary selection: config-gated, **off** by default.
+- **Press** (M7) — a `zwp_virtual_keyboard_v1` keyboard, on its own connection, used by `Paste`
+  to synthesise the user's paste shortcut into whatever holds keyboard focus. Wayland gives a
+  client no way to put text into another application's surface, so this is the only route from
+  "on the clipboard" to "in the document", and it is a privileged protocol for the obvious
+  reason. It uploads its own `us` keymap, which is what makes `Ctrl+V` mean `Ctrl+V` whatever
+  the user types on. Optional: a compositor without it leaves `Paste` equal to `Copy`.
 
 ### `clippo-store` — encrypted at rest
 
@@ -189,6 +195,7 @@ are the actual risk.
   | `List` | `(limit, offset) -> Vec<EntrySummary>` — previews already masked |
   | `Search` | `(query, limit) -> Vec<EntrySummary>` |
   | `Copy` / `Delete` | `(id)` |
+  | `Paste` | `(id) -> bool` — `Copy`, then the user's `paste_shortcut` synthesised into whatever has focus; the answer is whether a key was pressed (M7) |
   | `Pin` | `(id, bool)` |
   | `Clear` | `(include_pinned)` |
   | `Reveal` | `(id) -> String` |
@@ -202,7 +209,7 @@ are the actual risk.
 ### `clippo-cli`
 
 A thin `zbus` client over the same interface:
-`clippo list|search|copy|pin|rm|clear|pause|reveal`, plus `clippo show` from M5, which is
+`clippo list|search|copy|paste|pin|rm|clear|pause|reveal`, plus `clippo show` from M5, which is
 the only one that calls the applet rather than the daemon.
 
 Ship it before the GUI — it makes every layer below testable without touching a UI.
@@ -232,6 +239,9 @@ Ship it before the GUI — it makes every layer below testable without touching 
 | **Applet popup may not be programmatically openable** in libcosmic | Design M5 so swapping to a standalone picker window is cheap. *Materialised, in the keyboard-focus form:* the popup opened but took no keys. The mitigation paid — see the decisions section. |
 | **Self-echo loop** — a wrong hash guard re-enters every copy-back into history | Integration test at M3. |
 | **Secret heuristics will need iteration** | Config escape hatch to disable the entropy rule while keeping the regex and MIME rules. |
+| **Synthesised paste goes to whichever window has focus**, which nothing can address or predict | The applet closes the picker first and the daemon waits before pressing. Racy by construction — there is no event for "focus has settled" — so the wait is a constant, and being early means pasting into the picker. |
+| **Synthesising input is a capability not everyone wants clippo to have** | `auto_paste`, on by default, off in one line. Off means the virtual keyboard is never created at all, so it is not a check that a later bug can skip. `Paste` is then exactly `Copy`. |
+| **One `paste_shortcut` for every application**, and applications disagree | Config key, defaulting to `Ctrl+V`. Terminals mostly want `Ctrl+Shift+V`. `Paste` copies first regardless, so a wrong shortcut degrades to a manual paste rather than to nothing. |
 | **Daemon owns the selection** — if `clippod` dies, the clipboard empties | Expected Wayland behavior. `Restart=on-failure` mitigates; document in the README. |
 | **SQLCipher vendored build** adds noticeable first-compile cost | Accepted. The alternative — hand-rolled per-blob crypto — is worse. |
 
@@ -302,3 +312,45 @@ Choices made during planning that a future reader might otherwise re-litigate:
   own rather than through `Store::get`, which returns *every* flavor: going through `get` would
   avoid the full-size decode and still read and decrypt the full-size PNG in order to hand back
   the small one beside it, which is the cost the derived thumbnail exists to remove.
+- **`Paste(id)` added to the daemon's interface** (M7). `Copy` puts an entry on the clipboard,
+  which is only ever half of what a user picking a row wanted: the other half is it appearing
+  where their cursor is, and they were doing that half themselves. Wayland offers a client no
+  way to write into another application's surface, by design, so the only route is to
+  synthesise the keystroke they would have pressed — `zwp_virtual_keyboard_v1`, which
+  `cosmic-comp` advertises and honours.
+
+  It is a daemon member and not an applet capability because it could not be an applet one:
+  `cosmic-panel`'s embedded compositor does not advertise the virtual-keyboard global to the
+  applets it hosts, so the applet cannot bind it at all. `clippod` already holds a direct
+  connection to `cosmic-comp` for data-control, which is where the keyboard goes too.
+
+  Three things were settled by trying them on a real session rather than by reading:
+
+  - **Announcing the modifier is not enough.** `zwp_virtual_keyboard_v1` has a `modifiers`
+    request, and sending only that produces an unmodified `v`: the compositor recomputes
+    modifier state from the keys it believes are held, so the announcement is overwritten by
+    the very next keypress. The modifier has to be pressed as a key. Both are sent.
+  - **The keymap is clippo's, not the user's.** The compositor reads our keycodes against the
+    keymap we upload, so a compiled `us` layout makes `Ctrl+V` arrive as `Ctrl+V` on any
+    physical layout. Uploading nothing is not an option — the protocol refuses keys without a
+    keymap.
+  - **Focus cannot be addressed or waited for.** The keystroke lands wherever focus is, and
+    the picker is still on screen when `Paste` arrives, because the applet cannot send the
+    request after destroying the surface it would be sending from. So the applet closes and
+    the daemon waits a fixed 120 ms before pressing. There is no event on this side of the bus
+    that says focus has returned; `clippod` has no surface and sees none of it.
+
+  `Paste` fails only where `Copy` fails. A keystroke that was not sent — `auto_paste` off, no
+  protocol, no seat, a compositor that took it away mid-run — comes back as `Paste`'s `bool`
+  rather than as an error, because the entry really is on the clipboard and the user can finish
+  by hand. Reporting an error would have a frontend say the whole thing failed when the half
+  that matters succeeded. The `bool` is what lets `clippo paste` say which of the two happened
+  instead of claiming a paste it did not make; the applet ignores it, having closed already and
+  having nowhere to report it.
+
+  **`auto_paste` is a capability switch, not a preference**, which is why it is one setting for
+  every caller rather than "what `Enter` does". A user turning it off is saying clippo must not
+  type into their windows, and `clippo paste` continuing to do so would make that false. With it
+  off `clippod` never creates the virtual keyboard at all — the means, not just the intent, is
+  absent, so no later change to `Paste` can press a key by accident. The knob is checked *after*
+  the copy for the same reason: turning it off must change exactly one thing.

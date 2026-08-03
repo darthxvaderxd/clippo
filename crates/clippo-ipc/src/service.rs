@@ -43,6 +43,30 @@ pub trait ClippoBackend: Send + Sync + 'static {
     /// hash.
     async fn copy(&self, id: i64) -> fdo::Result<()>;
 
+    /// [`copy`][Self::copy], and then press the user's paste shortcut into
+    /// whatever has keyboard focus. Answers whether the key was pressed.
+    ///
+    /// The copy half must happen first and must still happen when the second
+    /// half cannot: a compositor that will not synthesise keys still leaves the
+    /// entry on the clipboard for the user to paste by hand, which is strictly
+    /// what `Copy` would have given them. So this fails only for the reasons
+    /// `Copy` fails, and a keystroke that was not sent comes back as `false`
+    /// rather than as an error.
+    ///
+    /// `false` has three causes and a caller cannot tell them apart, because
+    /// none of them changes what it should do: the user turned `auto_paste`
+    /// off, the compositor offers no way to synthesise keys, or the attempt
+    /// failed. The reason is in the daemon's journal. What `false` means to a
+    /// frontend is the same in every case — the entry is on the clipboard and
+    /// the user has not had it pasted for them.
+    ///
+    /// **Which window receives it is not knowable here.** Whatever has focus
+    /// when the keystroke lands gets it, so a caller with a surface of its own
+    /// on screen — the applet's picker — has to close it first, and even then
+    /// is racing the compositor's focus handling. The daemon waits before
+    /// pressing for exactly that reason.
+    async fn paste(&self, id: i64) -> fdo::Result<bool>;
+
     /// Remove one entry, pinned or not.
     async fn delete(&self, id: i64) -> fdo::Result<()>;
 
@@ -113,6 +137,11 @@ impl ClippoInterface {
     /// `Copy(id)`.
     async fn copy(&self, id: i64) -> fdo::Result<()> {
         self.backend.copy(id).await
+    }
+
+    /// `Paste(id) -> bool`.
+    async fn paste(&self, id: i64) -> fdo::Result<bool> {
+        self.backend.paste(id).await
     }
 
     /// `Delete(id)`.
