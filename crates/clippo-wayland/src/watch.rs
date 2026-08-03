@@ -22,6 +22,7 @@ use calloop::generic::{Generic, NoIoDrop};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken};
 use calloop_wayland_source::WaylandSource;
+use clippo_core::display::one_line;
 use rustix::io::Errno;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -47,6 +48,40 @@ const READ_CHUNK: usize = 64 * 1024;
 /// loop — so a full channel means the loop is not turning at all, which is a
 /// failure worth reporting rather than blocking a D-Bus method on.
 const COMMAND_QUEUE: usize = 16;
+
+/// How much of a MIME type reaches the journal, and in what form.
+///
+/// Every MIME string in a `warn!` below is one a client chose: a type it
+/// advertised, or one it asked to paste. That makes it the same hostile input a
+/// preview is — a copied `ESC [ 2 J` or `U+202E` acts on whoever reads the log
+/// just as it acts on whoever reads a list — and [`one_line`] is the escaping
+/// the previews already get, rather than a second one written here. The width
+/// is generous next to the ~25 characters of the longest type clippo wants.
+const MIME_LOG_CHARS: usize = 128;
+
+/// A MIME type as it goes into the journal.
+///
+/// One call, so that every `warn!` carrying a client's string renders it the
+/// same way and a test can pin what they render. The escaping itself is
+/// [`one_line`]'s — `clippo_core::display`'s, shared with the previews — and
+/// not a second implementation of it.
+fn for_log(mime: &str) -> String {
+    one_line(mime, MIME_LOG_CHARS)
+}
+
+/// How many MIME types one offer may advertise before clippo stops recording
+/// them.
+///
+/// The list is kept for the life of the offer and travels to the daemon as
+/// `Selection::advertised`, so its size is a per-selection allocation a client
+/// picks. Only the seven of [`mime::INTERESTING_MIMES`] are ever read from a
+/// pipe, but the rest are worth reporting — "clippo kept none of it, and here
+/// is what was on offer" is what makes a missed capture diagnosable. Real
+/// sources advertise dozens (a rich-text editor offering every flavor of a
+/// copied selection lands in the tens), so a ceiling of 256 sits an order of
+/// magnitude above the busiest honest source while bounding the list at a few
+/// kilobytes rather than at whatever a hostile one cares to send.
+const MAX_ADVERTISED_MIMES: usize = 256;
 
 /// A running watcher thread.
 ///
@@ -319,7 +354,47 @@ pub(crate) struct WatchState {
 
 struct OfferState {
     offer: Offer,
+    mimes: AdvertisedMimes,
+}
+
+/// What one offer advertised, up to [`MAX_ADVERTISED_MIMES`] of it.
+///
+/// Its own type rather than a bare `Vec` so the ceiling is applied in one place
+/// and can be tested without a compositor — an [`Offer`] cannot be built
+/// without one.
+#[derive(Default)]
+struct AdvertisedMimes {
     mimes: Vec<String>,
+    /// Whether the ceiling has been reached, so it is reported once per offer
+    /// rather than once per type discarded past it.
+    overflowed: bool,
+}
+
+impl AdvertisedMimes {
+    /// Remember one advertised MIME type, or discard it if the list is full.
+    ///
+    /// Discarding costs nothing a caller can see: what clippo reads is decided
+    /// by [`mime::is_interesting`], and no honest source puts an interesting
+    /// type past the ceiling of a list it began with hundreds of private ones.
+    fn push(&mut self, mime: String) {
+        if self.mimes.len() < MAX_ADVERTISED_MIMES {
+            self.mimes.push(mime);
+            return;
+        }
+        // Once per offer: the number of types past the ceiling is the client's
+        // to choose, and the journal is a shared resource.
+        if !std::mem::replace(&mut self.overflowed, true) {
+            warn!(
+                ceiling = MAX_ADVERTISED_MIMES,
+                first_ignored = %for_log(&mime),
+                "an offer advertised more MIME types than clippo records; ignoring the rest"
+            );
+        }
+    }
+
+    fn into_vec(self) -> Vec<String> {
+        self.mimes
+    }
 }
 
 /// The clipboard as clippo currently owns it.
@@ -356,7 +431,7 @@ impl DataControlSink for WatchState {
             offer.id(),
             OfferState {
                 offer,
-                mimes: Vec::new(),
+                mimes: AdvertisedMimes::default(),
             },
         );
     }
@@ -426,7 +501,10 @@ impl DataControlSink for WatchState {
         let Some(blob) = offer::blob_for(&offered.flavors, &mime) else {
             // Only reachable if an application asks for something we never
             // advertised, which the compositor should not forward.
-            warn!(%mime, "refusing a paste of a flavor clippo did not offer");
+            warn!(
+                mime = %for_log(&mime),
+                "refusing a paste of a flavor clippo did not offer"
+            );
             return;
         };
         self.begin_write(mime, blob, fd);
@@ -482,7 +560,11 @@ impl WatchState {
                     read_tokens.insert(slot, token);
                 }
                 Err(reason) => {
-                    warn!(%mime, %reason, "could not start a flavor read");
+                    warn!(
+                        mime = %for_log(&mime),
+                        %reason,
+                        "could not start a flavor read"
+                    );
                     selection.drop_flavor(slot, DropReason::Setup(reason));
                 }
             }
@@ -624,7 +706,11 @@ impl WatchState {
 
         let selection = pending.selection.into_selection();
         for dropped in &selection.dropped {
-            warn!(mime = %dropped.mime, reason = %dropped.reason, "dropped a flavor");
+            warn!(
+                mime = %for_log(&dropped.mime),
+                reason = %dropped.reason,
+                "dropped a flavor"
+            );
         }
         trace!(
             kind = ?selection.kind,
@@ -683,7 +769,7 @@ impl WatchState {
         let mut kept = Vec::new();
         for (id, state) in std::mem::take(&mut self.offers) {
             if Some(&id) == keep {
-                kept = state.mimes;
+                kept = state.mimes.into_vec();
             } else {
                 state.offer.destroy();
             }
@@ -969,12 +1055,45 @@ fn read_flavor(
 
 /// The advertised flavors clippo wants, in the order the source offered them,
 /// with repeats removed.
+///
+/// "Repeat" is [`mime::same`]'s question rather than string equality's, and the
+/// difference is the whole bound on this function. [`mime::is_interesting`]
+/// normalises before it compares, so `text/plain`, `"text/plain "` and
+/// `"te xt/plain"` are all interesting; whitespace may be inserted anywhere any
+/// number of times, so an exact-match dedup let one source turn a single flavor
+/// into as many entries as it cared to advertise — and every entry costs a pipe,
+/// a loop registration and a `FlavorBuffer` with the *full* per-flavor cap.
+/// `same` is the comparison the paste path already asks ([`offer::blob_for`]),
+/// and asking it here collapses those spellings to one entry.
+///
+/// That also takes the inner scan with it: `wanted` is bounded, so this is
+/// linear in what was advertised rather than quadratic in it.
 fn interesting_flavors(advertised: &[String]) -> Vec<String> {
     let mut wanted: Vec<String> = Vec::new();
+    let mut refused = 0_usize;
     for mime in advertised {
-        if mime::is_interesting(mime) && !wanted.iter().any(|seen| seen == mime) {
-            wanted.push(mime.clone());
+        if !mime::is_interesting(mime) || wanted.iter().any(|seen| mime::same(seen, mime)) {
+            continue;
         }
+        // Belt and braces. With `same` above this is unreachable — an
+        // interesting type normalises to one of `INTERESTING_MIMES`, so a
+        // full `wanted` already holds a match for it — but that bound is a
+        // property of a list someone may extend, and this one is arithmetic.
+        if wanted.len() == mime::INTERESTING_MIMES.len() {
+            refused += 1;
+            continue;
+        }
+        wanted.push(mime.clone());
+    }
+    // One line per selection, not one per flavor: the whole point of the
+    // ceiling is that a source advertising thousands of them cannot turn the
+    // journal into the resource it exhausts instead.
+    if refused > 0 {
+        warn!(
+            refused,
+            kept = wanted.len(),
+            "a selection advertised more distinct interesting flavors than clippo reads"
+        );
     }
     wanted
 }
@@ -1013,5 +1132,136 @@ mod tests {
     fn an_offer_with_nothing_useful_yields_no_reads() {
         let advertised = ["TIMESTAMP", "MULTIPLE"].map(String::from);
         assert!(interesting_flavors(&advertised).is_empty());
+    }
+
+    /// Whitespace-permuted spellings of one type, all distinct as strings and
+    /// all accepted by `is_interesting`.
+    fn permutations(base: &str, count: usize) -> Vec<String> {
+        let positions = base.len() + 1;
+        (0..count)
+            .map(|n| {
+                let (head, tail) = base.split_at(n % positions);
+                let spaces = " ".repeat(n / positions + 1);
+                format!("{head}{spaces}{tail}")
+            })
+            .collect()
+    }
+
+    /// Walk what `start_reads` walks — one real pipe and one capped
+    /// [`FlavorBuffer`] per wanted flavor — and report how many pipes that took.
+    ///
+    /// The finding is about the number of pipes, loop registrations and buffers
+    /// one selection can force, so the count that matters is this one and not
+    /// `wanted.len()` on its own. There is no compositor here, so the source
+    /// side of each pipe is written by the test; everything after `expect_flavor`
+    /// is the code `read_flavor` runs.
+    fn read_a_selection(advertised: &[String]) -> (usize, crate::Selection) {
+        let wanted = interesting_flavors(advertised);
+        let mut selection = PendingSelection::new(1, SelectionKind::Clipboard, advertised.to_vec());
+        let mut pipes: Vec<OwnedFd> = Vec::new();
+
+        for mime in &wanted {
+            let (read_fd, write_fd) = rustix::pipe::pipe().expect("a pipe");
+            let slot = selection.expect_flavor(mime.clone(), 1024);
+            rustix::io::write(write_fd.as_fd(), b"payload").expect("a write");
+            drop(write_fd);
+
+            let mut chunk = [0u8; 64];
+            loop {
+                match rustix::io::read(read_fd.as_fd(), &mut chunk) {
+                    Ok(0) => {
+                        selection.finish(slot);
+                        break;
+                    }
+                    Ok(bytes) => {
+                        selection.push(slot, &chunk[..bytes]);
+                    }
+                    Err(Errno::INTR) => {}
+                    Err(error) => panic!("reading a flavor: {error}"),
+                }
+            }
+            // Held open to the end, so `pipes.len()` is what the descriptor
+            // table saw at once rather than a count of reuses.
+            pipes.push(read_fd);
+        }
+
+        (pipes.len(), selection.into_selection())
+    }
+
+    #[test]
+    fn the_spellings_of_one_flavor_collapse_to_one_read() {
+        let advertised = [
+            "text/plain",
+            "text/plain ",
+            " text/plain",
+            "te xt/plain",
+            "TEXT/plain",
+            "text/pl a in",
+        ]
+        .map(String::from);
+        // `is_interesting` accepts all six; the dedup has to agree with it.
+        assert!(advertised.iter().all(|mime| mime::is_interesting(mime)));
+        assert_eq!(interesting_flavors(&advertised), ["text/plain"]);
+    }
+
+    #[test]
+    fn thousands_of_permutations_open_no_more_pipes_than_there_are_flavors() {
+        let mut advertised = permutations("text/plain", 3000);
+        advertised.extend(permutations("image/png", 3000));
+        advertised.extend(permutations("TIMESTAMP", 3000));
+        assert_eq!(advertised.len(), 9000);
+
+        let wanted = interesting_flavors(&advertised);
+        assert!(
+            wanted.len() <= mime::INTERESTING_MIMES.len(),
+            "wanted {wanted:?}"
+        );
+
+        // The assertion the finding is actually about: 9 000 advertised types
+        // buy the source two pipes, two registrations and two capped buffers.
+        let (pipes, selection) = read_a_selection(&advertised);
+        assert_eq!(pipes, 2);
+        assert_eq!(selection.flavors.len(), 2);
+        assert!(selection.dropped.is_empty());
+    }
+
+    #[test]
+    fn an_offer_cannot_advertise_past_the_ceiling() {
+        let mut advertised = AdvertisedMimes::default();
+        for n in 0..MAX_ADVERTISED_MIMES {
+            advertised.push(format!("application/x-private-{n}"));
+        }
+        assert!(!advertised.overflowed);
+
+        for n in MAX_ADVERTISED_MIMES..MAX_ADVERTISED_MIMES + 5000 {
+            advertised.push(format!("application/x-private-{n}"));
+        }
+        assert!(advertised.overflowed, "the ceiling should have been hit");
+
+        let kept = advertised.into_vec();
+        assert_eq!(kept.len(), MAX_ADVERTISED_MIMES);
+        assert_eq!(kept[0], "application/x-private-0");
+        assert_eq!(
+            kept[MAX_ADVERTISED_MIMES - 1],
+            format!("application/x-private-{}", MAX_ADVERTISED_MIMES - 1)
+        );
+    }
+
+    #[test]
+    fn a_mime_type_reaches_the_journal_escaped() {
+        let hostile = "text/plain\u{1b}[2J\u{202e}nialp/txet\u{200b}";
+        let logged = for_log(hostile);
+        assert!(
+            !logged
+                .chars()
+                .any(|c| c.is_control() || clippo_core::display::is_invisible_or_reordering(c)),
+            "{logged}"
+        );
+        assert!(logged.contains("\\u{1b}"), "{logged}");
+        assert!(logged.contains("\\u{202e}"), "{logged}");
+        assert!(logged.contains("\\u{200b}"), "{logged}");
+        // Bounded too: the length is the client's to choose, the journal's is
+        // not.
+        assert!(for_log(&"x".repeat(10_000)).chars().count() <= MIME_LOG_CHARS);
     }
 }
