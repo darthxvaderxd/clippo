@@ -212,10 +212,16 @@ install: build-release
     echo
     echo "Next:"
     echo "  systemctl --user enable --now clippod    # start it, and on every login"
+    echo "  just add-to-panel                        # put the icon in the panel"
     echo "  journalctl --user -u clippod -f          # watch it"
     echo
-    echo "Then add clippo to the panel: Settings -> Desktop -> Panel ->"
-    echo "Configure panel applets. Run this from a host terminal, not a Flatpak;"
+    echo "Neither of the first two happens on its own: starting a daemon that owns"
+    echo "your clipboard, and rearranging your panel, are not things to do to"
+    echo "somebody as a side effect of copying files. \`add-to-panel\` puts clippo at"
+    echo "the front of the right wing; Settings -> Desktop -> Panel -> Configure"
+    echo "panel applets is the same job by hand, and moves it afterwards."
+    echo
+    echo "Run all of this from a host terminal, not a Flatpak;"
     echo "\$WAYLAND_DISPLAY must be wayland-0. See the README."
 
 # Leaves the clipboard history and the keyring entry alone — `just purge-data`
@@ -335,3 +341,189 @@ purge-data:
     echo "or with:"
     echo "  secret-tool clear xdg:schema com.nilfactor.Clippo.DatabaseKey \\"
     echo "                    application clippo purpose history-database-key"
+
+# ---------------------------------------------------------------------------
+# Panel placement
+# ---------------------------------------------------------------------------
+
+# The name cosmic-panel knows an applet by: its `.desktop`'s basename, without
+# the extension.
+_applet_id := "com.nilfactor.Clippo"
+
+# cosmic-panel's layout for the top panel — a RON `Some((left, right))` naming
+# the applets in each of the two wings, either side of the centre.
+#
+# Editing this file is the *only* way to say where clippo sits, because nothing
+# declarative can. cosmic-panel reads exactly three keys out of an applet's
+# `.desktop` — `X-CosmicShrinkable`, `X-CosmicHoverPopup` and
+# `X-NotificationsAppletClients` — and cosmic-settings reads one,
+# `X-CosmicApplet`, which is what makes clippo *offerable* and says nothing
+# about position. There is no key for a wing or an index, so `res/` cannot
+# carry a preferred placement however much we would like it to. Somebody has to
+# write this file, and these two recipes are that somebody.
+#
+# Which is also why this is its own recipe rather than part of `install`, for
+# the same reason `install` does not `systemctl enable` the daemon:
+# rearranging somebody's panel is not a thing to do to them as a side effect of
+# copying files. `install` suggests it; you run it.
+_wings := _xdg_config / "cosmic/com.system76.CosmicPanel.Panel/v1/plugins_wings"
+
+# `just remove-from-panel` takes it off again, leaving the rest of the panel be.
+
+# Put the clippo icon in the panel's right wing. Idempotent.
+add-to-panel: (_panel "add")
+
+# Take the clippo icon off the panel. Idempotent.
+remove-from-panel: (_panel "remove")
+
+_panel MODE:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    mode="{{ MODE }}"
+    id="{{ _applet_id }}"
+    wings="{{ _wings }}"
+
+    case "$mode" in add|remove) ;; *) echo "_panel: bad mode $mode" >&2; exit 2 ;; esac
+
+    # cosmic-config layers your file over a system default, so a missing or
+    # `None` user file means *the distro's layout*, not an empty panel. Reading
+    # that default in those cases is the whole of what stops `add-to-panel`
+    # from writing a panel with clippo on it and nothing else — which is to say
+    # from silently removing every other applet you have.
+    seed=""
+    IFS=: read -r -a data_dirs <<< "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    for d in "${data_dirs[@]}"; do
+        [ -n "$d" ] || continue
+        cand="$d/cosmic/com.system76.CosmicPanel.Panel/v1/plugins_wings"
+        if [ -r "$cand" ]; then seed="$cand"; break; fi
+    done
+
+    if [ -s "$wings" ] && [ "$(tr -d ' \t\r\n' < "$wings")" != "None" ]; then
+        src="$wings"
+    elif [ "$mode" = "remove" ]; then
+        # Nothing of your own to edit means nothing of yours has clippo in it.
+        # Materialising the default just to take an absent applet out of it
+        # would turn a no-op into a permanent override of a file you never had.
+        echo "no panel layout of your own — nothing to remove"
+        exit 0
+    elif [ -n "$seed" ]; then
+        src="$seed"
+        echo "no panel layout of your own yet — starting from $seed" >&2
+    else
+        echo "cannot find a panel layout to edit." >&2
+        echo "  yours:   $wings" >&2
+        echo "  default: <XDG_DATA_DIRS>/cosmic/com.system76.CosmicPanel.Panel/v1/plugins_wings" >&2
+        echo >&2
+        echo "Add clippo in Settings -> Desktop -> Panel -> Configure panel applets" >&2
+        echo "instead; that writes the file, after which this recipe can move it." >&2
+        exit 1
+    fi
+
+    # cosmic-settings holds this file in memory and writes the whole thing back
+    # when you touch anything on its Panel page, so an edit made underneath a
+    # running one lasts until the next click and no longer.
+    if pgrep -x cosmic-settings >/dev/null 2>&1; then
+        echo "warning: cosmic-settings is running. It will overwrite this edit with" >&2
+        echo "         its own copy if you change anything on its Panel page." >&2
+    fi
+
+    mkdir -p "$(dirname "$wings")"
+    tmp="$(mktemp "$(dirname "$wings")/.plugins_wings.XXXXXX")"
+    trap 'rm -f "$tmp"' EXIT
+
+    # Written to match cosmic-settings' own formatting byte for byte, trailing
+    # newline included — it does not write one — so that the compare below can
+    # tell "already in place" from "changed" without a diff that is only
+    # whitespace.
+    awk -v id="$id" -v mode="$mode" '
+        # An applet ID never contains a bracket, so the two bracketed runs in
+        # the file are exactly the two wings and can be found by position
+        # without parsing RON properly.
+        function ids(s, arr,   n, i, m, part, t) {
+            n = split(s, part, ",")
+            m = 0
+            for (i = 1; i <= n; i++) {
+                t = part[i]
+                gsub(/^[ \t\r\n"]+/, "", t)
+                gsub(/[ \t\r\n"]+$/, "", t)
+                if (t != "") arr[++m] = t
+            }
+            return m
+        }
+        function emit(arr, n,   i, out) {
+            out = "[\n"
+            for (i = 1; i <= n; i++) out = out "    \"" arr[i] "\",\n"
+            return out "]"
+        }
+        { doc = doc " " $0 }
+        END {
+            if (gsub(/\[/, "[", doc) != 2 || gsub(/\]/, "]", doc) != 2) {
+                print "plugins_wings is not the expected Some(([..], [..])) shape;" > "/dev/stderr"
+                print "refusing to guess at it. Edit it by hand." > "/dev/stderr"
+                exit 1
+            }
+            a = index(doc, "[")
+            b = a + index(substr(doc, a + 1), "]")
+            c = b + index(substr(doc, b + 1), "[")
+            d = c + index(substr(doc, c + 1), "]")
+            nl = ids(substr(doc, a + 1, b - a - 1), L)
+            nr = ids(substr(doc, c + 1, d - c - 1), R)
+
+            # Taken out of both wings first, so `add` after a placement made by
+            # hand moves the icon instead of giving you two of them.
+            ol = 0; for (i = 1; i <= nl; i++) if (L[i] != id) OL[++ol] = L[i]
+            orr = 0; for (i = 1; i <= nr; i++) if (R[i] != id) OR[++orr] = R[i]
+
+            if (mode == "add") {
+                # Front of the right wing: the inner edge of the right-hand
+                # group, next to the centre and ahead of the status applets,
+                # which is where a thing you open on purpose wants to be rather
+                # than lost among the indicators.
+                for (i = orr; i >= 1; i--) OR[i + 1] = OR[i]
+                OR[1] = id
+                orr++
+            }
+
+            printf "Some((%s, %s))", emit(OL, ol), emit(OR, orr)
+        }
+    ' "$src" > "$tmp"
+
+    if [ -e "$wings" ] && cmp -s "$tmp" "$wings"; then
+        rm -f "$tmp"; trap - EXIT
+        if [ "$mode" = "add" ]; then
+            echo "clippo is already at the front of the panel's right wing — nothing changed"
+        else
+            echo "clippo is not on the panel — nothing changed"
+        fi
+        exit 0
+    fi
+
+    # Match the mode of the file being replaced rather than imposing one: it is
+    # cosmic-settings' file, and whatever umask it was written under is not
+    # ours to have an opinion about. 644 only for one we are creating.
+    if [ -e "$wings" ]; then
+        chmod --reference="$wings" "$tmp"
+    else
+        chmod 644 "$tmp"
+    fi
+    mv -f "$tmp" "$wings"
+    trap - EXIT
+
+    echo
+    if [ "$mode" = "add" ]; then
+        echo "clippo added to the front of the panel's right wing."
+    else
+        echo "clippo removed from the panel."
+    fi
+    echo "  $wings"
+
+    if [ "$mode" = "add" ] && [ ! -x "{{ bindir }}/clippo-applet" ]; then
+        echo
+        echo "note: {{ bindir }}/clippo-applet is not there, so the panel will show a" >&2
+        echo "      gap until \`just install\` has run." >&2
+    fi
+
+    echo
+    echo "cosmic-panel watches that file and should redraw within a second or two."
+    echo "If it does not, \`pkill cosmic-panel\` — the session brings it straight back."

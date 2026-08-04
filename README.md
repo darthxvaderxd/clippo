@@ -35,6 +35,35 @@ The host needs a Rust toolchain (stable); RustRover's bundled one is for its own
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
+It also needs two system libraries — the **development** packages specifically. Having the
+runtime `.so` that any Wayland desktop already ships is not enough: the build scripts ask
+`pkg-config` for `xkbcommon.pc` and `wayland-client.pc`, and only the `-dev` package installs
+those. On top of that, SQLCipher and the OpenSSL it uses are compiled from source here
+(`rusqlite`'s `bundled-sqlcipher-vendored-openssl` feature — the encrypted store is not linked
+against whatever OpenSSL the distribution happens to have), which wants a C compiler, `make`
+and `perl`:
+
+```sh
+# Debian, Ubuntu, Pop!_OS
+sudo apt install build-essential pkg-config perl libxkbcommon-dev libwayland-dev
+
+# Fedora
+sudo dnf install gcc make pkgconf-pkg-config perl-core libxkbcommon-devel wayland-devel
+
+# Arch
+sudo pacman -S --needed base-devel libxkbcommon wayland
+```
+
+Missing `libxkbcommon-dev` is the one that actually catches people, and it is worth knowing
+what it looks like, because the failure is reported by a dependency's build script rather than
+by anything with clippo's name on it:
+
+```
+error: failed to run custom build command for `smithay-client-toolkit v0.20.0`
+  The system library `xkbcommon` required by crate `smithay-client-toolkit` was not found.
+  The file `xkbcommon.pc` needs to be installed [...]
+```
+
 Then, from the repo root:
 
 ```sh
@@ -52,8 +81,8 @@ somebody last looked. What is deliberately accepted, and why, is in
 loosened check.
 
 `just` itself is optional for development — every recipe there is a one-line `cargo`
-invocation you can run directly. `install` and `uninstall` are the two that do real work; see
-below.
+invocation you can run directly. `install`, `uninstall` and the two `*-panel` recipes are the
+ones that do real work; see below.
 
 ## Installing
 
@@ -64,14 +93,15 @@ then captures nothing.
 ```sh
 just install                              # 1. build and place the files
 systemctl --user enable --now clippod     # 2. start recording, now and on every login
+just add-to-panel                         # 3. put the icon in the panel's right wing
 ```
 
-3. **Add clippo to the panel** — **Settings → Desktop → Panel → Configure panel applets**.
 4. **Bind a shortcut**, if you want one — **Settings → Keyboard → Shortcuts → Custom
    shortcuts**, the command `clippo show` and the key `Super+V`.
 
-Only the first two are `just`'s to do; the last two are COSMIC settings, and the sections
-below say why each is a manual step. Steps 3 and 4 are optional in the sense that `clippo
+Only the first three are `just`'s to do; the last is a COSMIC setting, and the sections below
+say why none of the last three is something `install` does for you. Steps 3 and 4 are
+optional in the sense that `clippo
 list` and `clippo copy` work without them — but `Super+V` needs *both*, because `clippo show`
 asks the panel applet to open, and a shortcut with no applet to talk to fails every time you
 press it.
@@ -105,10 +135,39 @@ down with it. `install` deliberately does *not* enable it for you — starting a
 then owns your clipboard is not something to do to somebody as a side effect of copying
 files.
 
-Adding clippo to the panel is **Settings → Desktop → Panel → Configure panel applets**, and
-what puts it in that list is the `.desktop` file's `X-CosmicApplet=true`. It is a manual step
-because a panel is somebody's own arrangement — [The applet](#the-applet) is what you get, and
-what it does with the keyboard once it is open.
+`just add-to-panel` puts the icon at the front of the panel's **right** wing — the inner edge
+of the right-hand group, next to the centre and ahead of the status applets, which is where
+something you open on purpose belongs rather than lost among the indicators.
+`just remove-from-panel` takes it off again and leaves the rest of the panel exactly as it
+was. Both are idempotent, and `add-to-panel` *moves* an icon you have already placed by hand
+rather than giving you two of them. It is a separate recipe rather than part of `install` for
+the same reason the daemon is not enabled for you: rearranging somebody's panel is not
+something to do to them as a side effect of copying files.
+
+That position cannot be shipped in `res/`, which is why a recipe has to write it at all.
+`cosmic-panel` reads exactly three keys out of an applet's `.desktop` — `X-CosmicShrinkable`,
+`X-CosmicHoverPopup` and `X-NotificationsAppletClients` — and `cosmic-settings` reads one,
+`X-CosmicApplet=true`, which is what makes clippo *offerable* in **Settings → Desktop → Panel
+→ Configure panel applets** and says nothing about where it lands. There is no key for a wing
+or an index. Placement lives only in
+`~/.config/cosmic/com.system76.CosmicPanel.Panel/v1/plugins_wings`, a RON `Some((left, right))`
+naming the applets in each wing, so that is the file `add-to-panel` edits. Three things it is
+careful about:
+
+- **An absent or `None` file means the distro's default layout, not an empty panel.** It seeds
+  from the system copy under `XDG_DATA_DIRS` in that case. Writing just clippo into an empty
+  layout would silently take every other applet off your panel.
+- **It matches `cosmic-settings`' own formatting byte for byte**, so a second run can tell
+  "already in place" from "changed" by comparing rather than diffing whitespace.
+- **It refuses rather than guesses** if the file is not the shape it expects, leaving it
+  untouched.
+
+One thing worth knowing either way: `cosmic-settings` holds `plugins_wings` in memory and
+writes the whole file back when you change anything on its Panel page, so an edit made
+underneath a running one lasts until your next click there. `add-to-panel` warns if it sees
+`cosmic-settings` running. Doing the whole thing by hand in that settings page works just as
+well and is how you move it afterwards — a panel is somebody's own arrangement.
+[The applet](#the-applet) is what you get, and what it does with the keyboard once it is open.
 
 The `Super+V` shortcut is manual for a different reason: COSMIC owns global shortcuts and
 clippo does not register one for itself. [Global shortcut](#global-shortcut) has the GUI route
@@ -318,10 +377,11 @@ state of its own — every row came from the daemon's `Search`, and every action
 call on the same D-Bus members `clippo` uses, so there is no second code path to disagree with
 the first.
 
-Normally `cosmic-panel` starts it, and adding it to the panel is COSMIC **Settings → Desktop →
-Panel → Configure panel applets**. What puts clippo in that list is the `.desktop` file
-`just install` writes, and specifically its `X-CosmicApplet=true` — without it clippo is not
-offered there whatever else is installed.
+Normally `cosmic-panel` starts it, and putting it on the panel is `just add-to-panel` or COSMIC
+**Settings → Desktop → Panel → Configure panel applets**. What puts clippo in that settings
+list is the `.desktop` file `just install` writes, and specifically its `X-CosmicApplet=true` —
+without it clippo is not offered there whatever else is installed. See
+[Installing](#installing) for where the icon lands and why placement is a recipe of its own.
 
 To run it by hand from a working copy instead, without installing:
 
