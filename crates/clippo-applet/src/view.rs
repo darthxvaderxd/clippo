@@ -4,6 +4,14 @@
 //! and none of them decide anything. What a key does is [`crate::app`]'s
 //! business; what a row looks like is this file's.
 //!
+//! [`row_height`] and [`ROW_SPACING`] are the one exception, and they are here
+//! for the same reason: what a row *measures* is decided by the sizes below,
+//! and [`crate::app`] has to know where a row is to scroll the highlight onto
+//! it. They answer that question without deciding anything either — the two
+//! places would otherwise be free to disagree about how tall a row with a
+//! thumbnail on it is, and a list scrolled by the wrong one of them is exactly
+//! the bug they exist to fix.
+//!
 //! # What a row shows
 //!
 //! [`EntrySummary::preview`] and nothing else, because that is the only content
@@ -42,7 +50,7 @@ use cosmic::widget::image::Handle;
 use cosmic::{theme, Element};
 
 use crate::app::{Action, Message};
-use crate::model::{Model, Status};
+use crate::model::{Model, Status, IMAGE_KIND};
 use crate::thumbs::Thumbnails;
 
 /// The id of the search field, so that opening the picker can focus it.
@@ -59,6 +67,56 @@ pub fn search_id() -> widget::Id {
 /// popup leaves the highlight on a row nobody can see.
 pub fn list_id() -> widget::Id {
     widget::Id::new("clippo-list")
+}
+
+/// The gap the list leaves between two rows.
+///
+/// Public because it is not only a look: [`crate::app`] adds it back up to say
+/// where a row is, and a position computed without it drifts by a whole row
+/// every fifty of them.
+pub const ROW_SPACING: f32 = 2.0;
+
+/// The height of a line of [`widget::text::body`], which is what a row's
+/// preview is drawn as.
+///
+/// libcosmic's figure, not a guess at one: `body` is 14-pixel text on an
+/// explicit 21-pixel line.
+const LINE: f32 = 21.0;
+
+/// The padding [`row`] puts above and below its contents, added together.
+const ROW_PADDING: f32 = 8.0;
+
+/// The leading icon on a row that is not drawing a thumbnail.
+const ICON: f32 = 16.0;
+
+/// How tall the list draws one row, in logical pixels.
+///
+/// An estimate, and it has to be: a widget's height is decided by a layout pass
+/// against a renderer that has the fonts, and [`crate::app`] needs a number
+/// before that has happened. What makes an estimate good enough is that it is
+/// only ever used as a *proportion* — the app divides the height the list
+/// really came out at by the total these predict, so whatever they are
+/// uniformly wrong by cancels, and only the ratio between one kind of row and
+/// another has to be right.
+///
+/// `thumbnail` rather than the entry's kind alone because that ratio is exactly
+/// what it decides: an image row is a [`THUMB`] tall once its thumbnail has
+/// arrived and an ordinary line of text tall until then, and a screenshot-heavy
+/// history where the two were treated alike is precisely the list whose
+/// accumulated error puts the highlight off screen.
+///
+/// A row the user has pressed `Ctrl+R` on is not modelled — see
+/// [`readable`] for how tall one of those can get. Nothing scrolls on the
+/// reveal path, so the number is never asked for while one is on screen.
+pub fn row_height(entry: &EntrySummary, thumbnail: bool) -> f32 {
+    let leading = if thumbnail && entry.kind == IMAGE_KIND {
+        THUMB
+    } else {
+        ICON
+    };
+    // The row is a centred `Row`, so it is as tall as its tallest child, and
+    // the button's padding is on top of that.
+    ROW_PADDING + leading.max(LINE)
 }
 
 /// The longest preview drawn on one row.
@@ -158,10 +216,9 @@ fn list<'a>(model: &'a Model, thumbnails: &'a Thumbnails) -> Element<'a, Message
     let selected = model.selected_id();
     let revealed = model.revealed();
 
-    let rows = model
-        .entries()
-        .iter()
-        .fold(widget::Column::new().spacing(2), |column, entry| {
+    let rows = model.entries().iter().fold(
+        widget::Column::new().spacing(ROW_SPACING),
+        |column, entry| {
             let is_selected = selected == Some(entry.id);
             column.push(row(
                 entry,
@@ -174,10 +231,17 @@ fn list<'a>(model: &'a Model, thumbnails: &'a Thumbnails) -> Element<'a, Message
                 // cache mistake cannot put a picture on a row of text.
                 thumbnails.get(entry),
             ))
-        });
+        },
+    );
 
     widget::scrollable(rows)
         .id(list_id())
+        // The only route to the two figures a scroll has to be decided from:
+        // how much of the list is on screen, and how tall it turned out to be.
+        // iced publishes this whenever the viewport changes — from the redraw
+        // pass as well as from the wheel — so [`crate::app`] hears about the
+        // list before the user can press anything at it.
+        .on_scroll(Message::ListScrolled)
         .height(Length::Fill)
         .width(Length::Fill)
         .into()
@@ -551,6 +615,49 @@ mod tests {
             drawn.chars().count()
         );
         assert!(drawn.contains('\u{2026}'), "{drawn}");
+    }
+
+    /// The one thing about a row's height that has to be right: an image row
+    /// showing a thumbnail is taller than a row of text. Everything the app
+    /// does with these is a proportion, so the *ratio* is the content — a list
+    /// that thought the two were the same height is the one whose highlight
+    /// ends up off screen forty screenshots down.
+    #[test]
+    fn a_thumbnailed_row_is_taller_than_a_row_of_text() {
+        let text = EntrySummary {
+            id: 1,
+            created_at: 1,
+            last_used_at: 1,
+            kind: "text".to_owned(),
+            preview: "hello".to_owned(),
+            pinned: false,
+            sensitive: false,
+        };
+        let image = EntrySummary {
+            kind: IMAGE_KIND.to_owned(),
+            ..text.clone()
+        };
+
+        assert!(row_height(&image, true) > row_height(&text, false));
+        assert_eq!(
+            row_height(&image, true),
+            THUMB + ROW_PADDING,
+            "a thumbnail plus the padding around it"
+        );
+        assert_eq!(
+            row_height(&image, false),
+            row_height(&text, false),
+            "and the generic icon this row draws until its thumbnail arrives \
+             leaves it exactly as tall as a row of text"
+        );
+        // The badges are drawn at 14 and cannot make a row taller than its own
+        // line of text, so they are deliberately not in the figure.
+        let badged = EntrySummary {
+            pinned: true,
+            sensitive: true,
+            ..text.clone()
+        };
+        assert_eq!(row_height(&badged, false), row_height(&text, false));
     }
 
     #[test]
