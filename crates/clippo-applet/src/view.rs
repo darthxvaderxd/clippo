@@ -10,7 +10,8 @@
 //! it. They answer that question without deciding anything either — the two
 //! places would otherwise be free to disagree about how tall a row with a
 //! thumbnail on it is, and a list scrolled by the wrong one of them is exactly
-//! the bug they exist to fix.
+//! the bug they exist to fix. The sizes [`row`] draws with are the same
+//! constants [`row_height`] adds up, for the same reason.
 //!
 //! # What a row shows
 //!
@@ -44,6 +45,7 @@
 //! chose. `Reveal` remains the only route to the full-size bytes.
 
 use clippo_ipc::EntrySummary;
+use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::{Alignment, Length};
 use cosmic::widget;
 use cosmic::widget::image::Handle;
@@ -83,11 +85,17 @@ pub const ROW_SPACING: f32 = 2.0;
 /// explicit 21-pixel line.
 const LINE: f32 = 21.0;
 
-/// The padding [`row`] puts above and below its contents, added together.
-const ROW_PADDING: f32 = 8.0;
+/// The padding [`row`] puts above its contents, and again below them.
+///
+/// Used by [`row`] itself as well as by [`row_height`], so that the height and
+/// the drawing cannot disagree about it.
+const ROW_PADDING_Y: f32 = 4.0;
+
+/// The padding [`row`] puts either side of its contents.
+const ROW_PADDING_X: f32 = 8.0;
 
 /// The leading icon on a row that is not drawing a thumbnail.
-const ICON: f32 = 16.0;
+const ICON: u16 = 16;
 
 /// How tall the list draws one row, in logical pixels.
 ///
@@ -105,25 +113,39 @@ const ICON: f32 = 16.0;
 /// history where the two were treated alike is precisely the list whose
 /// accumulated error puts the highlight off screen.
 ///
-/// A row the user has pressed `Ctrl+R` on is not modelled — see
-/// [`readable`] for how tall one of those can get. Nothing scrolls on the
-/// reveal path, so the number is never asked for while one is on screen.
+/// One [`LINE`] and not two is true by construction rather than by hope: the
+/// preview is drawn ellipsized to a single line (see [`row`]), so a copied
+/// paragraph — which the daemon flattens to one long line, and which is wider
+/// than this popup — is cut at the edge of the row instead of wrapping onto a
+/// second one. Wrapping would be a *per-row* error, which is the one kind the
+/// scale in [`crate::app`] cannot absorb: it corrects what every row is
+/// uniformly wrong by, so a list with tall rows scattered through it would
+/// accumulate the difference exactly as one that ignored thumbnails did.
+///
+/// The one row not modelled is the one the user has pressed `Ctrl+R` on, which
+/// is deliberately left wrapping — see [`readable`] for how tall it can get.
+/// Nothing scrolls on the reveal path, so the number is never asked for while
+/// one is on screen.
 pub fn row_height(entry: &EntrySummary, thumbnail: bool) -> f32 {
     let leading = if thumbnail && entry.kind == IMAGE_KIND {
         THUMB
     } else {
-        ICON
+        f32::from(ICON)
     };
     // The row is a centred `Row`, so it is as tall as its tallest child, and
     // the button's padding is on top of that.
-    ROW_PADDING + leading.max(LINE)
+    2.0 * ROW_PADDING_Y + leading.max(LINE)
 }
 
-/// The longest preview drawn on one row.
+/// The longest preview handed to one row.
 ///
-/// The daemon's previews are already single-line, but not bounded to anything
-/// this narrow, and a very long one would otherwise set the width of every row
-/// in the list.
+/// Not what makes a row one line — [`row`] asks the renderer to ellipsize at
+/// the width it really has, which is the only place that width is known. This
+/// is a bound on the *work*: the daemon's previews are single-line but only
+/// loosely bounded, and shaping runs over the string that is handed over
+/// however few characters of it survive the cut. Generous enough that the
+/// renderer's cut is the one the user sees, so this is not a layout decision
+/// taken in the dark about a width this side cannot measure.
 const PREVIEW_CHARS: usize = 96;
 
 /// The longest revealed value drawn on one row.
@@ -260,19 +282,29 @@ fn row<'a>(
             .height(THUMB)
             .into(),
         None => widget::icon::from_name(kind_icon(&entry.kind))
-            .size(16)
+            .size(ICON)
             .into(),
     };
 
     // A revealed value is wrapped rather than cut at the width of the list: a
     // secret the user has to go elsewhere to finish reading defeats the reason
     // they pressed Ctrl+R. It is still bounded — see `readable` — because the
-    // value is the whole flavor and the row has no height to be cut to. A
-    // preview stays on the tight cap: those are browsed rather than read, and
-    // one long one would otherwise set the width of every row.
+    // value is the whole flavor and the row has no height to be cut to.
+    //
+    // A preview is the opposite, and its single line is load-bearing rather
+    // than tidy: `row_height` tells the app how tall this row is so that the
+    // arrows can scroll the highlight onto it, and a preview left to wrap would
+    // silently make some rows twice that. The daemon flattens a copied
+    // paragraph into one long line, which is exactly the content that would
+    // wrap, so it is an everyday copy rather than an exotic one. Ellipsized
+    // rather than cut by character count because the renderer is the only side
+    // that knows the width the row really came out at — and it marks the cut
+    // where it makes it, which a guessed character cap would not.
     let body = match revealed {
         Some(value) => widget::text::body(readable(value)).width(Length::Fill),
-        None => widget::text::body(shorten(&entry.preview, PREVIEW_CHARS)).width(Length::Fill),
+        None => widget::text::body(shorten(&entry.preview, PREVIEW_CHARS))
+            .width(Length::Fill)
+            .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1))),
     };
     let mut line = widget::Row::new()
         .push(leading)
@@ -297,7 +329,10 @@ fn row<'a>(
             theme::Button::MenuItem
         })
         .width(Length::Fill)
-        .padding([4, 8])
+        // The constants rather than the numbers, because `row_height` adds the
+        // vertical one back to say how tall this row is and the two must not be
+        // free to drift apart.
+        .padding([ROW_PADDING_Y, ROW_PADDING_X])
         // Clicking a row selects it and copies it, which is what a click on a
         // clipboard entry can only reasonably mean.
         .on_press(Message::Chose(entry.id))
@@ -641,8 +676,15 @@ mod tests {
         assert!(row_height(&image, true) > row_height(&text, false));
         assert_eq!(
             row_height(&image, true),
-            THUMB + ROW_PADDING,
+            THUMB + 2.0 * ROW_PADDING_Y,
             "a thumbnail plus the padding around it"
+        );
+        assert_eq!(
+            row_height(&text, false),
+            LINE + 2.0 * ROW_PADDING_Y,
+            "and a row of text is one line, because the preview is drawn \
+             ellipsized to one — a wrapped row would be half again as tall as \
+             this and the app would place every row below it wrongly"
         );
         assert_eq!(
             row_height(&image, false),

@@ -299,7 +299,11 @@ impl Clippo {
     /// whatever height its value needs, which is not a height
     /// [`view::row_height`] models, so a measurement taken while one is on
     /// screen says nothing about the size of an ordinary row. The position and
-    /// the viewport are still facts, so only the scale is held over.
+    /// the viewport are still facts, so only the scale is held over — and if
+    /// there is no earlier one to hold over, the whole measurement is dropped
+    /// rather than kept beside a made-up scale. That needs the first viewport
+    /// this list ever publishes to arrive with a value already revealed, which
+    /// takes a selection, which takes a frame that would have published one.
     fn note_list(&mut self, viewport: Viewport) {
         let scale = match self.model.revealed() {
             Some(_) => self.list.map(|list| list.scale),
@@ -416,11 +420,10 @@ impl Clippo {
                 // showing it costs the *next* one its landing rule. See
                 // [`Model::accepts`].
                 if self.model.accepts(&query) {
-                    let was = self.model.selected_id();
-                    self.model.set_entries(entries);
+                    let landed = self.model.set_entries(entries);
                     self.thumbnails.prune(self.model.entries());
                     self.fetch_thumbnails();
-                    // Only when the landing rule moved the highlight — a fresh
+                    // Only when the landing rule placed the highlight — a fresh
                     // ranking puts it on the top row of a list the user had
                     // arrowed halfway down, and deleting the selected row hands
                     // it to whatever moved up into the gap. Both leave it off
@@ -432,7 +435,15 @@ impl Clippo {
                     // arrows would be dragged back to their highlight by an
                     // unrelated copy in another window. The highlight has not
                     // moved there; the list has no business moving either.
-                    if self.model.selected_id() != was {
+                    //
+                    // The model answers this rather than a comparison here,
+                    // because neither of the two things this side can see says
+                    // it. A fresh ranking that puts the already-selected entry
+                    // first leaves the id alone while moving the highlight to
+                    // the top; a copy in another window leaves the id alone and
+                    // moves every row's *index* down by one without the
+                    // highlight having moved at all.
+                    if landed {
                         return self.keep_selection_visible();
                     }
                 }
