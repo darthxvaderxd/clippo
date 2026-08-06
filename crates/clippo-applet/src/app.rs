@@ -31,6 +31,7 @@
 use cosmic::app::{Core, Task};
 use cosmic::iced::event::{wayland, PlatformSpecific};
 use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
+use cosmic::iced::widget::scrollable::{snap_to, RelativeOffset};
 use cosmic::iced::window::Id;
 use cosmic::iced::{Event, Subscription};
 use cosmic::{widget, Element};
@@ -241,6 +242,37 @@ impl Clippo {
         }
     }
 
+    /// Scroll the list so that the highlighted row is on screen.
+    ///
+    /// The list scrolls itself for the mouse and for nothing else, so without
+    /// this the highlight walks off the bottom of the popup on the sixth or
+    /// seventh `↓` and the user is arrowing blind. The selection is still
+    /// moving and `Enter` still copies whatever it is on; the only way to see
+    /// which row that is is to reach for the mouse and scroll, which is the
+    /// keyboard-first premise gone at the point it matters most.
+    ///
+    /// A *relative* snap rather than a pixel offset because neither figure a
+    /// pixel offset needs is known here: how tall a row is, and how much of the
+    /// list the popup is showing. `snap_to` stores the fraction and resolves it
+    /// against the real bounds when the list is next laid out, so this is right
+    /// whatever height the panel gives the popup — and it does not have to run
+    /// after a frame the way an absolute offset computed from stale bounds
+    /// would.
+    fn keep_selection_visible(&self) -> Task<Message> {
+        let Some(index) = self.model.selected_index() else {
+            return Task::none();
+        };
+        snap_to(
+            view::list_id(),
+            RelativeOffset {
+                // Left alone: the list only scrolls vertically, and naming a
+                // horizontal offset would fight anything that ever changes it.
+                x: None,
+                y: Some(selection_offset(index, self.model.entries().len())),
+            },
+        )
+    }
+
     /// Ask for any thumbnail an image row needs and does not have.
     ///
     /// The entry is marked as asked only once [`Clippo::ask`] says the worker
@@ -279,6 +311,13 @@ impl Clippo {
                     self.model.set_entries(entries);
                     self.thumbnails.prune(self.model.entries());
                     self.fetch_thumbnails();
+                    // The landing rule has just chosen a row, and the list is
+                    // still scrolled wherever it was: a fresh ranking puts the
+                    // highlight on the top row under a list the user had
+                    // arrowed halfway down, and a deletion moves every row
+                    // below the gap. Both leave the highlight off screen
+                    // unless the list follows it.
+                    return self.keep_selection_visible();
                 }
             }
             bus::Event::Revealed(id, value) => {
@@ -341,8 +380,14 @@ impl Clippo {
 
         let selected = self.model.selected_id();
         match action {
-            Action::Previous => self.model.select_previous(),
-            Action::Next => self.model.select_next(),
+            Action::Previous => {
+                self.model.select_previous();
+                return self.keep_selection_visible();
+            }
+            Action::Next => {
+                self.model.select_next();
+                return self.keep_selection_visible();
+            }
             Action::Activate => return self.activate(),
             Action::Dismiss => return self.dismiss(),
             Action::Remove => {
@@ -366,6 +411,40 @@ impl Clippo {
         }
         Task::none()
     }
+}
+
+/// How far down its travel the list has to sit for row `index` of `rows` to be
+/// on screen, as the fraction `snap_to` takes.
+///
+/// The rows are spread evenly over the travel: the first row is the list at the
+/// top, the last row is the list at the bottom, and row *i* of *n* is
+/// *i*/(*n*−1) of the way between them. That is not an approximation for rows
+/// of one height — it is exactly enough. The list is `n·h` tall in a viewport
+/// of `V`, so this offset is `i/(n-1)·(n·h - V)`, and the row spans `i·h` to
+/// `(i+1)·h`; both "the row's top is at or below the offset" and "its bottom is
+/// at or above the offset plus `V`" reduce to `V ≥ h`, which is to say the
+/// popup is showing at least one whole row.
+///
+/// Rows are not quite one height — an image row is a thumbnail tall where a
+/// text row is a line of text, and a revealed row is taller than either — so a
+/// list mixing them lands a few pixels out rather than exactly. That is the
+/// difference between a highlight at the edge of the popup and one just inside
+/// it, not between a visible highlight and an invisible one, and it is the
+/// price of not having to measure a widget tree from here.
+///
+/// A side effect worth naming: this scrolls a little on *every* move rather
+/// than only when the highlight would leave the popup. That is the intended
+/// reading of "the scrollbar moves with the selection" — the bar tracks where
+/// the user is in the history, the way dragging it does.
+fn selection_offset(index: usize, rows: usize) -> f32 {
+    // Nothing to travel over, and `rows - 1` would divide by zero.
+    if rows < 2 {
+        return 0.0;
+    }
+    // Clamped rather than trusted: `snap_to` clamps the fraction anyway, and a
+    // row number from outside the list is a bug that should scroll to the end
+    // rather than produce a NaN offset.
+    index.min(rows - 1) as f32 / (rows - 1) as f32
 }
 
 /// Translate a raw key press into an [`Action`].
@@ -659,6 +738,51 @@ mod tests {
             action_for(&key(Named::Escape), Modifiers::CTRL),
             Some(Action::Dismiss)
         );
+    }
+
+    /// The two ends, which are the ones the user notices: arrowing to the last
+    /// row must put the list at the bottom, and arrowing back to the first must
+    /// put it at the top.
+    #[test]
+    fn the_ends_of_the_list_are_the_ends_of_the_travel() {
+        assert_eq!(selection_offset(0, 20), 0.0);
+        assert_eq!(selection_offset(19, 20), 1.0);
+        assert_eq!(selection_offset(1, 3), 0.5);
+    }
+
+    /// A list that fits, or one row, has nowhere to scroll to — and `rows - 1`
+    /// is the division this must not do.
+    #[test]
+    fn a_list_with_nothing_to_scroll_stays_where_it_is() {
+        assert_eq!(selection_offset(0, 1), 0.0);
+        assert_eq!(selection_offset(0, 0), 0.0);
+        assert_eq!(selection_offset(4, 1), 0.0);
+    }
+
+    /// The bug, as a property: every row of a long list has an offset that is a
+    /// real fraction, and moving down the list only ever moves the list down.
+    #[test]
+    fn every_row_of_a_long_list_has_somewhere_to_scroll_to() {
+        let rows = 200;
+        let mut previous = -1.0;
+
+        for index in 0..rows {
+            let offset = selection_offset(index, rows);
+            assert!(offset.is_finite(), "row {index}");
+            assert!((0.0..=1.0).contains(&offset), "row {index}: {offset}");
+            assert!(
+                offset > previous,
+                "row {index} scrolls no further than {previous}"
+            );
+            previous = offset;
+        }
+    }
+
+    /// An index past the end is a bug elsewhere; it must not become a NaN
+    /// offset, which `snap_to` would clamp into nothing sensible.
+    #[test]
+    fn a_row_number_past_the_end_scrolls_to_the_end() {
+        assert_eq!(selection_offset(99, 5), 1.0);
     }
 
     #[test]

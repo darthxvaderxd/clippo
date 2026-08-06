@@ -50,6 +50,17 @@ pub fn search_id() -> widget::Id {
     widget::Id::new("clippo-search")
 }
 
+/// The id of the list, so that moving the highlight can scroll it.
+///
+/// The rows are drawn inside a [`widget::scrollable()`], which scrolls for the
+/// mouse on its own and knows nothing about the selection — the arrows are read
+/// globally and handled in [`crate::app`], which is where the highlight moves.
+/// Without a name to aim a scroll operation at, arrowing past the bottom of the
+/// popup leaves the highlight on a row nobody can see.
+pub fn list_id() -> widget::Id {
+    widget::Id::new("clippo-list")
+}
+
 /// The longest preview drawn on one row.
 ///
 /// The daemon's previews are already single-line, but not bounded to anything
@@ -166,6 +177,7 @@ fn list<'a>(model: &'a Model, thumbnails: &'a Thumbnails) -> Element<'a, Message
         });
 
     widget::scrollable(rows)
+        .id(list_id())
         .height(Length::Fill)
         .width(Length::Fill)
         .into()
