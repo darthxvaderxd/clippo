@@ -4,6 +4,15 @@
 //! and none of them decide anything. What a key does is [`crate::app`]'s
 //! business; what a row looks like is this file's.
 //!
+//! [`row_height`] and [`ROW_SPACING`] are the one exception, and they are here
+//! for the same reason: what a row *measures* is decided by the sizes below,
+//! and [`crate::app`] has to know where a row is to scroll the highlight onto
+//! it. They answer that question without deciding anything either — the two
+//! places would otherwise be free to disagree about how tall a row with a
+//! thumbnail on it is, and a list scrolled by the wrong one of them is exactly
+//! the bug they exist to fix. The sizes [`row`] draws with are the same
+//! constants [`row_height`] adds up, for the same reason.
+//!
 //! # What a row shows
 //!
 //! [`EntrySummary::preview`] and nothing else, because that is the only content
@@ -36,13 +45,14 @@
 //! chose. `Reveal` remains the only route to the full-size bytes.
 
 use clippo_ipc::EntrySummary;
+use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::{Alignment, Length};
 use cosmic::widget;
 use cosmic::widget::image::Handle;
 use cosmic::{theme, Element};
 
 use crate::app::{Action, Message};
-use crate::model::{Model, Status};
+use crate::model::{Model, Status, IMAGE_KIND};
 use crate::thumbs::Thumbnails;
 
 /// The id of the search field, so that opening the picker can focus it.
@@ -50,11 +60,92 @@ pub fn search_id() -> widget::Id {
     widget::Id::new("clippo-search")
 }
 
-/// The longest preview drawn on one row.
+/// The id of the list, so that moving the highlight can scroll it.
 ///
-/// The daemon's previews are already single-line, but not bounded to anything
-/// this narrow, and a very long one would otherwise set the width of every row
-/// in the list.
+/// The rows are drawn inside a [`widget::scrollable()`], which scrolls for the
+/// mouse on its own and knows nothing about the selection — the arrows are read
+/// globally and handled in [`crate::app`], which is where the highlight moves.
+/// Without a name to aim a scroll operation at, arrowing past the bottom of the
+/// popup leaves the highlight on a row nobody can see.
+pub fn list_id() -> widget::Id {
+    widget::Id::new("clippo-list")
+}
+
+/// The gap the list leaves between two rows.
+///
+/// Public because it is not only a look: [`crate::app`] adds it back up to say
+/// where a row is, and a position computed without it drifts by a whole row
+/// every fifty of them.
+pub const ROW_SPACING: f32 = 2.0;
+
+/// The height of a line of [`widget::text::body`], which is what a row's
+/// preview is drawn as.
+///
+/// libcosmic's figure, not a guess at one: `body` is 14-pixel text on an
+/// explicit 21-pixel line.
+const LINE: f32 = 21.0;
+
+/// The padding [`row`] puts above its contents, and again below them.
+///
+/// Used by [`row`] itself as well as by [`row_height`], so that the height and
+/// the drawing cannot disagree about it.
+const ROW_PADDING_Y: f32 = 4.0;
+
+/// The padding [`row`] puts either side of its contents.
+const ROW_PADDING_X: f32 = 8.0;
+
+/// The leading icon on a row that is not drawing a thumbnail.
+const ICON: u16 = 16;
+
+/// How tall the list draws one row, in logical pixels.
+///
+/// An estimate, and it has to be: a widget's height is decided by a layout pass
+/// against a renderer that has the fonts, and [`crate::app`] needs a number
+/// before that has happened. What makes an estimate good enough is that it is
+/// only ever used as a *proportion* — the app divides the height the list
+/// really came out at by the total these predict, so whatever they are
+/// uniformly wrong by cancels, and only the ratio between one kind of row and
+/// another has to be right.
+///
+/// `thumbnail` rather than the entry's kind alone because that ratio is exactly
+/// what it decides: an image row is a [`THUMB`] tall once its thumbnail has
+/// arrived and an ordinary line of text tall until then, and a screenshot-heavy
+/// history where the two were treated alike is precisely the list whose
+/// accumulated error puts the highlight off screen.
+///
+/// One [`LINE`] and not two is true by construction rather than by hope: the
+/// preview is drawn ellipsized to a single line (see [`row`]), so a copied
+/// paragraph — which the daemon flattens to one long line, and which is wider
+/// than this popup — is cut at the edge of the row instead of wrapping onto a
+/// second one. Wrapping would be a *per-row* error, which is the one kind the
+/// scale in [`crate::app`] cannot absorb: it corrects what every row is
+/// uniformly wrong by, so a list with tall rows scattered through it would
+/// accumulate the difference exactly as one that ignored thumbnails did.
+///
+/// The one row not modelled is the one the user has pressed `Ctrl+R` on, which
+/// is deliberately left wrapping — see [`readable`] for how tall it can get.
+/// Nothing scrolls on the reveal path, so the number is never asked for while
+/// one is on screen.
+pub fn row_height(entry: &EntrySummary, thumbnail: bool) -> f32 {
+    let leading = if thumbnail && entry.kind == IMAGE_KIND {
+        THUMB
+    } else {
+        f32::from(ICON)
+    };
+    // The row is a centred `Row`, so it is as tall as its tallest child, and
+    // the button's padding is on top of that.
+    2.0 * ROW_PADDING_Y + leading.max(LINE)
+}
+
+/// The longest preview handed to one row.
+///
+/// Not what makes a row one line — [`row`] asks the renderer to ellipsize at
+/// the width it really has, which is the only place that width is known. This
+/// is a bound on the *work*: the daemon's previews are single-line but only
+/// loosely bounded, and shaping runs over the string that is handed over
+/// however few characters of it survive the cut. Generous enough that the
+/// renderer's cut is the one the user sees, so this is not a layout decision
+/// taken in the dark about a width this side cannot measure.
 const PREVIEW_CHARS: usize = 96;
 
 /// The longest revealed value drawn on one row.
@@ -147,10 +238,9 @@ fn list<'a>(model: &'a Model, thumbnails: &'a Thumbnails) -> Element<'a, Message
     let selected = model.selected_id();
     let revealed = model.revealed();
 
-    let rows = model
-        .entries()
-        .iter()
-        .fold(widget::Column::new().spacing(2), |column, entry| {
+    let rows = model.entries().iter().fold(
+        widget::Column::new().spacing(ROW_SPACING),
+        |column, entry| {
             let is_selected = selected == Some(entry.id);
             column.push(row(
                 entry,
@@ -163,9 +253,17 @@ fn list<'a>(model: &'a Model, thumbnails: &'a Thumbnails) -> Element<'a, Message
                 // cache mistake cannot put a picture on a row of text.
                 thumbnails.get(entry),
             ))
-        });
+        },
+    );
 
     widget::scrollable(rows)
+        .id(list_id())
+        // The only route to the two figures a scroll has to be decided from:
+        // how much of the list is on screen, and how tall it turned out to be.
+        // iced publishes this whenever the viewport changes — from the redraw
+        // pass as well as from the wheel — so [`crate::app`] hears about the
+        // list before the user can press anything at it.
+        .on_scroll(Message::ListScrolled)
         .height(Length::Fill)
         .width(Length::Fill)
         .into()
@@ -184,19 +282,29 @@ fn row<'a>(
             .height(THUMB)
             .into(),
         None => widget::icon::from_name(kind_icon(&entry.kind))
-            .size(16)
+            .size(ICON)
             .into(),
     };
 
     // A revealed value is wrapped rather than cut at the width of the list: a
     // secret the user has to go elsewhere to finish reading defeats the reason
     // they pressed Ctrl+R. It is still bounded — see `readable` — because the
-    // value is the whole flavor and the row has no height to be cut to. A
-    // preview stays on the tight cap: those are browsed rather than read, and
-    // one long one would otherwise set the width of every row.
+    // value is the whole flavor and the row has no height to be cut to.
+    //
+    // A preview is the opposite, and its single line is load-bearing rather
+    // than tidy: `row_height` tells the app how tall this row is so that the
+    // arrows can scroll the highlight onto it, and a preview left to wrap would
+    // silently make some rows twice that. The daemon flattens a copied
+    // paragraph into one long line, which is exactly the content that would
+    // wrap, so it is an everyday copy rather than an exotic one. Ellipsized
+    // rather than cut by character count because the renderer is the only side
+    // that knows the width the row really came out at — and it marks the cut
+    // where it makes it, which a guessed character cap would not.
     let body = match revealed {
         Some(value) => widget::text::body(readable(value)).width(Length::Fill),
-        None => widget::text::body(shorten(&entry.preview, PREVIEW_CHARS)).width(Length::Fill),
+        None => widget::text::body(shorten(&entry.preview, PREVIEW_CHARS))
+            .width(Length::Fill)
+            .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1))),
     };
     let mut line = widget::Row::new()
         .push(leading)
@@ -221,7 +329,10 @@ fn row<'a>(
             theme::Button::MenuItem
         })
         .width(Length::Fill)
-        .padding([4, 8])
+        // The constants rather than the numbers, because `row_height` adds the
+        // vertical one back to say how tall this row is and the two must not be
+        // free to drift apart.
+        .padding([ROW_PADDING_Y, ROW_PADDING_X])
         // Clicking a row selects it and copies it, which is what a click on a
         // clipboard entry can only reasonably mean.
         .on_press(Message::Chose(entry.id))
@@ -539,6 +650,56 @@ mod tests {
             drawn.chars().count()
         );
         assert!(drawn.contains('\u{2026}'), "{drawn}");
+    }
+
+    /// The one thing about a row's height that has to be right: an image row
+    /// showing a thumbnail is taller than a row of text. Everything the app
+    /// does with these is a proportion, so the *ratio* is the content — a list
+    /// that thought the two were the same height is the one whose highlight
+    /// ends up off screen forty screenshots down.
+    #[test]
+    fn a_thumbnailed_row_is_taller_than_a_row_of_text() {
+        let text = EntrySummary {
+            id: 1,
+            created_at: 1,
+            last_used_at: 1,
+            kind: "text".to_owned(),
+            preview: "hello".to_owned(),
+            pinned: false,
+            sensitive: false,
+        };
+        let image = EntrySummary {
+            kind: IMAGE_KIND.to_owned(),
+            ..text.clone()
+        };
+
+        assert!(row_height(&image, true) > row_height(&text, false));
+        assert_eq!(
+            row_height(&image, true),
+            THUMB + 2.0 * ROW_PADDING_Y,
+            "a thumbnail plus the padding around it"
+        );
+        assert_eq!(
+            row_height(&text, false),
+            LINE + 2.0 * ROW_PADDING_Y,
+            "and a row of text is one line, because the preview is drawn \
+             ellipsized to one — a wrapped row would be half again as tall as \
+             this and the app would place every row below it wrongly"
+        );
+        assert_eq!(
+            row_height(&image, false),
+            row_height(&text, false),
+            "and the generic icon this row draws until its thumbnail arrives \
+             leaves it exactly as tall as a row of text"
+        );
+        // The badges are drawn at 14 and cannot make a row taller than its own
+        // line of text, so they are deliberately not in the figure.
+        let badged = EntrySummary {
+            pinned: true,
+            sensitive: true,
+            ..text.clone()
+        };
+        assert_eq!(row_height(&badged, false), row_height(&text, false));
     }
 
     #[test]

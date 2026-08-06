@@ -244,7 +244,16 @@ impl Model {
     ///   how `Enter` ends up copying something the ranking did not put first:
     ///   arrow down to row 3, type one character, and the highlight stays on
     ///   row 3 of a list it has never seen.
-    pub fn set_entries(&mut self, entries: Vec<EntrySummary>) {
+    ///
+    /// Answers whether that landing rule *placed* the highlight, which is the
+    /// one thing about this the caller cannot work out afterwards. Comparing
+    /// the selected id across the call cannot: a fresh ranking that puts the
+    /// same entry first has moved the highlight to row 0 while leaving the id
+    /// alone, and a copy made in another window shifts every row down while
+    /// leaving both the id and the fact that nothing moved. The first wants the
+    /// list scrolled to the highlight and the second must not have it — see
+    /// `Clippo::keep_selection_visible` in [`crate::app`].
+    pub fn set_entries(&mut self, entries: Vec<EntrySummary>) -> bool {
         let previous = self.selected_index();
         let land_at_top = std::mem::take(&mut self.land_at_top);
         self.entries = entries;
@@ -268,6 +277,8 @@ impl Model {
         // not outlive the list it was read from, and the entry could have been
         // deleted and its id reused by nothing at all.
         self.forget_revealed();
+
+        !still_there
     }
 
     /// The highlighted entry, if there is one.
@@ -627,6 +638,43 @@ mod tests {
         model.set_entries(vec![entry(9), entry(1), entry(2), entry(3)]);
 
         assert_eq!(model.selected_id(), Some(9));
+    }
+
+    /// What the applet scrolls on. The two cases that matter are the ones the
+    /// selected id cannot tell apart, and they want opposite answers: a fresh
+    /// ranking that happens to put the already-highlighted entry first has
+    /// moved the highlight to the top of a list the user had arrowed down, and
+    /// a copy made in another window has moved every row down without moving
+    /// the highlight at all. The id is unchanged in both.
+    #[test]
+    fn the_landing_rule_says_when_it_placed_the_highlight() {
+        let mut model = model_with(&[1, 2, 3]);
+        model.select_next();
+        model.select_next();
+        assert_eq!(model.selected_id(), Some(3));
+
+        // A fresh ranking whose best match is what was already highlighted.
+        model.set_query("c".to_owned());
+        assert!(
+            model.set_entries(vec![entry(3), entry(1)]),
+            "the highlight was placed on row 0, however familiar the id is"
+        );
+        assert_eq!(model.selected_id(), Some(3));
+
+        // The same query re-answered because somebody copied something.
+        assert!(
+            !model.set_entries(vec![entry(9), entry(3), entry(1)]),
+            "nothing placed it — it survived where it was, one row further down"
+        );
+        assert_eq!(model.selected_id(), Some(3));
+        assert_eq!(model.selected_index(), Some(1), "which did move");
+
+        // And a deletion, which does place it.
+        assert!(
+            model.set_entries(vec![entry(9), entry(1)]),
+            "the highlighted row is gone, so the rule handed it to row 1"
+        );
+        assert_eq!(model.selected_id(), Some(1));
     }
 
     /// Two keystrokes, two `Search` calls: the answer to the first must not be
